@@ -361,13 +361,27 @@ Please respond to the user's message above, considering the full context of our 
                 pass
 
 
-@bot.message_handler(func=lambda message: True)
-def handle_message(message):
-    """Handle all non-command messages by calling the agent."""
+@bot.message_handler(content_types=['photo', 'document', 'sticker', 'video', 'audio', 'animation', 'video_note', 'contact', 'location', 'venue', 'poll'])
+def handle_other_content(message):
+    """Handle non-text content types with a confirmation."""
     save_chat_id(message.chat.id)
     
-    # Skip if message has no text (voice messages are handled separately)
+    # Determine content type for the confirmation message
+    content_type = message.content_type
+    response = f"📨 Received {content_type}. I can process text and voice messages."
+    bot.reply_to(message, response)
+    append_chat_history("user", f"[{content_type}]")
+    append_chat_history("assistant", response)
+
+
+@bot.message_handler(func=lambda message: True)
+def handle_message(message):
+    """Handle all non-command text messages by calling the agent."""
+    save_chat_id(message.chat.id)
+    
+    # Skip if message has no text
     if not message.text:
+        bot.reply_to(message, "📨 Received your message.")
         return
     
     # Get chat history BEFORE appending current message (so current message only appears once)
@@ -417,7 +431,14 @@ Please respond to the user's message above, considering the full context of our 
 
 def main():
     """Start Tau: agent loop in background, Telegram bot in foreground."""
-    notify("🤖 Tau starting...")
+    from .telegram import get_chat_id
+    
+    # Send startup message if we have a saved chat ID
+    chat_id = get_chat_id()
+    if chat_id:
+        notify("🤖 Tau is online and ready!\n\nCommands:\n/task - Add a task\n/status - Check status\n/adapt - Self-modify\n/restart - Restart bot")
+    else:
+        print("Tau starting... Send /start in Telegram to connect.")
     
     # Start agent loop in background thread
     agent_thread = threading.Thread(
@@ -442,7 +463,7 @@ def main():
     try:
         bot.polling()
     except KeyboardInterrupt:
-        pass
+        print("\nShutting down...")
     finally:
         _stop_event.set()
         notify("🛑 Tau stopped")
