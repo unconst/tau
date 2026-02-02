@@ -4,3 +4,6 @@ A self-adapting autonomous agent with Telegram integration. Tau continuously pro
 
 ## Running
 
+```bash
+curl -fsSL https://raw.githubusercontent.com/unconst/tau/main/install.sh | bash
+```
