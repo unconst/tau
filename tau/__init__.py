@@ -261,26 +261,39 @@ CURRENT USER MESSAGE (transcribed from voice):
 
 Please respond to the user's message above, considering the full context of our conversation history."""
         
-        # Process transcribed text as normal message
-        result = subprocess.run(
-            [
-                "agent",
-                "--force",
-                "--model", "composer-1",
-                "--mode=ask",
-                "--output-format=text",
-                "--print",
-                prompt_with_context
-            ],
-            capture_output=True,
-            text=True,
-            timeout=120
+        # Start typing indicator in background
+        typing_stop = threading.Event()
+        typing_thread = threading.Thread(
+            target=send_typing_action,
+            args=(message.chat.id, typing_stop),
+            daemon=True
         )
-        response = result.stdout.strip() if result.stdout else result.stderr.strip()
-        if not response:
-            response = "No response from agent."
-        bot.reply_to(message, response)
-        append_chat_history("assistant", response)
+        typing_thread.start()
+        
+        # Process transcribed text as normal message
+        try:
+            result = subprocess.run(
+                [
+                    "agent",
+                    "--force",
+                    "--model", "composer-1",
+                    "--mode=ask",
+                    "--output-format=text",
+                    "--print",
+                    prompt_with_context
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120
+            )
+            response = result.stdout.strip() if result.stdout else result.stderr.strip()
+            if not response:
+                response = "No response from agent."
+            bot.reply_to(message, response)
+            append_chat_history("assistant", response)
+        finally:
+            # Stop typing indicator
+            typing_stop.set()
         
     except Exception as e:
         error_msg = f"Error processing voice message: {str(e)}"
@@ -308,6 +321,17 @@ def handle_other_content(message):
     append_chat_history("assistant", response)
 
 
+def send_typing_action(chat_id, stop_event):
+    """Send typing action every 4 seconds until stop_event is set."""
+    while not stop_event.is_set():
+        try:
+            bot.send_chat_action(chat_id, 'typing')
+        except Exception:
+            pass
+        # Wait 4 seconds (typing indicator lasts ~5 seconds)
+        stop_event.wait(4)
+
+
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
     """Handle all non-command text messages by calling the agent."""
@@ -333,6 +357,15 @@ CURRENT USER MESSAGE:
 {message.text}
 
 Please respond to the user's message above, considering the full context of our conversation history."""
+    
+    # Start typing indicator in background
+    typing_stop = threading.Event()
+    typing_thread = threading.Thread(
+        target=send_typing_action,
+        args=(message.chat.id, typing_stop),
+        daemon=True
+    )
+    typing_thread.start()
     
     try:
         result = subprocess.run(
@@ -362,6 +395,9 @@ Please respond to the user's message above, considering the full context of our 
         error_msg = f"Error: {str(e)}"
         bot.reply_to(message, error_msg)
         append_chat_history("assistant", error_msg)
+    finally:
+        # Stop typing indicator
+        typing_stop.set()
 
 def main():
     """Start Tau: agent loop in background, Telegram bot in foreground."""
