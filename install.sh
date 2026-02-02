@@ -56,11 +56,17 @@ print_info() {
     printf "%sℹ%s %s\n" "$CYAN" "$NC" "$1"
 }
 
-# Wait for user to continue
+# Wait for user to continue (read from /dev/tty for curl pipe compatibility)
 wait_continue() {
-    echo ""
-    read -p "Press Enter to continue..."
-    echo ""
+    printf "\n"
+    printf "Press Enter to continue..."
+    read -r </dev/tty
+    printf "\n"
+}
+
+# Read user input (compatible with curl pipe)
+read_input() {
+    read -r "$@" </dev/tty
 }
 
 # Check if a command exists
@@ -99,10 +105,11 @@ step_welcome() {
     printf "Installation directory: %s%s%s\n" "$BOLD" "$INSTALL_DIR" "$NC"
     printf "\n"
     
-    read -p "Ready to begin? (Y/n): " -n 1 -r
-    echo
+    printf "Ready to begin? (Y/n): "
+    read -r -n 1 REPLY </dev/tty
+    printf "\n"
     if [[ $REPLY =~ ^[Nn]$ ]]; then
-        echo "Installation cancelled."
+        printf "Installation cancelled.\n"
         exit 0
     fi
 }
@@ -195,9 +202,10 @@ step_clone_repo() {
     
     if [ -d "$INSTALL_DIR" ]; then
         print_info "Tau directory already exists at $INSTALL_DIR"
-        echo ""
-        read -p "Update existing installation? (y/N): " -n 1 -r
-        echo
+        printf "\n"
+        printf "Update existing installation? (y/N): "
+        read -r -n 1 REPLY </dev/tty
+        printf "\n"
         if [[ $REPLY =~ ^[Yy]$ ]]; then
             print_step "Updating repository..."
             cd "$INSTALL_DIR"
@@ -273,8 +281,9 @@ step_setup_cursor_agent() {
     printf "  %s4.%s Select the option to install the CLI\n" "$BOLD" "$NC"
     printf "\n"
     
-    read -p "Press Enter once you've installed the Cursor agent CLI (or 's' to skip): " -n 1 -r
-    echo
+    printf "Press Enter once you've installed the Cursor agent CLI (or 's' to skip): "
+    read -r -n 1 REPLY </dev/tty
+    printf "\n"
     
     if [[ ! $REPLY =~ ^[Ss]$ ]]; then
         if command_exists agent; then
@@ -314,22 +323,25 @@ step_setup_telegram_token() {
     if [ -n "$TAU_BOT_TOKEN" ]; then
         print_info "TAU_BOT_TOKEN is already set in your environment"
         BOT_TOKEN="$TAU_BOT_TOKEN"
-        read -p "Use existing token? (Y/n): " -n 1 -r
-        echo
+        printf "Use existing token? (Y/n): "
+        read -r -n 1 REPLY </dev/tty
+        printf "\n"
         if [[ $REPLY =~ ^[Nn]$ ]]; then
             BOT_TOKEN=""
         fi
     fi
     
     if [ -z "$BOT_TOKEN" ]; then
-        echo ""
-        read -p "Paste your Telegram Bot Token: " BOT_TOKEN
+        printf "\n"
+        printf "Paste your Telegram Bot Token: "
+        read -r BOT_TOKEN </dev/tty
         
         if [ -z "$BOT_TOKEN" ]; then
             print_error "No token provided. Tau requires a Telegram bot token to run."
-            echo ""
-            read -p "Try again? (Y/n): " -n 1 -r
-            echo
+            printf "\n"
+            printf "Try again? (Y/n): "
+            read -r -n 1 REPLY </dev/tty
+            printf "\n"
             if [[ ! $REPLY =~ ^[Nn]$ ]]; then
                 step_setup_telegram_token
                 return
@@ -370,7 +382,8 @@ step_setup_openai_key() {
         return
     fi
     
-    read -p "Enter OpenAI API Key (or press Enter to skip): " API_KEY
+    printf "Enter OpenAI API Key (or press Enter to skip): "
+    read -r API_KEY </dev/tty
     
     if [ -n "$API_KEY" ]; then
         ENV_FILE="$INSTALL_DIR/.env"
@@ -430,11 +443,12 @@ python -m tau
 STARTEOF
     chmod +x "$START_SCRIPT"
     
-    read -p "Launch Tau now? (Y/n): " -n 1 -r
-    echo
+    printf "Launch Tau now? (Y/n): "
+    read -r -n 1 REPLY </dev/tty
+    printf "\n"
     
     if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-        echo ""
+        printf "\n"
         print_step "Starting Tau..."
         echo ""
         
