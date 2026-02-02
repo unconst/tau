@@ -6,7 +6,7 @@ Read this file first. Based on your task, read the relevant context files below.
 
 These files should be read at the start of every session:
 
-- `context/IDENTITY.md` - Core identity and design philosophy of Barbara
+- `context/IDENTITY.md` - Core identity and design philosophy of Tau
 - `context/FACTS.md` - Accumulated facts and learned knowledge
 - `context/MEMORY-SYSTEM.md` - Task and memory organization system
 

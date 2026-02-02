@@ -3,7 +3,7 @@
 # Tau Installation Script
 # 
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/Tau/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/unconst/tau/main/install.sh | bash
 #
 # Or clone and run locally:
 #   ./install.sh
@@ -11,44 +11,56 @@
 
 set -e
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m' # No Color
-BOLD='\033[1m'
+# Colors for output (using $'...' syntax for proper escape handling)
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+BLUE=$'\033[0;34m'
+CYAN=$'\033[0;36m'
+NC=$'\033[0m'
+BOLD=$'\033[1m'
 
 # Default installation directory
-INSTALL_DIR="${TAU_INSTALL_DIR:-$HOME/Tau}"
-REPO_URL="${TAU_REPO_URL:-https://github.com/YOUR_USERNAME/Tau.git}"
+INSTALL_DIR="${TAU_INSTALL_DIR:-$HOME/tau}"
+REPO_URL="${TAU_REPO_URL:-https://github.com/unconst/tau.git}"
 
-# Print colored output
+# Store the token for later use
+BOT_TOKEN=""
+
+# Print colored output using printf for reliability
 print_header() {
-    echo -e "\n${BOLD}${CYAN}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}${CYAN}  $1${NC}"
-    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════${NC}\n"
+    printf "\n"
+    printf "%s%s═══════════════════════════════════════════════════════════%s\n" "$BOLD" "$CYAN" "$NC"
+    printf "%s%s  %s%s\n" "$BOLD" "$CYAN" "$1" "$NC"
+    printf "%s%s═══════════════════════════════════════════════════════════%s\n" "$BOLD" "$CYAN" "$NC"
+    printf "\n"
 }
 
 print_step() {
-    echo -e "${BLUE}→${NC} $1"
+    printf "%s→%s %s\n" "$BLUE" "$NC" "$1"
 }
 
 print_success() {
-    echo -e "${GREEN}✓${NC} $1"
+    printf "%s✓%s %s\n" "$GREEN" "$NC" "$1"
 }
 
 print_warning() {
-    echo -e "${YELLOW}⚠${NC} $1"
+    printf "%s⚠%s %s\n" "$YELLOW" "$NC" "$1"
 }
 
 print_error() {
-    echo -e "${RED}✗${NC} $1"
+    printf "%s✗%s %s\n" "$RED" "$NC" "$1"
 }
 
 print_info() {
-    echo -e "${CYAN}ℹ${NC} $1"
+    printf "%sℹ%s %s\n" "$CYAN" "$NC" "$1"
+}
+
+# Wait for user to continue
+wait_continue() {
+    echo ""
+    read -p "Press Enter to continue..."
+    echo ""
 }
 
 # Check if a command exists
@@ -66,37 +78,70 @@ detect_os() {
     echo "$OS"
 }
 
-# Check for required dependencies
-check_dependencies() {
-    print_header "Checking Dependencies"
+# Step 1: Welcome
+step_welcome() {
+    clear
+    print_header "Welcome to Tau"
     
-    local missing_deps=()
+    printf "%sTau%s is a self-adapting autonomous agent with Telegram integration.\n" "$BOLD" "$NC"
+    printf "\n"
+    printf "This installer will guide you through:\n"
+    printf "\n"
+    printf "  %sStep 1%s → Check system dependencies\n" "$CYAN" "$NC"
+    printf "  %sStep 2%s → Install uv (Python package manager)\n" "$CYAN" "$NC"
+    printf "  %sStep 3%s → Clone the Tau repository\n" "$CYAN" "$NC"
+    printf "  %sStep 4%s → Set up Python environment\n" "$CYAN" "$NC"
+    printf "  %sStep 5%s → Install Cursor agent CLI\n" "$CYAN" "$NC"
+    printf "  %sStep 6%s → Configure Telegram bot token\n" "$CYAN" "$NC"
+    printf "  %sStep 7%s → Configure OpenAI API key (optional)\n" "$CYAN" "$NC"
+    printf "  %sStep 8%s → Launch Tau!\n" "$CYAN" "$NC"
+    printf "\n"
+    printf "Installation directory: %s%s%s\n" "$BOLD" "$INSTALL_DIR" "$NC"
+    printf "\n"
+    
+    read -p "Ready to begin? (Y/n): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Nn]$ ]]; then
+        echo "Installation cancelled."
+        exit 0
+    fi
+}
+
+# Step 2: Check dependencies
+step_check_dependencies() {
+    print_header "Step 1: Checking Dependencies"
+    
+    local missing_critical=false
     
     # Check git
+    print_step "Checking for git..."
     if command_exists git; then
-        print_success "git is installed"
+        print_success "git is installed ($(git --version | cut -d' ' -f3))"
     else
-        missing_deps+=("git")
         print_error "git is not installed"
+        missing_critical=true
     fi
     
     # Check Python
+    print_step "Checking for Python 3..."
     if command_exists python3; then
         PYTHON_VERSION=$(python3 --version 2>&1 | cut -d' ' -f2)
         print_success "Python $PYTHON_VERSION is installed"
     else
-        missing_deps+=("python3")
         print_error "Python 3 is not installed"
+        missing_critical=true
     fi
     
-    # Check uv (Python package manager)
+    # Check uv
+    print_step "Checking for uv..."
     if command_exists uv; then
         print_success "uv is installed"
     else
-        print_warning "uv is not installed (will install)"
+        print_warning "uv is not installed (will install in next step)"
     fi
     
     # Check Cursor agent CLI
+    print_step "Checking for Cursor agent CLI..."
     if command_exists agent; then
         print_success "Cursor agent CLI is installed"
     else
@@ -104,63 +149,81 @@ check_dependencies() {
     fi
     
     # Exit if critical dependencies are missing
-    if [[ " ${missing_deps[*]} " =~ " git " ]] || [[ " ${missing_deps[*]} " =~ " python3 " ]]; then
+    if [ "$missing_critical" = true ]; then
         echo ""
-        print_error "Missing critical dependencies. Please install:"
-        for dep in "${missing_deps[@]}"; do
-            echo "  - $dep"
-        done
+        print_error "Missing critical dependencies. Please install git and Python 3 first."
         exit 1
     fi
+    
+    wait_continue
 }
 
-# Install uv if not present
-install_uv() {
-    if ! command_exists uv; then
-        print_step "Installing uv..."
-        curl -LsSf https://astral.sh/uv/install.sh | sh
-        
-        # Add to PATH for current session
-        export PATH="$HOME/.local/bin:$PATH"
-        
-        if command_exists uv; then
-            print_success "uv installed successfully"
-        else
-            print_error "Failed to install uv"
-            exit 1
-        fi
+# Step 3: Install uv
+step_install_uv() {
+    print_header "Step 2: Installing uv"
+    
+    if command_exists uv; then
+        print_success "uv is already installed"
+        wait_continue
+        return
     fi
+    
+    echo "uv is a fast Python package manager that Tau uses."
+    echo ""
+    print_step "Installing uv from https://astral.sh/uv..."
+    echo ""
+    
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    
+    # Add to PATH for current session
+    export PATH="$HOME/.local/bin:$PATH"
+    
+    if command_exists uv; then
+        echo ""
+        print_success "uv installed successfully!"
+    else
+        print_error "Failed to install uv"
+        exit 1
+    fi
+    
+    wait_continue
 }
 
-# Clone or update the repository
-clone_repo() {
-    print_header "Setting Up Tau Repository"
+# Step 4: Clone repository
+step_clone_repo() {
+    print_header "Step 3: Cloning Tau Repository"
     
     if [ -d "$INSTALL_DIR" ]; then
         print_info "Tau directory already exists at $INSTALL_DIR"
+        echo ""
         read -p "Update existing installation? (y/N): " -n 1 -r
         echo
         if [[ $REPLY =~ ^[Yy]$ ]]; then
             print_step "Updating repository..."
             cd "$INSTALL_DIR"
-            git pull origin main || print_warning "Could not pull updates (may be local changes)"
+            git pull origin main || print_warning "Could not pull updates"
+        else
+            print_info "Using existing installation"
         fi
     else
-        print_step "Cloning Tau repository to $INSTALL_DIR..."
+        print_step "Cloning from $REPO_URL..."
+        echo ""
         git clone "$REPO_URL" "$INSTALL_DIR"
-        print_success "Repository cloned successfully"
+        echo ""
+        print_success "Repository cloned to $INSTALL_DIR"
     fi
     
     cd "$INSTALL_DIR"
+    wait_continue
 }
 
-# Set up Python virtual environment and install dependencies
-setup_python() {
-    print_header "Setting Up Python Environment"
+# Step 5: Setup Python environment
+step_setup_python() {
+    print_header "Step 4: Setting Up Python Environment"
     
     cd "$INSTALL_DIR"
     
-    # Create virtual environment if it doesn't exist
+    # Create virtual environment
     if [ ! -d ".venv" ]; then
         print_step "Creating Python virtual environment..."
         uv venv .venv
@@ -169,184 +232,246 @@ setup_python() {
         print_info "Virtual environment already exists"
     fi
     
-    # Activate virtual environment
-    source .venv/bin/activate
+    echo ""
     
-    # Install dependencies
-    print_step "Installing Python dependencies..."
+    # Activate and install
+    print_step "Activating virtual environment..."
+    source .venv/bin/activate
+    print_success "Virtual environment activated"
+    
+    echo ""
+    
+    print_step "Installing Tau and dependencies..."
+    echo ""
     uv pip install -e .
-    print_success "Dependencies installed"
+    echo ""
+    print_success "Dependencies installed!"
+    
+    wait_continue
 }
 
-# Guide user through Cursor agent installation
-setup_cursor_agent() {
-    print_header "Setting Up Cursor Agent CLI"
+# Step 6: Setup Cursor agent
+step_setup_cursor_agent() {
+    print_header "Step 5: Setting Up Cursor Agent CLI"
     
     if command_exists agent; then
-        print_success "Cursor agent CLI is already installed"
+        print_success "Cursor agent CLI is already installed!"
+        wait_continue
         return
     fi
     
-    echo -e "${YELLOW}The Cursor agent CLI is required for Tau to function.${NC}"
-    echo ""
-    echo "To install it:"
-    echo ""
-    echo "  1. Open Cursor IDE"
-    echo "  2. Press ${BOLD}Cmd+Shift+P${NC} (macOS) or ${BOLD}Ctrl+Shift+P${NC} (Linux)"
-    echo "  3. Type: ${BOLD}Install 'agent' command${NC}"
-    echo "  4. Select the option to install the CLI"
-    echo ""
-    echo "Alternatively, if you have Cursor installed, try:"
-    echo "  ${CYAN}cursor --install-extension cursor.agent${NC}"
-    echo ""
+    printf "%sThe Cursor agent CLI is required for Tau to function.%s\n" "$YELLOW" "$NC"
+    printf "\n"
+    printf "To install it:\n"
+    printf "\n"
+    printf "  %s1.%s Open %sCursor IDE%s\n" "$BOLD" "$NC" "$CYAN" "$NC"
+    printf "\n"
+    printf "  %s2.%s Press %sCmd+Shift+P%s (macOS) or %sCtrl+Shift+P%s (Linux)\n" "$BOLD" "$NC" "$CYAN" "$NC" "$CYAN" "$NC"
+    printf "\n"
+    printf "  %s3.%s Type: %sInstall 'agent' command%s\n" "$BOLD" "$NC" "$CYAN" "$NC"
+    printf "\n"
+    printf "  %s4.%s Select the option to install the CLI\n" "$BOLD" "$NC"
+    printf "\n"
     
-    read -p "Press Enter once you've installed the Cursor agent CLI..."
+    read -p "Press Enter once you've installed the Cursor agent CLI (or 's' to skip): " -n 1 -r
+    echo
     
-    # Verify installation
-    if command_exists agent; then
-        print_success "Cursor agent CLI is now installed"
+    if [[ ! $REPLY =~ ^[Ss]$ ]]; then
+        if command_exists agent; then
+            print_success "Cursor agent CLI is now installed!"
+        else
+            print_warning "Cursor agent CLI not detected yet."
+            print_info "You can install it later - Tau will still start."
+        fi
     else
-        print_warning "Cursor agent CLI not detected. Tau may not function correctly."
-        print_info "You can continue and install it later."
+        print_info "Skipped. You can install it later."
     fi
+    
+    wait_continue
 }
 
-# Set up Telegram bot token
-setup_telegram_token() {
-    print_header "Setting Up Telegram Bot Token"
+# Step 7: Setup Telegram token
+step_setup_telegram_token() {
+    print_header "Step 6: Configure Telegram Bot Token"
     
-    echo "Tau uses a Telegram bot to communicate with you."
-    echo ""
-    echo "To create a Telegram bot:"
-    echo ""
-    echo "  1. Open Telegram and search for ${BOLD}@BotFather${NC}"
-    echo "  2. Send ${BOLD}/newbot${NC} to create a new bot"
-    echo "  3. Follow the prompts to name your bot"
-    echo "  4. Copy the ${BOLD}HTTP API token${NC} BotFather gives you"
-    echo ""
+    printf "Tau communicates with you through a Telegram bot.\n"
+    printf "\n"
+    printf "%sTo create your Telegram bot:%s\n" "$BOLD" "$NC"
+    printf "\n"
+    printf "  %s1.%s Open Telegram on your phone or desktop\n" "$BOLD" "$NC"
+    printf "\n"
+    printf "  %s2.%s Search for %s@BotFather%s and start a chat\n" "$BOLD" "$NC" "$CYAN" "$NC"
+    printf "\n"
+    printf "  %s3.%s Send %s/newbot%s\n" "$BOLD" "$NC" "$CYAN" "$NC"
+    printf "\n"
+    printf "  %s4.%s Follow the prompts to name your bot\n" "$BOLD" "$NC"
+    printf "\n"
+    printf "  %s5.%s Copy the %sHTTP API token%s that BotFather gives you\n" "$BOLD" "$NC" "$YELLOW" "$NC"
+    printf "     (looks like: %s123456789:ABCdefGHIjklMNOpqrsTUVwxyz%s)\n" "$CYAN" "$NC"
+    printf "\n"
     
-    # Check if token is already set
+    # Check if token is already set in environment
     if [ -n "$TAU_BOT_TOKEN" ]; then
-        print_info "TAU_BOT_TOKEN is already set in environment"
+        print_info "TAU_BOT_TOKEN is already set in your environment"
+        BOT_TOKEN="$TAU_BOT_TOKEN"
         read -p "Use existing token? (Y/n): " -n 1 -r
         echo
-        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-            return
+        if [[ $REPLY =~ ^[Nn]$ ]]; then
+            BOT_TOKEN=""
         fi
     fi
     
-    read -p "Enter your Telegram Bot Token (or press Enter to skip): " BOT_TOKEN
-    
-    if [ -n "$BOT_TOKEN" ]; then
-        # Create .env file
-        ENV_FILE="$INSTALL_DIR/.env"
+    if [ -z "$BOT_TOKEN" ]; then
+        echo ""
+        read -p "Paste your Telegram Bot Token: " BOT_TOKEN
         
-        # Check if .env exists and has the token
-        if [ -f "$ENV_FILE" ] && grep -q "TAU_BOT_TOKEN" "$ENV_FILE"; then
-            # Update existing token
-            if [[ "$(uname -s)" == "Darwin" ]]; then
-                sed -i '' "s/^TAU_BOT_TOKEN=.*/TAU_BOT_TOKEN=$BOT_TOKEN/" "$ENV_FILE"
+        if [ -z "$BOT_TOKEN" ]; then
+            print_error "No token provided. Tau requires a Telegram bot token to run."
+            echo ""
+            read -p "Try again? (Y/n): " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                step_setup_telegram_token
+                return
             else
-                sed -i "s/^TAU_BOT_TOKEN=.*/TAU_BOT_TOKEN=$BOT_TOKEN/" "$ENV_FILE"
+                print_error "Cannot continue without a Telegram bot token."
+                exit 1
             fi
-        else
-            # Append token
-            echo "TAU_BOT_TOKEN=$BOT_TOKEN" >> "$ENV_FILE"
         fi
-        
-        print_success "Token saved to $ENV_FILE"
-        
-        # Also suggest adding to shell profile
-        echo ""
-        print_info "To use Tau from anywhere, add this to your shell profile:"
-        echo ""
-        echo "  ${CYAN}export TAU_BOT_TOKEN=\"$BOT_TOKEN\"${NC}"
-        echo ""
-    else
-        print_warning "Skipping token setup. Set TAU_BOT_TOKEN before running Tau."
     fi
+    
+    # Save to .env file
+    ENV_FILE="$INSTALL_DIR/.env"
+    echo "TAU_BOT_TOKEN=$BOT_TOKEN" > "$ENV_FILE"
+    
+    echo ""
+    print_success "Token saved to $ENV_FILE"
+    
+    wait_continue
 }
 
-# Set up OpenAI API key (optional)
-setup_openai_key() {
-    print_header "Setting Up OpenAI API Key (Optional)"
+# Step 8: Setup OpenAI key (optional)
+step_setup_openai_key() {
+    print_header "Step 7: Configure OpenAI API Key (Optional)"
     
-    echo "OpenAI API key enables voice message transcription."
-    echo "This is ${BOLD}optional${NC} - Tau works without it."
-    echo ""
+    printf "OpenAI API key enables voice message transcription.\n"
+    printf "\n"
+    printf "This is %soptional%s - Tau works without it.\n" "$BOLD" "$NC"
+    printf "\n"
     
     if [ -n "$OPENAI_API_KEY" ]; then
-        print_info "OPENAI_API_KEY is already set in environment"
+        print_info "OPENAI_API_KEY is already set in your environment"
+        # Append to .env if not already there
+        ENV_FILE="$INSTALL_DIR/.env"
+        if ! grep -q "OPENAI_API_KEY" "$ENV_FILE" 2>/dev/null; then
+            echo "OPENAI_API_KEY=$OPENAI_API_KEY" >> "$ENV_FILE"
+        fi
+        wait_continue
         return
     fi
     
-    read -p "Enter your OpenAI API Key (or press Enter to skip): " API_KEY
+    read -p "Enter OpenAI API Key (or press Enter to skip): " API_KEY
     
     if [ -n "$API_KEY" ]; then
         ENV_FILE="$INSTALL_DIR/.env"
-        
-        if [ -f "$ENV_FILE" ] && grep -q "OPENAI_API_KEY" "$ENV_FILE"; then
-            if [[ "$(uname -s)" == "Darwin" ]]; then
-                sed -i '' "s/^OPENAI_API_KEY=.*/OPENAI_API_KEY=$API_KEY/" "$ENV_FILE"
-            else
-                sed -i "s/^OPENAI_API_KEY=.*/OPENAI_API_KEY=$API_KEY/" "$ENV_FILE"
-            fi
-        else
-            echo "OPENAI_API_KEY=$API_KEY" >> "$ENV_FILE"
-        fi
-        
-        print_success "API key saved to $ENV_FILE"
+        echo "OPENAI_API_KEY=$API_KEY" >> "$ENV_FILE"
+        print_success "API key saved"
     else
-        print_info "Skipping OpenAI setup. Voice features will be disabled."
+        print_info "Skipped. Voice features will be disabled."
     fi
+    
+    wait_continue
 }
 
-# Create startup script
-create_startup_script() {
-    print_header "Creating Startup Script"
+# Step 9: Launch Tau
+step_launch_tau() {
+    print_header "Step 8: Launching Tau!"
     
+    printf "%sInstallation complete!%s\n" "$GREEN" "$NC"
+    printf "\n"
+    printf "Tau is ready to run.\n"
+    printf "\n"
+    printf "%sWhat happens next:%s\n" "$BOLD" "$NC"
+    printf "\n"
+    printf "  1. Tau will start and connect to Telegram\n"
+    printf "  2. Open Telegram and find your bot\n"
+    printf "  3. Send %s/start%s to begin\n" "$CYAN" "$NC"
+    printf "\n"
+    printf "%sAvailable commands:%s\n" "$BOLD" "$NC"
+    printf "\n"
+    printf "  %s/start%s     - Initialize the bot\n" "$CYAN" "$NC"
+    printf "  %s/task%s      - Add a new task\n" "$CYAN" "$NC"
+    printf "  %s/status%s    - Check current status\n" "$CYAN" "$NC"
+    printf "  %s/adapt%s     - Self-modify the bot\n" "$CYAN" "$NC"
+    printf "  %s/restart%s   - Restart the bot\n" "$CYAN" "$NC"
+    printf "\n"
+    printf "%sTo run Tau later:%s\n" "$BOLD" "$NC"
+    printf "\n"
+    printf "  %scd %s && ./start.sh%s\n" "$CYAN" "$INSTALL_DIR" "$NC"
+    printf "\n"
+    
+    # Create start.sh for future use
     START_SCRIPT="$INSTALL_DIR/start.sh"
-    
-    cat > "$START_SCRIPT" << 'EOF'
+    cat > "$START_SCRIPT" << 'STARTEOF'
 #!/usr/bin/env bash
-# Start Tau agent
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # Load environment variables
 if [ -f .env ]; then
-    export $(grep -v '^#' .env | xargs)
+    set -a
+    source .env
+    set +a
 fi
 
-# Activate virtual environment
+# Activate virtual environment and run
 source .venv/bin/activate
-
-# Run Tau
 python -m tau
-EOF
-    
+STARTEOF
     chmod +x "$START_SCRIPT"
-    print_success "Created start.sh"
     
-    # Create systemd service for Linux (optional)
-    if [[ "$(detect_os)" == "linux" ]]; then
-        print_info "On Linux, you can run Tau as a systemd service."
-        print_info "Run: ./install.sh --systemd to set this up."
+    read -p "Launch Tau now? (Y/n): " -n 1 -r
+    echo
+    
+    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+        echo ""
+        print_step "Starting Tau..."
+        echo ""
+        
+        cd "$INSTALL_DIR"
+        
+        # Load environment variables
+        set -a
+        source .env
+        set +a
+        
+        # Activate virtual environment
+        source .venv/bin/activate
+        
+        # Run Tau
+        exec python -m tau
+    else
+        printf "\n"
+        print_info "To start Tau later, run:"
+        printf "\n"
+        printf "  %scd %s && ./start.sh%s\n" "$CYAN" "$INSTALL_DIR" "$NC"
+        printf "\n"
     fi
 }
 
-# Create systemd service (Linux only)
-create_systemd_service() {
-    if [[ "$(detect_os)" != "linux" ]]; then
-        print_error "Systemd services are only available on Linux"
-        return
-    fi
-    
-    SERVICE_FILE="$HOME/.config/systemd/user/tau.service"
-    mkdir -p "$(dirname "$SERVICE_FILE")"
-    
-    cat > "$SERVICE_FILE" << EOF
+# Main installation flow
+main() {
+    # Handle --systemd flag
+    if [[ "$1" == "--systemd" ]]; then
+        if [[ "$(detect_os)" != "linux" ]]; then
+            print_error "Systemd services are only available on Linux"
+            exit 1
+        fi
+        
+        SERVICE_FILE="$HOME/.config/systemd/user/tau.service"
+        mkdir -p "$(dirname "$SERVICE_FILE")"
+        
+        cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=Tau Self-Adapting Agent
 After=network.target
@@ -361,63 +486,13 @@ RestartSec=10
 [Install]
 WantedBy=default.target
 EOF
-    
-    print_success "Created systemd service at $SERVICE_FILE"
-    echo ""
-    echo "To enable and start Tau as a service:"
-    echo "  ${CYAN}systemctl --user daemon-reload${NC}"
-    echo "  ${CYAN}systemctl --user enable tau${NC}"
-    echo "  ${CYAN}systemctl --user start tau${NC}"
-    echo ""
-    echo "To check status:"
-    echo "  ${CYAN}systemctl --user status tau${NC}"
-}
-
-# Print final instructions
-print_final_instructions() {
-    print_header "Installation Complete!"
-    
-    echo -e "${GREEN}Tau has been installed successfully!${NC}"
-    echo ""
-    echo "Installation directory: ${BOLD}$INSTALL_DIR${NC}"
-    echo ""
-    echo "${BOLD}To start Tau:${NC}"
-    echo ""
-    echo "  ${CYAN}cd $INSTALL_DIR${NC}"
-    echo "  ${CYAN}./start.sh${NC}"
-    echo ""
-    echo "${BOLD}Or run directly:${NC}"
-    echo ""
-    echo "  ${CYAN}cd $INSTALL_DIR && source .venv/bin/activate && python -m tau${NC}"
-    echo ""
-    echo "${BOLD}First time setup:${NC}"
-    echo ""
-    echo "  1. Start Tau with one of the commands above"
-    echo "  2. Open Telegram and search for your bot"
-    echo "  3. Send ${BOLD}/start${NC} to initialize"
-    echo ""
-    echo "${BOLD}Available Telegram commands:${NC}"
-    echo ""
-    echo "  /start     - Initialize the bot"
-    echo "  /task      - Add a new task"
-    echo "  /status    - Check current status"
-    echo "  /adapt     - Self-modify the bot"
-    echo "  /restart   - Restart the bot"
-    echo ""
-    print_info "For more information, see: $INSTALL_DIR/README.md"
-}
-
-# Main installation flow
-main() {
-    print_header "Tau Installation"
-    
-    echo "This script will install Tau, a self-adapting autonomous agent"
-    echo "with Telegram integration."
-    echo ""
-    
-    # Handle --systemd flag
-    if [[ "$1" == "--systemd" ]]; then
-        create_systemd_service
+        
+        print_success "Created systemd service at $SERVICE_FILE"
+        echo ""
+        echo "To enable and start:"
+        echo "  systemctl --user daemon-reload"
+        echo "  systemctl --user enable tau"
+        echo "  systemctl --user start tau"
         exit 0
     fi
     
@@ -426,25 +501,16 @@ main() {
         INSTALL_DIR="$1"
     fi
     
-    echo "Installation directory: ${BOLD}$INSTALL_DIR${NC}"
-    echo ""
-    read -p "Continue with installation? (Y/n): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Nn]$ ]]; then
-        echo "Installation cancelled."
-        exit 0
-    fi
-    
     # Run installation steps
-    check_dependencies
-    install_uv
-    clone_repo
-    setup_python
-    setup_cursor_agent
-    setup_telegram_token
-    setup_openai_key
-    create_startup_script
-    print_final_instructions
+    step_welcome
+    step_check_dependencies
+    step_install_uv
+    step_clone_repo
+    step_setup_python
+    step_setup_cursor_agent
+    step_setup_telegram_token
+    step_setup_openai_key
+    step_launch_tau
 }
 
 # Run main function

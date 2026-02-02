@@ -1,14 +1,19 @@
 """Shared Telegram bot for Tau agent."""
 
 import os
+from pathlib import Path
+
+# Load .env file before accessing any environment variables
+WORKSPACE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+from dotenv import load_dotenv
+load_dotenv(os.path.join(WORKSPACE, ".env"))
+
 import telebot
 from datetime import datetime
-from pathlib import Path
 
 BOT_TOKEN = os.getenv("TAU_BOT_TOKEN")
 if not BOT_TOKEN:
-    raise ValueError("TAU_BOT_TOKEN environment variable is required")
-WORKSPACE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    raise ValueError("TAU_BOT_TOKEN environment variable is required. Create a .env file with TAU_BOT_TOKEN=your_token")
 CHAT_ID_FILE = os.path.join(WORKSPACE, "chat_id.txt")
 CHAT_HISTORY_FILE = os.path.join(WORKSPACE, "context", "CHAT.md")
 

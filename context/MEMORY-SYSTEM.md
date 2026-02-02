@@ -1,6 +1,6 @@
 # Memory System
 
-Barbara uses a hierarchical memory system to organize task-specific information and high-level summaries.
+Tau uses a hierarchical memory system to organize task-specific information and high-level summaries.
 
 ## Structure
 
