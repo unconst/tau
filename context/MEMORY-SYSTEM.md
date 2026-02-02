@@ -6,9 +6,9 @@ Tau uses a hierarchical memory system to organize task-specific information and 
 
 ### Task Directories
 
-Each task has its own directory under `tasks/`:
-- `tasks/task-1/` - First task
-- `tasks/task-2/` - Second task
+Each task has its own directory under `context/tasks/`:
+- `context/tasks/task-1/` - First task
+- `context/tasks/task-2/` - Second task
 - etc.
 
 Each task directory contains:
@@ -17,7 +17,7 @@ Each task directory contains:
 
 ### High-Level Memory
 
-`tasks/memory.md` contains only high-level summaries:
+`context/tasks/memory.md` contains only high-level summaries:
 - Key milestones and completions
 - Important decisions
 - Brief status updates
@@ -41,7 +41,7 @@ The chat history is particularly important because:
 
 ## Memory Writing Guidelines
 
-### Task Memory (`tasks/task-{id}/memory.md`)
+### Task Memory (`context/tasks/task-{id}/memory.md`)
 
 Write detailed, specific information:
 - Technical details: code changes, file paths, function names
@@ -50,7 +50,7 @@ Write detailed, specific information:
 - Relevant context and decisions
 - Implementation details
 
-### High-Level Memory (`tasks/memory.md`)
+### High-Level Memory (`context/tasks/memory.md`)
 
 Write concise summaries:
 - What was accomplished (not how)

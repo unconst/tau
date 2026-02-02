@@ -11,7 +11,7 @@ from .telegram import bot, save_chat_id, notify, WORKSPACE, append_chat_history
 from .agent import run_loop, TASKS_DIR, get_all_tasks
 
 # Import task-specific scripts from their task directories
-task1_path = os.path.join(WORKSPACE, "tasks", "task-1")
+task1_path = os.path.join(WORKSPACE, "context", "tasks", "task-1")
 if os.path.exists(task1_path):
     sys.path.insert(0, task1_path)
     try:
@@ -21,7 +21,7 @@ if os.path.exists(task1_path):
 else:
     run_hourly_scheduler = None
 
-MEMORY_FILE = os.path.join(WORKSPACE, "tasks", "memory.md")
+MEMORY_FILE = os.path.join(WORKSPACE, "context", "tasks", "memory.md")
 
 # Event to signal agent loop to stop
 _stop_event = threading.Event()
@@ -68,72 +68,6 @@ def transcribe_voice(voice_path: str) -> str:
     except Exception as e:
         raise Exception(f"Failed to transcribe voice: {str(e)}")
 
-
-def generate_tts(text: str, output_path: str = None) -> str:
-    """Generate text-to-speech audio using OpenAI TTS API.
-    
-    Args:
-        text: The text to convert to speech
-        output_path: Optional path to save the audio file. If None, creates a temp file.
-    
-    Returns:
-        Path to the generated audio file
-    """
-    if not openai_client:
-        raise Exception("OpenAI API key not configured")
-    
-    if not output_path:
-        # Create temporary file for audio
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as tmp_file:
-            output_path = tmp_file.name
-    
-    try:
-        response = openai_client.audio.speech.create(
-            model="tts-1",  # or "tts-1-hd" for higher quality
-            voice="alloy",  # Options: alloy, echo, fable, onyx, nova, shimmer
-            input=text
-        )
-        
-        # Save the audio file
-        with open(output_path, 'wb') as f:
-            for chunk in response.iter_bytes():
-                f.write(chunk)
-        
-        return output_path
-    except Exception as e:
-        raise Exception(f"Failed to generate TTS: {str(e)}")
-
-
-def send_voice_message(chat_id: int, text: str):
-    """Generate TTS audio and send it as a voice message via Telegram.
-    
-    Args:
-        chat_id: Telegram chat ID to send the message to
-        text: The text to convert to speech and send
-    """
-    if not openai_client:
-        raise Exception("OpenAI API key not configured")
-    
-    voice_path = None
-    try:
-        # Generate TTS audio
-        voice_path = generate_tts(text)
-        
-        # Send voice message via Telegram
-        with open(voice_path, 'rb') as voice_file:
-            bot.send_voice(chat_id, voice_file)
-        
-        # Append to chat history
-        append_chat_history("assistant", f"[voice message]: {text}")
-    except Exception as e:
-        raise Exception(f"Failed to send voice message: {str(e)}")
-    finally:
-        # Clean up temporary file
-        if voice_path and os.path.exists(voice_path):
-            try:
-                os.unlink(voice_path)
-            except Exception:
-                pass
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):

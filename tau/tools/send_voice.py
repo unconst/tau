@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-"""Script to send a voice message via Telegram using OpenAI TTS."""
+"""Send a voice message via Telegram using OpenAI TTS.
+
+Agents can call this script to send voice messages to the user on Telegram.
+
+Usage:
+    python -m tau.tools.send_voice "Your message here"
+    
+The script converts text to speech using OpenAI's TTS API and sends it as a
+voice message via Telegram.
+"""
 
 import os
 import sys
 import tempfile
-
-# Add parent directory to path to import tau
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from openai import OpenAI
 from tau.telegram import bot, get_chat_id, append_chat_history
@@ -60,15 +66,19 @@ def send_voice_message(chat_id: int, text: str):
             except Exception:
                 pass
 
+
 def main():
     """Send a voice message."""
     chat_id = get_chat_id()
     if not chat_id:
         print("Error: No chat ID found. Please send a message to the bot first.")
-        return
+        sys.exit(1)
     
-    # Default message if none provided
-    text = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "Hello! This is a voice message generated using OpenAI's text-to-speech API."
+    if len(sys.argv) < 2:
+        print('Usage: python -m tau.tools.send_voice "your message"', file=sys.stderr)
+        sys.exit(1)
+    
+    text = " ".join(sys.argv[1:])
     
     try:
         send_voice_message(chat_id, text)
@@ -76,6 +86,7 @@ def main():
     except Exception as e:
         print(f"❌ Error: {str(e)}")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
