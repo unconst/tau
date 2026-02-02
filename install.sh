@@ -86,7 +86,6 @@ detect_os() {
 
 # Step 1: Welcome
 step_welcome() {
-    clear
     print_header "Welcome to Tau"
     
     printf "%sTau%s is a self-adapting autonomous agent with Telegram integration.\n" "$BOLD" "$NC"
