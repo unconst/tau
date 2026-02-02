@@ -84,6 +84,175 @@ detect_os() {
     echo "$OS"
 }
 
+# Detect Linux distro
+detect_linux_distro() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        echo "$ID"
+    elif [ -f /etc/debian_version ]; then
+        echo "debian"
+    elif [ -f /etc/redhat-release ]; then
+        echo "rhel"
+    else
+        echo "unknown"
+    fi
+}
+
+# Install macOS developer tools (Xcode Command Line Tools)
+install_macos_dev_tools() {
+    print_step "Installing Xcode Command Line Tools..."
+    printf "\n"
+    printf "%sThis will open a dialog to install Apple's developer tools.%s\n" "$YELLOW" "$NC"
+    printf "These tools include git, compilers, and other essentials.\n"
+    printf "\n"
+    
+    # Check if already installed
+    if xcode-select -p &>/dev/null; then
+        print_success "Xcode Command Line Tools already installed"
+        return 0
+    fi
+    
+    # Trigger the install dialog
+    xcode-select --install 2>/dev/null || true
+    
+    printf "\n"
+    printf "%sPlease complete the installation in the dialog that appeared.%s\n" "$YELLOW" "$NC"
+    printf "Press Enter once the installation is complete..."
+    read -r </dev/tty
+    
+    # Verify installation
+    if xcode-select -p &>/dev/null; then
+        print_success "Xcode Command Line Tools installed successfully"
+        return 0
+    else
+        print_warning "Could not verify installation. Continuing anyway..."
+        return 1
+    fi
+}
+
+# Install Linux dependencies based on distro
+install_linux_dependencies() {
+    local distro=$(detect_linux_distro)
+    
+    print_step "Installing system dependencies for $distro..."
+    printf "\n"
+    
+    case "$distro" in
+        ubuntu|debian|pop|linuxmint|elementary)
+            print_info "Using apt package manager"
+            printf "\n"
+            printf "This will run: %ssudo apt update && sudo apt install -y git python3 python3-pip python3-venv curl build-essential%s\n" "$CYAN" "$NC"
+            printf "\n"
+            printf "Continue? (Y/n): "
+            read -r -n 1 REPLY </dev/tty
+            printf "\n"
+            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                sudo apt update
+                sudo apt install -y git python3 python3-pip python3-venv curl build-essential
+            fi
+            ;;
+        fedora|rhel|centos|rocky|alma)
+            print_info "Using dnf package manager"
+            printf "\n"
+            printf "This will run: %ssudo dnf install -y git python3 python3-pip python3-devel curl gcc gcc-c++ make%s\n" "$CYAN" "$NC"
+            printf "\n"
+            printf "Continue? (Y/n): "
+            read -r -n 1 REPLY </dev/tty
+            printf "\n"
+            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                sudo dnf install -y git python3 python3-pip python3-devel curl gcc gcc-c++ make
+            fi
+            ;;
+        arch|manjaro|endeavouros)
+            print_info "Using pacman package manager"
+            printf "\n"
+            printf "This will run: %ssudo pacman -Sy --noconfirm git python python-pip curl base-devel%s\n" "$CYAN" "$NC"
+            printf "\n"
+            printf "Continue? (Y/n): "
+            read -r -n 1 REPLY </dev/tty
+            printf "\n"
+            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                sudo pacman -Sy --noconfirm git python python-pip curl base-devel
+            fi
+            ;;
+        opensuse*|suse*)
+            print_info "Using zypper package manager"
+            printf "\n"
+            printf "This will run: %ssudo zypper install -y git python3 python3-pip curl gcc gcc-c++ make%s\n" "$CYAN" "$NC"
+            printf "\n"
+            printf "Continue? (Y/n): "
+            read -r -n 1 REPLY </dev/tty
+            printf "\n"
+            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                sudo zypper install -y git python3 python3-pip curl gcc gcc-c++ make
+            fi
+            ;;
+        alpine)
+            print_info "Using apk package manager"
+            printf "\n"
+            printf "This will run: %ssudo apk add git python3 py3-pip curl build-base%s\n" "$CYAN" "$NC"
+            printf "\n"
+            printf "Continue? (Y/n): "
+            read -r -n 1 REPLY </dev/tty
+            printf "\n"
+            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                sudo apk add git python3 py3-pip curl build-base
+            fi
+            ;;
+        *)
+            print_warning "Unknown Linux distribution: $distro"
+            printf "\n"
+            printf "Please manually install: git, python3, python3-pip, python3-venv, curl, and build tools\n"
+            printf "\n"
+            printf "Press Enter to continue..."
+            read -r </dev/tty
+            ;;
+    esac
+}
+
+# Install Homebrew on macOS (optional, for Python installation)
+install_homebrew() {
+    if command_exists brew; then
+        print_success "Homebrew is already installed"
+        return 0
+    fi
+    
+    printf "Homebrew is a package manager that can install Python and other tools.\n"
+    printf "\n"
+    printf "Install Homebrew? (Y/n): "
+    read -r -n 1 REPLY </dev/tty
+    printf "\n"
+    
+    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+        print_step "Installing Homebrew..."
+        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+        
+        # Add to PATH for Apple Silicon Macs
+        if [ -f "/opt/homebrew/bin/brew" ]; then
+            eval "$(/opt/homebrew/bin/brew shellenv)"
+        fi
+        
+        print_success "Homebrew installed"
+    fi
+}
+
+# Install Python via Homebrew on macOS
+install_python_macos() {
+    if ! command_exists brew; then
+        install_homebrew
+    fi
+    
+    if command_exists brew; then
+        print_step "Installing Python via Homebrew..."
+        brew install python3
+        print_success "Python installed"
+    else
+        print_error "Cannot install Python without Homebrew"
+        print_info "Please install Python manually from https://python.org"
+        return 1
+    fi
+}
+
 # Step 1: Welcome
 step_welcome() {
     print_header "Welcome to Tau"
@@ -92,7 +261,7 @@ step_welcome() {
     printf "\n"
     printf "This installer will guide you through:\n"
     printf "\n"
-    printf "  %sStep 1%s → Check system dependencies\n" "$CYAN" "$NC"
+    printf "  %sStep 1%s → Check & install system dependencies (git, python, dev tools)\n" "$CYAN" "$NC"
     printf "  %sStep 2%s → Install uv (Python package manager)\n" "$CYAN" "$NC"
     printf "  %sStep 3%s → Clone the Tau repository\n" "$CYAN" "$NC"
     printf "  %sStep 4%s → Set up Python environment\n" "$CYAN" "$NC"
@@ -100,6 +269,8 @@ step_welcome() {
     printf "  %sStep 6%s → Configure Telegram bot token\n" "$CYAN" "$NC"
     printf "  %sStep 7%s → Configure OpenAI API key (optional)\n" "$CYAN" "$NC"
     printf "  %sStep 8%s → Launch Tau!\n" "$CYAN" "$NC"
+    printf "\n"
+    printf "%sSupported systems:%s macOS (Intel/Apple Silicon), Linux (Ubuntu, Debian, Fedora, Arch, etc.)\n" "$BOLD" "$NC"
     printf "\n"
     printf "Installation directory: %s%s%s\n" "$BOLD" "$INSTALL_DIR" "$NC"
     printf "\n"
@@ -117,7 +288,19 @@ step_welcome() {
 step_check_dependencies() {
     print_header "Step 1: Checking Dependencies"
     
-    local missing_critical=false
+    local OS=$(detect_os)
+    local missing_git=false
+    local missing_python=false
+    local missing_curl=false
+    
+    # Check curl (needed for uv installation)
+    print_step "Checking for curl..."
+    if command_exists curl; then
+        print_success "curl is installed"
+    else
+        print_error "curl is not installed"
+        missing_curl=true
+    fi
     
     # Check git
     print_step "Checking for git..."
@@ -125,7 +308,7 @@ step_check_dependencies() {
         print_success "git is installed ($(git --version | cut -d' ' -f3))"
     else
         print_error "git is not installed"
-        missing_critical=true
+        missing_git=true
     fi
     
     # Check Python
@@ -135,7 +318,7 @@ step_check_dependencies() {
         print_success "Python $PYTHON_VERSION is installed"
     else
         print_error "Python 3 is not installed"
-        missing_critical=true
+        missing_python=true
     fi
     
     # Check uv
@@ -154,11 +337,101 @@ step_check_dependencies() {
         print_warning "Cursor agent CLI is not installed (will guide installation)"
     fi
     
-    # Exit if critical dependencies are missing
-    if [ "$missing_critical" = true ]; then
+    # Handle missing dependencies
+    if [ "$missing_git" = true ] || [ "$missing_python" = true ] || [ "$missing_curl" = true ]; then
         echo ""
-        print_error "Missing critical dependencies. Please install git and Python 3 first."
-        exit 1
+        print_warning "Missing some required dependencies"
+        printf "\n"
+        
+        if [ "$OS" = "macos" ]; then
+            printf "On %smacOS%s, we can install developer tools automatically.\n" "$BOLD" "$NC"
+            printf "\n"
+            printf "Install missing dependencies? (Y/n): "
+            read -r -n 1 REPLY </dev/tty
+            printf "\n"
+            
+            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                # Install Xcode Command Line Tools (provides git, curl, etc.)
+                if [ "$missing_git" = true ] || [ "$missing_curl" = true ]; then
+                    install_macos_dev_tools
+                fi
+                
+                # Install Python if missing
+                if [ "$missing_python" = true ]; then
+                    install_python_macos
+                fi
+                
+                # Re-check dependencies
+                printf "\n"
+                print_step "Re-checking dependencies..."
+                
+                if ! command_exists git; then
+                    print_error "git is still not installed"
+                else
+                    print_success "git is now available"
+                fi
+                
+                if ! command_exists python3; then
+                    print_error "Python 3 is still not installed"
+                else
+                    print_success "Python 3 is now available"
+                fi
+                
+                if ! command_exists curl; then
+                    print_error "curl is still not installed"
+                else
+                    print_success "curl is now available"
+                fi
+            fi
+            
+        elif [ "$OS" = "linux" ]; then
+            printf "On %sLinux%s, we can install dependencies using your package manager.\n" "$BOLD" "$NC"
+            printf "\n"
+            printf "Install missing dependencies? (Y/n): "
+            read -r -n 1 REPLY </dev/tty
+            printf "\n"
+            
+            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                install_linux_dependencies
+                
+                # Re-check dependencies
+                printf "\n"
+                print_step "Re-checking dependencies..."
+                
+                if ! command_exists git; then
+                    print_error "git is still not installed"
+                else
+                    print_success "git is now available"
+                fi
+                
+                if ! command_exists python3; then
+                    print_error "Python 3 is still not installed"
+                else
+                    print_success "Python 3 is now available"
+                fi
+                
+                if ! command_exists curl; then
+                    print_error "curl is still not installed"
+                else
+                    print_success "curl is now available"
+                fi
+            fi
+        else
+            print_error "Unknown operating system. Please install git, python3, and curl manually."
+        fi
+        
+        # Final check - exit if still missing critical dependencies
+        if ! command_exists git || ! command_exists python3 || ! command_exists curl; then
+            echo ""
+            print_error "Missing critical dependencies. Cannot continue."
+            printf "\n"
+            printf "Please manually install:\n"
+            if ! command_exists git; then printf "  - git\n"; fi
+            if ! command_exists python3; then printf "  - python3\n"; fi
+            if ! command_exists curl; then printf "  - curl\n"; fi
+            printf "\n"
+            exit 1
+        fi
     fi
     
     wait_continue
