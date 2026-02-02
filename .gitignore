@@ -1,0 +1,27 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Runtime state
+chat_id.txt
+
+# Environment files (contain secrets)
+.env
+.env.local
+
+# Run-specific files
+context/CHAT.md
+context/FACTS.md
+tasks/memory.md
+tasks/*/memory.md
+
+# Task-generated files (keep task.md, ignore outputs)
+tasks/*/*.md
+!tasks/*/task.md

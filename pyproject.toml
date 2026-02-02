@@ -1,0 +1,13 @@
+[project]
+name = "tau"
+version = "0.1.0"
+description = "Self-adapting agent with two-buffer architecture"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["pytelegrambotapi", "openai"]
+
+[project.scripts]
+tau = "tau:main"
+
+[tool.setuptools]
+packages = ["tau"]
