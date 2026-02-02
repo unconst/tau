@@ -542,30 +542,33 @@ step_setup_cursor_agent() {
     
     printf "%sThe Cursor agent CLI is required for Tau to function.%s\n" "$YELLOW" "$NC"
     printf "\n"
-    printf "To install it:\n"
-    printf "\n"
-    printf "  %s1.%s Open %sCursor IDE%s\n" "$BOLD" "$NC" "$CYAN" "$NC"
-    printf "\n"
-    printf "  %s2.%s Press %sCmd+Shift+P%s (macOS) or %sCtrl+Shift+P%s (Linux)\n" "$BOLD" "$NC" "$CYAN" "$NC" "$CYAN" "$NC"
-    printf "\n"
-    printf "  %s3.%s Type: %sInstall 'agent' command%s\n" "$BOLD" "$NC" "$CYAN" "$NC"
-    printf "\n"
-    printf "  %s4.%s Select the option to install the CLI\n" "$BOLD" "$NC"
+    printf "This will install the Cursor agent CLI from %shttps://cursor.com/install%s\n" "$CYAN" "$NC"
     printf "\n"
     
-    printf "Press Enter once you've installed the Cursor agent CLI (or 's' to skip): "
+    printf "Install Cursor agent CLI? (Y/n): "
     read -r -n 1 REPLY </dev/tty
     printf "\n"
     
-    if [[ ! $REPLY =~ ^[Ss]$ ]]; then
+    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+        print_step "Installing Cursor agent CLI..."
+        printf "\n"
+        
+        curl https://cursor.com/install -fsSL | bash
+        
+        # Add common install locations to PATH for current session
+        export PATH="$HOME/.cursor/bin:$HOME/.local/bin:$PATH"
+        
+        printf "\n"
         if command_exists agent; then
-            print_success "Cursor agent CLI is now installed!"
+            print_success "Cursor agent CLI installed successfully!"
         else
-            print_warning "Cursor agent CLI not detected yet."
-            print_info "You can install it later - Tau will still start."
+            print_warning "Cursor agent CLI installed but not found in PATH."
+            print_info "You may need to restart your terminal or add it to your PATH."
+            print_info "Tau will still start - just ensure 'agent' is available."
         fi
     else
-        print_info "Skipped. You can install it later."
+        print_info "Skipped. You can install it later with:"
+        printf "  %scurl https://cursor.com/install -fsSL | bash%s\n" "$CYAN" "$NC"
     fi
     
     wait_continue
