@@ -459,17 +459,14 @@ def run_loop(stop_event=None):
             
             incomplete = find_incomplete(tasks)
             
-            # Send status ping every minute
+            # Send status ping every minute (only if there are tasks)
             if incomplete:
                 status_msg = f"📋 Status: {len(incomplete)} task(s) pending"
                 if len(incomplete) <= 3:
                     # Show task titles if 3 or fewer
                     task_list = "\n".join([f"  • {t['title'][:50]}" for t in incomplete])
                     status_msg += f"\n{task_list}"
-            else:
-                status_msg = "📋 Status: No tasks"
-            
-            notify(status_msg)
+                notify(status_msg)
             
             # Process tasks if there are any
             if incomplete:

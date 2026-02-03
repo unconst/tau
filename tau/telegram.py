@@ -79,8 +79,24 @@ def append_chat_history(role: str, content: str):
         f.write("---\n\n")
 
 
-def get_chat_history() -> str:
-    """Get the full chat history from context/CHAT.md."""
+def get_chat_history(max_lines: int = 100) -> str:
+    """Get recent chat history from context/CHAT.md.
+    
+    Args:
+        max_lines: Maximum number of lines to return (default 100)
+    
+    Returns:
+        Recent chat history, truncated to max_lines
+    """
     if os.path.exists(CHAT_HISTORY_FILE):
-        return open(CHAT_HISTORY_FILE).read()
+        with open(CHAT_HISTORY_FILE) as f:
+            lines = f.readlines()
+        
+        if len(lines) <= max_lines:
+            return "".join(lines)
+        
+        # Return header (first 10 lines) + last (max_lines - 10) lines
+        header = lines[:10]
+        recent = lines[-(max_lines - 10):]
+        return "".join(header) + "\n[... earlier messages truncated ...]\n\n" + "".join(recent)
     return ""

@@ -3,10 +3,23 @@
 # Tau Installation Script
 # 
 # Usage:
+#   # Install via curl (will prompt for install location):
 #   curl -fsSL https://raw.githubusercontent.com/unconst/tau/main/install.sh | bash
 #
-# Or clone and run locally:
-#   ./install.sh
+#   # Install to a specific directory via curl:
+#   TAU_INSTALL_DIR=/path/to/my-tau curl -fsSL https://raw.githubusercontent.com/unconst/tau/main/install.sh | bash
+#
+#   # Run from a cloned repo (installs in current directory):
+#   git clone https://github.com/unconst/tau.git my-tau
+#   cd my-tau && ./install.sh
+#
+#   # Specify custom install directory:
+#   ./install.sh /path/to/install
+#
+# Multiple Instances:
+#   You can run multiple Tau bots on the same machine by installing to
+#   different directories. Each instance gets unique service names derived
+#   from the installation path, preventing conflicts.
 #
 
 set -e
@@ -20,9 +33,69 @@ CYAN=$'\033[0;36m'
 NC=$'\033[0m'
 BOLD=$'\033[1m'
 
-# Default installation directory
-INSTALL_DIR="${TAU_INSTALL_DIR:-$HOME/tau}"
+# Repo URL for cloning (only used if not running from existing repo)
 REPO_URL="${TAU_REPO_URL:-https://github.com/unconst/tau.git}"
+
+# Detect if running from an existing repo (local execution vs curl pipe)
+detect_install_context() {
+    local script_dir=""
+    
+    # Check if script is being run from a file (not piped)
+    if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        
+        # Check if this looks like a tau repo (has key files)
+        if [ -f "$script_dir/tauctl" ] && [ -f "$script_dir/supervisord.conf" ] && [ -d "$script_dir/tau" ]; then
+            # Running from existing repo - use this directory
+            INSTALL_DIR="$script_dir"
+            RUNNING_FROM_REPO=true
+            return 0
+        fi
+    fi
+    
+    # Not running from repo - need to clone or use specified directory
+    RUNNING_FROM_REPO=false
+    
+    # Use environment variable if set
+    if [ -n "${TAU_INSTALL_DIR:-}" ]; then
+        INSTALL_DIR="$TAU_INSTALL_DIR"
+        return 0
+    fi
+    
+    # Default: will prompt user during welcome step
+    INSTALL_DIR=""
+}
+
+# Generate a unique instance ID from the installation path
+# This ensures multiple taobots don't conflict with each other
+generate_instance_id() {
+    local path="$1"
+    # Create a short, safe identifier from the path
+    # Use the last component of the path, sanitized
+    local base_name=$(basename "$path")
+    # Sanitize: lowercase, replace non-alphanumeric with dashes
+    local sanitized=$(echo "$base_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//')
+    
+    # If the sanitized name is empty or just "tau", add a hash of the full path
+    if [ -z "$sanitized" ] || [ "$sanitized" = "tau" ]; then
+        # Add first 6 chars of md5 hash for uniqueness
+        local hash=$(echo -n "$path" | md5 2>/dev/null || echo -n "$path" | md5sum | cut -d' ' -f1)
+        hash="${hash:0:6}"
+        if [ -z "$sanitized" ]; then
+            sanitized="tau-$hash"
+        else
+            sanitized="$sanitized-$hash"
+        fi
+    fi
+    
+    echo "$sanitized"
+}
+
+# Instance ID will be set after INSTALL_DIR is determined
+INSTANCE_ID=""
+
+# Detect installation context on script load
+detect_install_context
 
 # Store the token for later use
 BOT_TOKEN=""
@@ -259,11 +332,42 @@ step_welcome() {
     
     printf "%sTau%s A chat agent that learns from you, writes its own software to upgrade itself, and solve problems for you. \n" "$BOLD" "$NC"
     printf "\n"
+    
+    # Determine installation directory if not already set
+    if [ -z "$INSTALL_DIR" ]; then
+        printf "%sWhere would you like to install Tau?%s\n" "$BOLD" "$NC"
+        printf "\n"
+        printf "Enter installation path (or press Enter for %s$HOME/tau%s): " "$CYAN" "$NC"
+        read -r INSTALL_PATH </dev/tty
+        
+        if [ -z "$INSTALL_PATH" ]; then
+            INSTALL_DIR="$HOME/tau"
+        else
+            # Expand ~ to $HOME
+            INSTALL_DIR="${INSTALL_PATH/#\~/$HOME}"
+            # Convert to absolute path
+            INSTALL_DIR="$(cd "$(dirname "$INSTALL_DIR")" 2>/dev/null && pwd)/$(basename "$INSTALL_DIR")" || INSTALL_DIR="$INSTALL_PATH"
+        fi
+        printf "\n"
+    fi
+    
+    # Generate unique instance ID from the installation path
+    INSTANCE_ID=$(generate_instance_id "$INSTALL_DIR")
+    
+    if [ "$RUNNING_FROM_REPO" = true ]; then
+        printf "%sDetected existing Tau repository%s\n" "$GREEN" "$NC"
+        printf "\n"
+    fi
+    
     printf "This installer will guide you through:\n"
     printf "\n"
     printf "  %sStep 1%s → Check & install system dependencies (git, python, dev tools)\n" "$CYAN" "$NC"
     printf "  %sStep 2%s → Install uv (Python package manager)\n" "$CYAN" "$NC"
-    printf "  %sStep 3%s → Clone the Tau repository\n" "$CYAN" "$NC"
+    if [ "$RUNNING_FROM_REPO" = true ]; then
+        printf "  %sStep 3%s → (Skipped - using existing repository)\n" "$CYAN" "$NC"
+    else
+        printf "  %sStep 3%s → Clone the Tau repository\n" "$CYAN" "$NC"
+    fi
     printf "  %sStep 4%s → Set up Python environment & supervisor\n" "$CYAN" "$NC"
     printf "  %sStep 5%s → Install Cursor agent CLI\n" "$CYAN" "$NC"
     printf "  %sStep 6%s → Configure Telegram bot token\n" "$CYAN" "$NC"
@@ -274,6 +378,10 @@ step_welcome() {
     printf "%sSupported systems:%s macOS (Intel/Apple Silicon), Linux (Ubuntu, Debian, Fedora, Arch, etc.)\n" "$BOLD" "$NC"
     printf "\n"
     printf "Installation directory: %s%s%s\n" "$BOLD" "$INSTALL_DIR" "$NC"
+    printf "Instance ID: %s%s%s (used for service naming)\n" "$CYAN" "$INSTANCE_ID" "$NC"
+    printf "\n"
+    printf "%sNote:%s You can run multiple Tau bots on this machine by installing to different directories.\n" "$YELLOW" "$NC"
+    printf "Each instance will have its own configuration and run independently.\n"
     printf "\n"
     
     printf "Ready to begin? (Y/n): "
@@ -473,6 +581,28 @@ step_install_uv() {
 step_clone_repo() {
     print_header "Step 3: Cloning Tau Repository"
     
+    # If running from existing repo, we just need to be in that directory
+    if [ "$RUNNING_FROM_REPO" = true ]; then
+        print_success "Using existing repository at $INSTALL_DIR"
+        printf "\n"
+        
+        # Offer to update
+        printf "Update to latest version? (Y/n): "
+        read -r -n 1 REPLY </dev/tty
+        printf "\n"
+        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            print_step "Updating repository..."
+            cd "$INSTALL_DIR"
+            git pull origin main || print_warning "Could not pull updates (you may have local changes)"
+        else
+            print_info "Using current version"
+        fi
+        
+        cd "$INSTALL_DIR"
+        wait_continue
+        return
+    fi
+    
     if [ -d "$INSTALL_DIR" ]; then
         print_info "Tau directory already exists at $INSTALL_DIR"
         printf "\n"
@@ -496,6 +626,9 @@ step_clone_repo() {
             fi
         fi
     else
+        # Create parent directory if needed
+        mkdir -p "$(dirname "$INSTALL_DIR")"
+        
         print_step "Cloning from $REPO_URL..."
         echo ""
         git clone "$REPO_URL" "$INSTALL_DIR"
@@ -743,11 +876,13 @@ step_setup_startup() {
 # Setup launchd on macOS
 setup_launchd_startup() {
     local PLIST_DIR="$HOME/Library/LaunchAgents"
-    local PLIST_FILE="$PLIST_DIR/com.tau.supervisor.plist"
+    # Use unique plist name based on instance ID to support multiple taobots
+    local PLIST_NAME="com.tau.$INSTANCE_ID.supervisor"
+    local PLIST_FILE="$PLIST_DIR/$PLIST_NAME.plist"
     
     mkdir -p "$PLIST_DIR"
     
-    print_step "Creating LaunchAgent for supervisord..."
+    print_step "Creating LaunchAgent for supervisord (instance: $INSTANCE_ID)..."
     
     cat > "$PLIST_FILE" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -755,7 +890,7 @@ setup_launchd_startup() {
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.tau.supervisor</string>
+    <string>$PLIST_NAME</string>
     <key>ProgramArguments</key>
     <array>
         <string>$INSTALL_DIR/.venv/bin/supervisord</string>
@@ -791,7 +926,7 @@ EOF
     launchctl unload "$PLIST_FILE" 2>/dev/null || true
     launchctl load "$PLIST_FILE"
     
-    print_success "Tau will now start automatically on login!"
+    print_success "Tau ($INSTANCE_ID) will now start automatically on login!"
     printf "\n"
     print_info "To disable auto-start later:"
     printf "  %slaunchctl unload %s%s\n" "$CYAN" "$PLIST_FILE" "$NC"
@@ -800,15 +935,17 @@ EOF
 # Setup systemd on Linux
 setup_systemd_startup() {
     local SERVICE_DIR="$HOME/.config/systemd/user"
-    local SERVICE_FILE="$SERVICE_DIR/tau-supervisor.service"
+    # Use unique service name based on instance ID to support multiple taobots
+    local SERVICE_NAME="tau-$INSTANCE_ID"
+    local SERVICE_FILE="$SERVICE_DIR/$SERVICE_NAME.service"
     
     mkdir -p "$SERVICE_DIR"
     
-    print_step "Creating systemd user service..."
+    print_step "Creating systemd user service (instance: $INSTANCE_ID)..."
     
     cat > "$SERVICE_FILE" << EOF
 [Unit]
-Description=Tau Supervisord
+Description=Tau Supervisord ($INSTANCE_ID)
 After=network.target
 
 [Service]
@@ -827,17 +964,17 @@ EOF
     # Reload and enable
     print_step "Enabling systemd service..."
     systemctl --user daemon-reload
-    systemctl --user enable tau-supervisor
-    systemctl --user start tau-supervisor
+    systemctl --user enable "$SERVICE_NAME"
+    systemctl --user start "$SERVICE_NAME"
     
     # Enable lingering so user services start at boot
     print_step "Enabling user service persistence..."
     loginctl enable-linger "$USER" 2>/dev/null || print_warning "Could not enable linger (may need sudo)"
     
-    print_success "Tau will now start automatically on login!"
+    print_success "Tau ($INSTANCE_ID) will now start automatically on login!"
     printf "\n"
     print_info "To disable auto-start later:"
-    printf "  %ssystemctl --user disable tau-supervisor%s\n" "$CYAN" "$NC"
+    printf "  %ssystemctl --user disable %s%s\n" "$CYAN" "$SERVICE_NAME" "$NC"
 }
 
 # Step 10: Launch Tau
@@ -920,9 +1057,17 @@ step_launch_tau() {
 
 # Main installation flow
 main() {
-    # Handle custom install directory
+    # Handle custom install directory from command line (overrides auto-detection)
     if [[ -n "$1" ]] && [[ "$1" != --* ]]; then
         INSTALL_DIR="$1"
+        # Expand ~ to $HOME
+        INSTALL_DIR="${INSTALL_DIR/#\~/$HOME}"
+        # Check if this is an existing repo
+        if [ -f "$INSTALL_DIR/tauctl" ] && [ -f "$INSTALL_DIR/supervisord.conf" ] && [ -d "$INSTALL_DIR/tau" ]; then
+            RUNNING_FROM_REPO=true
+        else
+            RUNNING_FROM_REPO=false
+        fi
     fi
     
     # Run installation steps

@@ -31,3 +31,6 @@ tasks/*/memory.md
 tasks/*/*.md
 tasks/*/*.py
 !tasks/*/task.md
+
+# Context tasks (runtime-generated)
+context/tasks/

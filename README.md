@@ -1,9 +1,13 @@
 # Tau
 
-A self-adapting autonomous agent with Telegram integration. Tau continuously processes tasks, learns from interactions, and can modify its own code.
+A chat agent that learns from you, writes its own software to upgrade itself, and solve problems for you. 
 
-## Running
+## How to install?
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/unconst/tau/main/install.sh | bash
 ```
+
+## How to use?
+
+Ask the agent.

@@ -3,12 +3,25 @@ import subprocess
 import sys
 import threading
 import tempfile
+import logging
 from datetime import datetime
 from pathlib import Path
 
 from openai import OpenAI
 from .telegram import bot, save_chat_id, notify, WORKSPACE, append_chat_history
 from .agent import run_loop, TASKS_DIR, get_all_tasks
+
+# Configure logging
+LOG_FILE = os.path.join(WORKSPACE, "logs", "tau.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # Import task-specific scripts from their task directories
 task1_path = os.path.join(WORKSPACE, "context", "tasks", "task-1")
@@ -134,10 +147,11 @@ def adapt_bot(message):
     
     try:
         result = subprocess.run(
-            ["agent", "--force", "--model", "composer-1",
+            ["agent", "--force", "--model", "claude-opus-4-5",
              "--output-format=text", "--print", prompt],
             capture_output=True,
             text=True,
+            stdin=subprocess.DEVNULL,  # Prevent agent from waiting for input
             timeout=300,  # 5 min timeout for code changes
             cwd=WORKSPACE
         )
@@ -307,7 +321,7 @@ Please respond to the user's message above, considering the full context of our 
                 [
                     "agent",
                     "--force",
-                    "--model", "composer-1",
+                    "--model", "gemini-3-flash",
                     "--mode=ask",
                     "--output-format=text",
                     "--print",
@@ -315,6 +329,7 @@ Please respond to the user's message above, considering the full context of our 
                 ],
                 capture_output=True,
                 text=True,
+                stdin=subprocess.DEVNULL,  # Prevent agent from waiting for input
                 timeout=120
             )
             response = result.stdout.strip() if result.stdout else result.stderr.strip()
@@ -366,16 +381,19 @@ def send_typing_action(chat_id, stop_event):
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
     """Handle all non-command text messages by calling the agent."""
+    logger.info(f"=== MESSAGE RECEIVED: '{message.text[:50]}...' ===" if len(message.text or '') > 50 else f"=== MESSAGE RECEIVED: '{message.text}' ===")
     save_chat_id(message.chat.id)
     
     # Skip if message has no text
     if not message.text:
+        logger.info("No text in message, skipping")
         bot.reply_to(message, "📨 Received your message.")
         return
     
     # Get chat history BEFORE appending current message (so current message only appears once)
     from .telegram import get_chat_history
     chat_history = get_chat_history()
+    logger.info(f"Chat history loaded: {len(chat_history)} chars")
     
     # Now append the user message
     append_chat_history("user", message.text)
@@ -389,6 +407,8 @@ CURRENT USER MESSAGE:
 
 Please respond to the user's message above, considering the full context of our conversation history."""
     
+    logger.info(f"Total prompt size: {len(prompt_with_context)} chars")
+    
     # Start typing indicator in background
     typing_stop = threading.Event()
     typing_thread = threading.Thread(
@@ -398,12 +418,16 @@ Please respond to the user's message above, considering the full context of our 
     )
     typing_thread.start()
     
+    start_time = datetime.now()
+    logger.info("Calling agent CLI...")
+    
     try:
+        # CRITICAL: stdin=subprocess.DEVNULL prevents agent from waiting for input
         result = subprocess.run(
             [
                 "agent",
                 "--force",
-                "--model", "composer-1",
+                "--model", "gemini-3-flash",
                 "--mode=ask",
                 "--output-format=text",
                 "--print",
@@ -411,34 +435,56 @@ Please respond to the user's message above, considering the full context of our 
             ],
             capture_output=True,
             text=True,
-            timeout=120
+            stdin=subprocess.DEVNULL,
+            timeout=60
         )
+        
+        elapsed = (datetime.now() - start_time).total_seconds()
+        logger.info(f"Agent completed in {elapsed:.1f}s, exit code: {result.returncode}")
+        
         response = result.stdout.strip() if result.stdout else result.stderr.strip()
         if not response:
+            logger.warning("Agent returned empty response")
             response = "No response from agent."
-        bot.reply_to(message, response)
+        else:
+            logger.info(f"Response preview: {response[:100]}...")
+        
+        bot.reply_to(message, response[:4000])
         append_chat_history("assistant", response)
+        logger.info("Response sent to Telegram")
+        
     except subprocess.TimeoutExpired:
+        elapsed = (datetime.now() - start_time).total_seconds()
+        logger.error(f"Agent TIMEOUT after {elapsed:.1f}s")
         error_msg = "Request timed out."
         bot.reply_to(message, error_msg)
         append_chat_history("assistant", error_msg)
     except Exception as e:
+        elapsed = (datetime.now() - start_time).total_seconds()
+        logger.error(f"Agent ERROR after {elapsed:.1f}s: {str(e)}")
         error_msg = f"Error: {str(e)}"
         bot.reply_to(message, error_msg)
         append_chat_history("assistant", error_msg)
     finally:
-        # Stop typing indicator
         typing_stop.set()
+        logger.info("=== MESSAGE HANDLING COMPLETE ===")
+        logger.info("=== MESSAGE HANDLING COMPLETE ===")
 
 def main():
     """Start Tau: agent loop in background, Telegram bot in foreground."""
+    logger.info("=" * 50)
+    logger.info("TAU STARTING")
+    logger.info("=" * 50)
+    
     from .telegram import get_chat_id
     
     # Send startup message if we have a saved chat ID
     chat_id = get_chat_id()
     if chat_id:
+        logger.info(f"Found saved chat_id: {chat_id}")
         notify("🤖 Tau is online and ready!\n\nCommands:\n/task - Add a task\n/status - Check status\n/adapt - Self-modify\n/restart - Restart bot")
     else:
+        logger.info("No saved chat_id, waiting for /start command")
         print("Tau starting... Send /start in Telegram to connect.")
     
     # Start agent loop in background thread
