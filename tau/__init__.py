@@ -9,7 +9,7 @@ from pathlib import Path
 
 from openai import OpenAI
 from .telegram import bot, save_chat_id, notify, WORKSPACE, append_chat_history
-from .agent import run_loop, run_story_loop, TASKS_DIR, get_all_tasks
+from .agent import run_loop, run_story_loop, TASKS_DIR, get_all_tasks, git_commit_changes
 
 # Configure logging
 LOG_FILE = os.path.join(WORKSPACE, "logs", "tau.log")
@@ -155,6 +155,9 @@ def adapt_bot(message):
             timeout=300,  # 5 min timeout for code changes
             cwd=WORKSPACE
         )
+        
+        # Commit any changes made by the agent
+        git_commit_changes(prompt)
         
         # Just checkmark when done
         bot.reply_to(message, "✅")

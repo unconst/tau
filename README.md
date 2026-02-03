@@ -23,4 +23,6 @@ Use `/task <prompt>` to add a longer running challenge which the agent comes bac
 
 Tau maintains a directory on your computer (where you installed it) this is the full agent context. You can add files to it etc and it will all come into contact with your agent.
 
+## License
 
+MIT License - see [LICENSE](LICENSE) for details.
