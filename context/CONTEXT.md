@@ -17,6 +17,5 @@ For the active task:
 
 - `context/tasks/memory.md` (recent)
 - `context/CHAT.md` (recent)
-- `context/STORY.md` (recent) - summarized event log
 
 If required context is missing or ambiguous, ask the user.

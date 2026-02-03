@@ -9,7 +9,7 @@ from pathlib import Path
 
 from openai import OpenAI
 from .telegram import bot, save_chat_id, notify, WORKSPACE, append_chat_history
-from .agent import run_loop, run_story_loop, run_story_prune_loop, TASKS_DIR, get_all_tasks, git_commit_changes, set_debug_mode
+from .agent import run_loop, TASKS_DIR, get_all_tasks, git_commit_changes, set_debug_mode
 import re
 
 # Debug mode flag - controls verbose notifications
@@ -411,7 +411,7 @@ def adapt_bot(message):
             capture_output=True,
             text=True,
             stdin=subprocess.DEVNULL,  # Prevent agent from waiting for input
-            timeout=300,  # 5 min timeout for code changes
+            timeout=600,  # 10 min timeout for code changes
             cwd=WORKSPACE
         )
         
@@ -752,24 +752,6 @@ def main():
         name="AgentLoop"
     )
     agent_thread.start()
-    
-    # Start story update loop in background thread (runs every 5 minutes)
-    story_thread = threading.Thread(
-        target=run_story_loop,
-        args=(_stop_event,),
-        daemon=True,
-        name="StoryLoop"
-    )
-    story_thread.start()
-    
-    # Start story prune loop in background thread (runs every 6 hours)
-    prune_thread = threading.Thread(
-        target=run_story_prune_loop,
-        args=(_stop_event,),
-        daemon=True,
-        name="StoryPruneLoop"
-    )
-    prune_thread.start()
     
     # Start cron loop in background thread
     cron_thread = threading.Thread(

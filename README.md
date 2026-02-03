@@ -20,8 +20,8 @@ Use `<prompt>` calls to ask questions normally
 Use `/adapt <prompt>` to change the agent code directly 
 > (i.e. "/adapt Change the code to accept a new `/plan` command").
 
-Use `/task <prompt>` to add a longer running challenge which the agent comes back to periodically. 
-> (i.e. "/task send me a message at 5pm") 
+Use `/cron <interval> <prompt>` to create an agent which runs every `<interval>`
+Use `/crons` to lists all active cron jobs and `/uncron <id>` to remove them.
 
 Use `/task <prompt>` to add a longer running challenge which the agent comes back to periodically. 
 > (i.e. "/task send me a message at 5pm") 
