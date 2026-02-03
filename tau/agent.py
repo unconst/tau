@@ -105,6 +105,31 @@ Write in third person. No flowery language or storytelling - just a clear summar
 
 Output ONLY the summary, nothing else."""
 
+STORY_PRUNE_PROMPT_TEMPLATE = """You are pruning Tau's STORY.md to keep it under 200 lines.
+
+{identity}
+
+---
+
+CURRENT STORY (context/STORY.md):
+{current_story}
+
+---
+
+The story has grown too long ({line_count} lines). You need to reduce it to under 200 lines.
+
+Rules for pruning:
+1. KEEP the most recent entries (last 24 hours) - they provide immediate context
+2. KEEP entries that describe major milestones, new capabilities, or significant changes
+3. REMOVE entries that are redundant or describe routine operations
+4. REMOVE entries that describe failed attempts that were later superseded
+5. REMOVE entries that are less interesting or impactful
+6. KEEP the header line "# Tau's Story" and the comment line
+7. Preserve the chronological order of remaining entries
+8. Merge similar entries if they describe the same feature/change
+
+Output the COMPLETE pruned story file content (with header). Nothing else."""
+
 
 def read_file(path: str) -> str:
     """Read file contents, return empty string if missing."""
@@ -451,6 +476,93 @@ def run_story_loop(stop_event=None):
         
         # Wait for next interval
         for _ in range(STORY_INTERVAL):
+            if stop_event and stop_event.is_set():
+                break
+            time.sleep(1)
+
+
+def run_story_prune():
+    """Prune STORY.md to keep it under 200 lines by removing least interesting entries."""
+    if not os.path.exists(STORY_FILE):
+        return
+    
+    story_content = read_file(STORY_FILE)
+    lines = story_content.split('\n')
+    line_count = len(lines)
+    
+    # Only prune if over 200 lines
+    if line_count <= 200:
+        return
+    
+    # Get identity for context
+    identity_content = read_file(IDENTITY_FILE)
+    
+    # Build prompt
+    prompt = STORY_PRUNE_PROMPT_TEMPLATE.format(
+        identity=identity_content.strip() if identity_content else "",
+        current_story=story_content,
+        line_count=line_count
+    )
+    
+    # Run agent to prune story
+    try:
+        result = subprocess.run(
+            [
+                "agent",
+                "--force",
+                "--model", "gemini-3-flash",
+                "--mode=ask",
+                "--output-format=text",
+                "--print",
+                prompt
+            ],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=120,
+            cwd=WORKSPACE
+        )
+        
+        pruned_story = result.stdout.strip() if result.stdout else ""
+        
+        # Validate the output looks like a valid story file
+        if pruned_story and "# Tau's Story" in pruned_story:
+            pruned_lines = pruned_story.split('\n')
+            # Make sure we actually reduced it and it's not empty
+            if 10 < len(pruned_lines) <= 200:
+                with open(STORY_FILE, "w") as f:
+                    f.write(pruned_story)
+                    if not pruned_story.endswith('\n'):
+                        f.write('\n')
+                think(f"pruned story: {line_count} -> {len(pruned_lines)} lines")
+            
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception as e:
+        pass  # Silently handle prune errors
+
+
+def run_story_prune_loop(stop_event=None):
+    """Story prune loop. Runs every 6 hours."""
+    # Wait 5 minutes before first run
+    for _ in range(300):
+        if stop_event and stop_event.is_set():
+            return
+        time.sleep(1)
+    
+    PRUNE_INTERVAL = 6 * 60 * 60  # 6 hours in seconds
+    
+    while True:
+        if stop_event and stop_event.is_set():
+            break
+        
+        try:
+            run_story_prune()
+        except Exception:
+            pass  # Silently handle prune loop errors
+        
+        # Wait for next interval
+        for _ in range(PRUNE_INTERVAL):
             if stop_event and stop_event.is_set():
                 break
             time.sleep(1)

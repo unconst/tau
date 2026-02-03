@@ -9,7 +9,7 @@ from pathlib import Path
 
 from openai import OpenAI
 from .telegram import bot, save_chat_id, notify, WORKSPACE, append_chat_history
-from .agent import run_loop, run_story_loop, TASKS_DIR, get_all_tasks, git_commit_changes
+from .agent import run_loop, run_story_loop, run_story_prune_loop, TASKS_DIR, get_all_tasks, git_commit_changes
 
 # Configure logging
 LOG_FILE = os.path.join(WORKSPACE, "logs", "tau.log")
@@ -501,6 +501,15 @@ def main():
         name="StoryLoop"
     )
     story_thread.start()
+    
+    # Start story prune loop in background thread (runs every 6 hours)
+    prune_thread = threading.Thread(
+        target=run_story_prune_loop,
+        args=(_stop_event,),
+        daemon=True,
+        name="StoryPruneLoop"
+    )
+    prune_thread.start()
     
     # Start Bitcoin price scheduler in background thread (if available)
     if run_hourly_scheduler:
