@@ -1,4 +1,4 @@
-# Tau
+# Tau Ninja
 
 An agent that can do stuff and upgrade its own code in real time.
 

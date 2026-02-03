@@ -1,6 +1,13 @@
 import { useState, useEffect, useRef } from 'react';
 import { Copy, Check } from 'lucide-react';
 
+const asciiArt = `___________               _______  .__            __        
+\\__    ___/____   __ __   \\      \\ |__| ____     |__|____   
+  |    |  \\__  \\ |  |  \\  /   |   \\|  |/    \\    |  \\__  \\  
+  |    |   / __ \\|  |  / /    |    \\  |   |  \\   |  |/ __ \\_
+  |____|  (____  /____/  \\____|__  /__|___|  /\\__|  (____  /
+               \\/                \\/        \\/\\______|    \\/ `;
+
 function App() {
   const [copied, setCopied] = useState(false);
   const [mousePos, setMousePos] = useState({ x: 0.5, y: 0.5 });
@@ -79,17 +86,37 @@ function App() {
         </div>
       </div>
 
-      {/* Center content - Code Copy Bar */}
-      <div className="absolute inset-0 flex items-center justify-center">
+      {/* Center content - ASCII Art + Code Copy Bar */}
+      <div className="absolute inset-0 flex flex-col items-center justify-center gap-8">
+        {/* ASCII Art Header */}
+        <pre
+          className="ascii-float text-center select-none"
+          style={{
+            color: 'rgba(30, 27, 75, 0.85)',
+            fontSize: 'clamp(0.4rem, 1.2vw, 0.9rem)',
+            lineHeight: 1.2,
+            fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace',
+            textShadow: `
+              0 0 20px rgba(168, 85, 247, 0.4),
+              0 0 40px rgba(236, 72, 153, 0.3),
+              0 0 60px rgba(168, 85, 247, 0.2)
+            `,
+            filter: 'drop-shadow(0 4px 20px rgba(139, 92, 246, 0.3))',
+          }}
+        >
+          {asciiArt}
+        </pre>
+
+        {/* Code Copy Bar */}
         <div 
-          className="group relative flex items-center gap-3 px-6 py-4 rounded-2xl backdrop-blur-xl"
+          className="group relative flex items-center gap-3 px-6 py-4 rounded-2xl backdrop-blur-xl transition-transform duration-200 hover:scale-105"
           style={{
             background: 'rgba(255, 255, 255, 0.15)',
             boxShadow: '0 8px 32px rgba(0, 0, 0, 0.1), inset 0 1px 0 rgba(255, 255, 255, 0.2)',
             border: '1px solid rgba(255, 255, 255, 0.25)',
           }}
         >
-          <code className="text-xs font-mono text-slate-800/90 tracking-tight">
+          <code className="text-xs sm:text-sm font-mono text-slate-800/90 tracking-tight">
             {curlCommand}
           </code>
           <button
@@ -107,13 +134,17 @@ function App() {
       </div>
 
       {/* Bottom left info */}
-      <div className="absolute bottom-6 left-6 flex items-center gap-2 text-slate-700/80">
+      <div className="absolute bottom-6 left-6 flex items-center gap-3 text-slate-700/80">
         <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-          <circle cx="12" cy="12" r="10" />
-          <line x1="12" y1="16" x2="12" y2="12" />
-          <line x1="12" y1="8" x2="12.01" y2="8" />
+          <line x1="3" y1="6" x2="21" y2="6" />
+          <line x1="3" y1="12" x2="21" y2="12" />
+          <line x1="3" y1="18" x2="21" y2="18" />
         </svg>
-        <span className="text-sm font-medium">Tau</span>
+        <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z" />
+          <circle cx="12" cy="10" r="3" />
+        </svg>
+        <span className="text-sm font-medium">🥷 Tau Ninja</span>
       </div>
 
       {/* Global styles for animation */}
@@ -135,6 +166,19 @@ function App() {
             opacity: 0.8;
             transform: translate(1%, 2%) scale(1.02);
           }
+        }
+        
+        @keyframes float {
+          0%, 100% {
+            transform: translateY(0);
+          }
+          50% {
+            transform: translateY(-10px);
+          }
+        }
+        
+        .ascii-float {
+          animation: float 6s ease-in-out infinite;
         }
       `}</style>
     </div>

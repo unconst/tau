@@ -1,7 +1,7 @@
 [project]
 name = "tau"
 version = "0.1.0"
-description = "Self-adapting agent with two-buffer architecture"
+description = "An agent that can do stuff and upgrade its own code in real time."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["pytelegrambotapi", "openai", "python-dotenv", "supervisor"]
