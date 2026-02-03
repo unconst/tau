@@ -661,9 +661,9 @@ def cleanup_task_context(task: dict):
 
 
 def run_loop(stop_event=None):
-    """Main agent loop. Runs every minute, sends status ping, and processes tasks."""
-    # Target interval: 60 seconds (1 minute)
-    LOOP_INTERVAL = 60
+    """Main agent loop. Runs every 5 minutes, sends status ping, and processes tasks."""
+    # Target interval: 300 seconds (5 minutes)
+    LOOP_INTERVAL = 300
     
     while True:
         # Check if we should stop
