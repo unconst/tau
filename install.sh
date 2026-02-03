@@ -426,10 +426,9 @@ step_telegram() {
     fi
     
     if [ -z "$BOT_TOKEN" ]; then
-        info "Tau uses Telegram for control"
         info "Create a bot via @BotFather → /newbot"
         log ""
-        printf "  Paste bot token:\n  > "
+        printf "  ${DIM}Token:${NC} "
         read -r BOT_TOKEN </dev/tty
         
         if [ -z "$BOT_TOKEN" ]; then
@@ -597,21 +596,7 @@ print_final() {
     printf "  ${BOLD}${GREEN}✓ Tau is live${NC}\n"
     log ""
     info "Message your bot to begin"
-    info "Give it real tasks"
-    log ""
     printf "  ${CYAN}This agent can modify itself.${NC}\n"
-    log ""
-    log "  ${DIM}▸ Optional${NC}"
-    log ""
-    log "    ${DIM}Commands:${NC}"
-    log "      tauctl start"
-    log "      tauctl stop"
-    log "      tauctl logs"
-    log ""
-    log "    ${DIM}Add tauctl to PATH:${NC}"
-    log "      export PATH=\"$INSTALL_DIR:\$PATH\""
-    log ""
-    ok "Setup complete"
     log ""
 }
 
