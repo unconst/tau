@@ -152,7 +152,9 @@ detect_install_context() {
     fi
     
     RUNNING_FROM_REPO=false
-    [ -n "${TAU_INSTALL_DIR:-}" ] && INSTALL_DIR="$TAU_INSTALL_DIR"
+    if [ -n "${TAU_INSTALL_DIR:-}" ]; then
+        INSTALL_DIR="$TAU_INSTALL_DIR"
+    fi
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -189,7 +191,9 @@ step_welcome() {
     
     INSTANCE_ID=$(generate_instance_id "$INSTALL_DIR")
     
-    [ "$RUNNING_FROM_REPO" = true ] && ok "Using existing repo"
+    if [ "$RUNNING_FROM_REPO" = true ]; then
+        ok "Using existing repo"
+    fi
     
     info "Installing to $INSTALL_DIR"
     
@@ -287,7 +291,9 @@ install_macos_deps() {
         if ! command_exists brew; then
             if prompt_yn "Install Homebrew"; then
                 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-                [ -f "/opt/homebrew/bin/brew" ] && eval "$(/opt/homebrew/bin/brew shellenv)"
+                if [ -f "/opt/homebrew/bin/brew" ]; then
+                    eval "$(/opt/homebrew/bin/brew shellenv)"
+                fi
             fi
         fi
         
@@ -368,7 +374,9 @@ step_clone() {
 step_python() {
     cd "$INSTALL_DIR"
     
-    [ ! -d ".venv" ] && run_spin "Environment created" uv venv .venv
+    if [ ! -d ".venv" ]; then
+        run_spin "Environment created" uv venv .venv
+    fi
     
     source .venv/bin/activate
     
@@ -635,7 +643,9 @@ main() {
 
 # When piped via curl, ensure tty is available for interactive prompts
 if [ ! -t 0 ]; then
-    exec </dev/tty
+    if [ -e /dev/tty ]; then
+        exec </dev/tty || true
+    fi
 fi
 
 main "$@"
