@@ -2,7 +2,9 @@
   <img src="tauninja.png" alt="Tau Ninja" width="800" />
 </p>
 
-An agent that can do stuff and upgrade its own code in real time.
+<p align="center">
+  <strong><span style="font-size:1.5em;">An agent that can do stuff and upgrade its own code in real time.</span></strong>
+</p>
 
 ## How to install?
 
