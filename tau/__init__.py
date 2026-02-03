@@ -34,6 +34,17 @@ if os.path.exists(task1_path):
 else:
     run_hourly_scheduler = None
 
+# Import morning scheduler from task-6
+task6_path = os.path.join(WORKSPACE, "context", "tasks", "task-6")
+if os.path.exists(task6_path):
+    sys.path.insert(0, task6_path)
+    try:
+        from morning_scheduler import run_morning_scheduler
+    except ImportError:
+        run_morning_scheduler = None
+else:
+    run_morning_scheduler = None
+
 MEMORY_FILE = os.path.join(WORKSPACE, "context", "tasks", "memory.md")
 
 # Event to signal agent loop to stop
@@ -520,6 +531,16 @@ def main():
             name="BitcoinScheduler"
         )
         bitcoin_thread.start()
+    
+    # Start morning message scheduler in background thread (if available)
+    if run_morning_scheduler:
+        morning_thread = threading.Thread(
+            target=run_morning_scheduler,
+            args=(_stop_event,),
+            daemon=True,
+            name="MorningScheduler"
+        )
+        morning_thread.start()
     
     # Run Telegram bot in main thread
     try:
