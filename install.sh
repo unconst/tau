@@ -61,7 +61,7 @@ check_pending() { log "  ${DIM}○${NC} $1 ${DIM}(will install)${NC}"; }
 
 pause() {
     [ "$FAST" = "1" ] && return
-    printf "\n  ${DIM}▸${NC} "
+    printf "\n  ${DIM}▸ Continue ⏎${NC} "
     read -r </dev/tty
 }
 
