@@ -633,4 +633,9 @@ main() {
     step_launch
 }
 
+# When piped via curl, ensure tty is available for interactive prompts
+if [ ! -t 0 ]; then
+    exec </dev/tty
+fi
+
 main "$@"
