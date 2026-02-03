@@ -179,8 +179,7 @@ step_welcome() {
     printf "      ██║   ██╔══██║██║   ██║\n"
     printf "      ██║   ██║  ██║╚██████╔╝\n"
     printf "      ╚═╝   ╚═╝  ╚═╝ ╚═════╝\n"
-    printf "%s" "$NC"
-    printf "   %sSelf-upgrading agent%s\n\n" "$DIM" "$NC"
+    printf "%s\n" "$NC"
     
     if [ -z "$INSTALL_DIR" ]; then
         if [ "$FAST" != "1" ]; then
