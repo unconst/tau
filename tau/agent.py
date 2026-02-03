@@ -7,9 +7,22 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from .telegram import think, notify, get_chat_history
+from .telegram import think as _think_impl, notify, get_chat_history
 
 WORKSPACE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Debug mode flag - controlled by __init__.py
+_debug_mode = False
+
+def set_debug_mode(enabled: bool):
+    """Enable or disable debug mode for verbose notifications."""
+    global _debug_mode
+    _debug_mode = enabled
+
+def think(msg: str):
+    """Send thinking message only if debug mode is enabled."""
+    if _debug_mode:
+        _think_impl(msg)
 TASKS_DIR = os.path.join(WORKSPACE, "context", "tasks")
 MEMORY_FILE = os.path.join(WORKSPACE, "context", "tasks", "memory.md")
 IDENTITY_FILE = os.path.join(WORKSPACE, "context", "IDENTITY.md")

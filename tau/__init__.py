@@ -9,7 +9,10 @@ from pathlib import Path
 
 from openai import OpenAI
 from .telegram import bot, save_chat_id, notify, WORKSPACE, append_chat_history
-from .agent import run_loop, run_story_loop, run_story_prune_loop, TASKS_DIR, get_all_tasks, git_commit_changes
+from .agent import run_loop, run_story_loop, run_story_prune_loop, TASKS_DIR, get_all_tasks, git_commit_changes, set_debug_mode
+
+# Debug mode flag - controls verbose notifications
+DEBUG_MODE = False
 
 # Configure logging
 LOG_FILE = os.path.join(WORKSPACE, "logs", "tau.log")
@@ -97,7 +100,23 @@ def transcribe_voice(voice_path: str) -> str:
 def send_welcome(message):
     save_chat_id(message.chat.id)
     append_chat_history("user", f"/start")
-    response = "Hello! I'm Tau. Commands:\n/task <description> - Add a task\n/status - See recent activity\n/adapt <prompt> - Self-modify\n/restart - Restart bot"
+    response = "Hello! I'm Tau. Commands:\n/task <description> - Add a task\n/status - See recent activity\n/adapt <prompt> - Self-modify\n/restart - Restart bot\n/debug - Toggle debug mode"
+    bot.reply_to(message, response)
+    append_chat_history("assistant", response)
+
+
+@bot.message_handler(commands=['debug'])
+def toggle_debug(message):
+    """Toggle debug mode on/off."""
+    global DEBUG_MODE
+    save_chat_id(message.chat.id)
+    append_chat_history("user", "/debug")
+    
+    DEBUG_MODE = not DEBUG_MODE
+    set_debug_mode(DEBUG_MODE)
+    
+    status = "on" if DEBUG_MODE else "off"
+    response = f"Debug mode: {status}"
     bot.reply_to(message, response)
     append_chat_history("assistant", response)
 
@@ -486,11 +505,12 @@ def main():
     
     from .telegram import get_chat_id
     
-    # Send startup message if we have a saved chat ID
+    # Send startup message if we have a saved chat ID (only in debug mode)
     chat_id = get_chat_id()
     if chat_id:
         logger.info(f"Found saved chat_id: {chat_id}")
-        notify("⚚ Tau is online\n\nCommands:\n/task - Add a task\n/status - Check status\n/adapt - Self-modify\n/restart - Restart bot")
+        if DEBUG_MODE:
+            notify("⚚ Tau is online\n\nCommands:\n/task - Add a task\n/status - Check status\n/adapt - Self-modify\n/restart - Restart bot")
     else:
         logger.info("No saved chat_id, waiting for /start command")
         print("Tau starting... Send /start in Telegram to connect.")
@@ -549,7 +569,8 @@ def main():
         print("\nShutting down...")
     finally:
         _stop_event.set()
-        notify("🛑 Tau stopped")
+        if DEBUG_MODE:
+            notify("🛑 Tau stopped")
 
 
 if __name__ == "__main__":
