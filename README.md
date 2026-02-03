@@ -10,4 +10,8 @@ curl -fsSL https://raw.githubusercontent.com/unconst/tau/main/install.sh | bash
 
 ## How to use?
 
-Ask the agent.
+1. Typing a `<prompt>` calls the agent normally.
+2. Use `/adapt <prompt>` to update the agent code and restart it.
+3. Use `/task <prompt>` to add a longer running challenge which the agent comes back to periodically.
+
+

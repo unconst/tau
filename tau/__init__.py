@@ -147,7 +147,7 @@ def adapt_bot(message):
     
     try:
         result = subprocess.run(
-            ["agent", "--force", "--model", "claude-opus-4-5",
+            ["agent", "--force", "--model", "opus-4.5",
              "--output-format=text", "--print", prompt],
             capture_output=True,
             text=True,
