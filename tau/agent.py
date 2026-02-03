@@ -4,7 +4,7 @@ import os
 import re
 import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from .telegram import think, notify, get_chat_history
@@ -14,6 +14,13 @@ TASKS_DIR = os.path.join(WORKSPACE, "context", "tasks")
 MEMORY_FILE = os.path.join(WORKSPACE, "context", "tasks", "memory.md")
 IDENTITY_FILE = os.path.join(WORKSPACE, "context", "IDENTITY.md")
 MEMORY_SYSTEM_FILE = os.path.join(WORKSPACE, "context", "MEMORY-SYSTEM.md")
+STORY_FILE = os.path.join(WORKSPACE, "context", "STORY.md")
+CHAT_HISTORY_FILE = os.path.join(WORKSPACE, "context", "CHAT.md")
+LOG_FILE = os.path.join(WORKSPACE, "logs", "tau.log")
+
+# Track last story update for detecting new activity
+_last_story_chat_hash = None
+_last_story_log_hash = None
 
 # Ensure tasks directory exists
 os.makedirs(TASKS_DIR, exist_ok=True)
@@ -23,6 +30,11 @@ PROMPT_TEMPLATE = """You are Tau, a single-threaded autonomous agent.
 {identity}
 
 {memory_rules}
+
+---
+
+NARRATIVE (your story so far):
+{narrative}
 
 ---
 
@@ -61,6 +73,37 @@ TOOLS:
 - send_message: source .venv/bin/activate && python -m tau.tools.send_message "message"
 - send_voice: source .venv/bin/activate && python -m tau.tools.send_voice "message"
 """
+
+STORY_PROMPT_TEMPLATE = """You are summarizing Tau's recent activity for STORY.md.
+
+{identity}
+
+---
+
+CURRENT STORY (context/STORY.md):
+{current_story}
+
+---
+
+RECENT CHAT ACTIVITY (last 5 minutes):
+{recent_chat}
+
+---
+
+RECENT AGENT LOGS (last 5 minutes):
+{recent_logs}
+
+---
+
+Write a brief summary of what happened in the last 5 minutes. Be concise and factual.
+- What did the user ask for?
+- What did Tau do?
+- What was the outcome?
+
+Use as few sentences as needed. 1-3 sentences is fine if that covers it.
+Write in third person. No flowery language or storytelling - just a clear summary.
+
+Output ONLY the summary, nothing else."""
 
 
 def read_file(path: str) -> str:
@@ -230,6 +273,189 @@ def create_high_level_summary(detailed_content: str, task_title: str) -> str:
     return summary
 
 
+def get_recent_content(filepath: str, minutes: int = 5) -> str:
+    """Get content from the last N minutes based on timestamps in the file."""
+    if not os.path.exists(filepath):
+        return ""
+    
+    content = read_file(filepath)
+    if not content:
+        return ""
+    
+    # For log files, filter by timestamp
+    if filepath.endswith('.log'):
+        cutoff = datetime.now() - timedelta(minutes=minutes)
+        recent_lines = []
+        for line in content.split('\n'):
+            # Log format: 2024-01-15 10:30:45 [INFO] ...
+            try:
+                if len(line) >= 19:
+                    ts_str = line[:19]
+                    ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                    if ts >= cutoff:
+                        recent_lines.append(line)
+            except (ValueError, IndexError):
+                # Include lines that don't have timestamps if we're in a recent section
+                if recent_lines:
+                    recent_lines.append(line)
+        return '\n'.join(recent_lines[-100:])  # Limit to last 100 lines
+    
+    # For CHAT.md, look for ## headers with timestamps
+    if 'CHAT' in filepath.upper():
+        cutoff = datetime.now() - timedelta(minutes=minutes)
+        lines = content.split('\n')
+        recent_lines = []
+        include_section = False
+        
+        for line in lines:
+            # Chat format: ## USER - 2024-01-15 10:30:45
+            if line.startswith('## '):
+                try:
+                    # Extract timestamp from header
+                    parts = line.split(' - ')
+                    if len(parts) >= 2:
+                        ts_str = parts[-1].strip()
+                        ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                        include_section = ts >= cutoff
+                except (ValueError, IndexError):
+                    include_section = False
+            
+            if include_section:
+                recent_lines.append(line)
+        
+        return '\n'.join(recent_lines[-100:])
+    
+    # Fallback: return last 50 lines
+    return tail(content, 50)
+
+
+def get_content_hash(content: str) -> str:
+    """Get a simple hash of content for change detection."""
+    import hashlib
+    return hashlib.md5(content.encode()).hexdigest()
+
+
+def should_update_story() -> bool:
+    """Check if there's new activity since last story update."""
+    global _last_story_chat_hash, _last_story_log_hash
+    
+    recent_chat = get_recent_content(CHAT_HISTORY_FILE, minutes=5)
+    recent_logs = get_recent_content(LOG_FILE, minutes=5)
+    
+    chat_hash = get_content_hash(recent_chat) if recent_chat else ""
+    log_hash = get_content_hash(recent_logs) if recent_logs else ""
+    
+    # If no content at all, don't update
+    if not recent_chat and not recent_logs:
+        return False
+    
+    # Check if anything changed
+    changed = (chat_hash != _last_story_chat_hash) or (log_hash != _last_story_log_hash)
+    
+    # Update stored hashes
+    _last_story_chat_hash = chat_hash
+    _last_story_log_hash = log_hash
+    
+    return changed
+
+
+def append_story(narrative: str):
+    """Append a narrative entry to STORY.md."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    
+    # Ensure file exists with header
+    if not os.path.exists(STORY_FILE):
+        with open(STORY_FILE, "w") as f:
+            f.write("# Tau's Story\n\n")
+            f.write("<!-- Summarized event log, updated every 5 minutes -->\n\n")
+    
+    with open(STORY_FILE, "a") as f:
+        f.write(f"### {timestamp}\n\n")
+        f.write(f"{narrative.strip()}\n\n")
+        f.write("---\n\n")
+
+
+def run_story_update():
+    """Run the story agent to update STORY.md with recent activity."""
+    global _last_story_chat_hash, _last_story_log_hash
+    
+    # Check if there's new activity
+    if not should_update_story():
+        return
+    
+    # Get recent content
+    recent_chat = get_recent_content(CHAT_HISTORY_FILE, minutes=5)
+    recent_logs = get_recent_content(LOG_FILE, minutes=5)
+    
+    # Get current story for context
+    current_story = ""
+    if os.path.exists(STORY_FILE):
+        current_story = tail(read_file(STORY_FILE), 30)
+    
+    # Get identity for context
+    identity_content = read_file(IDENTITY_FILE)
+    
+    # Build prompt
+    prompt = STORY_PROMPT_TEMPLATE.format(
+        identity=identity_content.strip() if identity_content else "",
+        current_story=current_story if current_story else "No story yet.",
+        recent_chat=recent_chat if recent_chat else "No recent chat.",
+        recent_logs=recent_logs if recent_logs else "No recent logs."
+    )
+    
+    # Run agent to generate narrative
+    try:
+        result = subprocess.run(
+            [
+                "agent",
+                "--force",
+                "--model", "gemini-3-flash",
+                "--mode=ask",
+                "--output-format=text",
+                "--print",
+                prompt
+            ],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=60,
+            cwd=WORKSPACE
+        )
+        
+        narrative = result.stdout.strip() if result.stdout else ""
+        
+        if narrative and len(narrative) > 20:
+            append_story(narrative)
+            
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception as e:
+        pass  # Silently handle story errors
+
+
+def run_story_loop(stop_event=None):
+    """Story update loop. Runs every 5 minutes."""
+    # Wait 30 seconds before first run to let things settle
+    time.sleep(30)
+    
+    STORY_INTERVAL = 300  # 5 minutes
+    
+    while True:
+        if stop_event and stop_event.is_set():
+            break
+        
+        try:
+            run_story_update()
+        except Exception:
+            pass  # Silently handle story loop errors
+        
+        # Wait for next interval
+        for _ in range(STORY_INTERVAL):
+            if stop_event and stop_event.is_set():
+                break
+            time.sleep(1)
+
+
 def run_cursor(prompt: str) -> str:
     """Run Cursor agent with prompt, return output."""
     try:
@@ -252,6 +478,51 @@ def run_cursor(prompt: str) -> str:
         return "Error: Agent timed out after 5 minutes"
     except Exception as e:
         return f"Error: {str(e)}"
+
+
+def git_commit_changes(description: str):
+    """Commit any changes made by the agent with a description based on the task.
+    This allows reverting to previous states if needed."""
+    try:
+        # Check if there are any changes to commit
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            cwd=WORKSPACE
+        )
+        
+        if not status_result.stdout.strip():
+            # No changes to commit
+            return
+        
+        # Stage all changes
+        subprocess.run(
+            ["git", "add", "-A"],
+            capture_output=True,
+            text=True,
+            cwd=WORKSPACE
+        )
+        
+        # Create commit message from description
+        # Truncate if too long, clean up for commit message
+        commit_msg = description.replace("\n", " ").strip()
+        if len(commit_msg) > 200:
+            commit_msg = commit_msg[:197] + "..."
+        
+        # Prefix with [tau] to identify agent commits
+        commit_msg = f"[tau] {commit_msg}"
+        
+        # Commit
+        subprocess.run(
+            ["git", "commit", "-m", commit_msg],
+            capture_output=True,
+            text=True,
+            cwd=WORKSPACE
+        )
+        
+    except Exception:
+        pass  # Silently handle git errors
 
 
 def mark_task_complete_in_taskmd(task: dict):
@@ -391,8 +662,6 @@ def cleanup_task_context(task: dict):
 
 def run_loop(stop_event=None):
     """Main agent loop. Runs every minute, sends status ping, and processes tasks."""
-    think("agent loop starting...")
-    
     # Target interval: 60 seconds (1 minute)
     LOOP_INTERVAL = 60
     
@@ -460,6 +729,10 @@ def run_loop(stop_event=None):
                     identity_content = read_file(IDENTITY_FILE)
                     memory_system_content = read_file(MEMORY_SYSTEM_FILE)
                     
+                    # Read narrative/story context
+                    story_content = read_file(STORY_FILE)
+                    narrative_tail = tail(story_content, 40) if story_content else "No story yet."
+                    
                     # Build prompt
                     tasks_text = "\n\n".join(
                         f"## {t['title']} ({t['id']})\n{t['body']}" for t in incomplete
@@ -467,6 +740,7 @@ def run_loop(stop_event=None):
                     prompt = PROMPT_TEMPLATE.format(
                         identity=identity_content.strip() if identity_content else "",
                         memory_rules=memory_system_content.strip() if memory_system_content else "",
+                        narrative=narrative_tail,
                         chat_history=chat_history_tail,
                         tasks=tasks_text,
                         high_level_memory=tail(high_level_memory_content, 30),
@@ -476,6 +750,16 @@ def run_loop(stop_event=None):
                     # Run agent
                     think("executing...")
                     output = run_cursor(prompt)
+                    
+                    # Commit any changes made by the agent
+                    # Use task title + first part of output as commit description
+                    # For /adapt, the prompt itself is a good description
+                    commit_desc = f"{task['title']}: {output[:100] if output else 'agent action'}"
+                    if "adapt" in task['title'].lower():
+                        # Try to extract the original prompt if it's an adapt task
+                        commit_desc = f"adapt: {task['title'].replace('/adapt', '').strip()}"
+                    
+                    git_commit_changes(commit_desc)
                     
                     # The agent's output should contain the detailed action description
                     # We'll use it for task memory and create a summary for high-level memory

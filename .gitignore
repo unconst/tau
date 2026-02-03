@@ -24,6 +24,7 @@ logs/*.log
 # Run-specific files
 context/CHAT.md
 context/FACTS.md
+context/STORY.md
 tasks/memory.md
 tasks/*/memory.md
 

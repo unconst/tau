@@ -9,7 +9,7 @@ from pathlib import Path
 
 from openai import OpenAI
 from .telegram import bot, save_chat_id, notify, WORKSPACE, append_chat_history
-from .agent import run_loop, TASKS_DIR, get_all_tasks
+from .agent import run_loop, run_story_loop, TASKS_DIR, get_all_tasks
 
 # Configure logging
 LOG_FILE = os.path.join(WORKSPACE, "logs", "tau.log")
@@ -141,9 +141,9 @@ def adapt_bot(message):
     append_chat_history("user", f"/adapt {prompt}")
     save_chat_id(message.chat.id)
     
-    response = f"Adapting: {prompt}..."
-    bot.reply_to(message, response)
-    append_chat_history("assistant", response)
+    # Acknowledge with single emoji
+    bot.reply_to(message, "🫡")
+    append_chat_history("assistant", "🫡")
     
     try:
         result = subprocess.run(
@@ -156,15 +156,9 @@ def adapt_bot(message):
             cwd=WORKSPACE
         )
         
-        response = result.stdout.strip() if result.stdout else result.stderr.strip()
-        full_response = f"Adaptation complete:\n{response[:3000]}"
-        bot.reply_to(message, full_response)
-        append_chat_history("assistant", full_response)
-        
-        # Restart to apply changes
-        restart_msg = "Restarting to apply changes..."
-        bot.reply_to(message, restart_msg)
-        append_chat_history("assistant", restart_msg)
+        # Just checkmark when done
+        bot.reply_to(message, "✅")
+        append_chat_history("assistant", "✅")
         bot.stop_polling()
         
         # Try supervisor restart first
@@ -482,7 +476,7 @@ def main():
     chat_id = get_chat_id()
     if chat_id:
         logger.info(f"Found saved chat_id: {chat_id}")
-        notify("🤖 Tau is online and ready!\n\nCommands:\n/task - Add a task\n/status - Check status\n/adapt - Self-modify\n/restart - Restart bot")
+        notify("⚚ Tau is online\n\nCommands:\n/task - Add a task\n/status - Check status\n/adapt - Self-modify\n/restart - Restart bot")
     else:
         logger.info("No saved chat_id, waiting for /start command")
         print("Tau starting... Send /start in Telegram to connect.")
@@ -495,6 +489,15 @@ def main():
         name="AgentLoop"
     )
     agent_thread.start()
+    
+    # Start story update loop in background thread (runs every 5 minutes)
+    story_thread = threading.Thread(
+        target=run_story_loop,
+        args=(_stop_event,),
+        daemon=True,
+        name="StoryLoop"
+    )
+    story_thread.start()
     
     # Start Bitcoin price scheduler in background thread (if available)
     if run_hourly_scheduler:
