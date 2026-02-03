@@ -641,11 +641,4 @@ main() {
     step_launch
 }
 
-# When piped via curl, ensure tty is available for interactive prompts
-if [ ! -t 0 ]; then
-    if [ -e /dev/tty ]; then
-        exec </dev/tty || true
-    fi
-fi
-
 main "$@"
