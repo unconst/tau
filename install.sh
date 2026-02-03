@@ -3,7 +3,7 @@
 # Tau Installation Script
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/unconst/tau/main/install.sh | bash
+#   curl -fsSL https://tau.ninja/install.sh | bash
 #   TAU_INSTALL_DIR=/path/to/tau curl -fsSL ... | bash
 #   TAU_QUIET=1 ./install.sh
 #

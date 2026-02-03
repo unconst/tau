@@ -5,7 +5,7 @@ An agent that can do stuff and upgrade its own code in real time.
 ## How to install?
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/unconst/tau/main/install.sh | bash
+curl -fsSL https://tau.ninja/install.sh | bash
 ```
 
 ## How to use?

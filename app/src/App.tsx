@@ -6,7 +6,7 @@ function App() {
   const [mousePos, setMousePos] = useState({ x: 0.5, y: 0.5 });
   const containerRef = useRef<HTMLDivElement>(null);
 
-  const curlCommand = 'curl -fsSL https://raw.githubusercontent.com/unconst/tau/main/install.sh | bash';
+  const curlCommand = 'curl -fsSL https://tau.ninja/install.sh | bash';
 
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
