@@ -476,15 +476,24 @@ step_clone_repo() {
     if [ -d "$INSTALL_DIR" ]; then
         print_info "Tau directory already exists at $INSTALL_DIR"
         printf "\n"
-        printf "Update existing installation? (y/N): "
-        read -r -n 1 REPLY </dev/tty
-        printf "\n"
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
+        
+        # Check if critical files are missing - force update if so
+        if [ ! -f "$INSTALL_DIR/tauctl" ] || [ ! -f "$INSTALL_DIR/supervisord.conf" ]; then
+            print_warning "Missing critical files - updating required"
             print_step "Updating repository..."
             cd "$INSTALL_DIR"
             git pull origin main || print_warning "Could not pull updates"
         else
-            print_info "Using existing installation"
+            printf "Update existing installation? (Y/n): "
+            read -r -n 1 REPLY </dev/tty
+            printf "\n"
+            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                print_step "Updating repository..."
+                cd "$INSTALL_DIR"
+                git pull origin main || print_warning "Could not pull updates"
+            else
+                print_info "Using existing installation"
+            fi
         fi
     else
         print_step "Cloning from $REPO_URL..."
