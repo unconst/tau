@@ -12,6 +12,11 @@ wheels/
 # Runtime state
 chat_id.txt
 
+# Supervisor runtime files
+.supervisor.sock
+.supervisord.pid
+logs/*.log
+
 # Environment files (contain secrets)
 .env
 .env.local

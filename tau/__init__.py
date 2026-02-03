@@ -77,15 +77,41 @@ def send_welcome(message):
     bot.reply_to(message, response)
     append_chat_history("assistant", response)
 
+def restart_via_supervisor():
+    """Restart tau via supervisorctl. Returns True if supervisor handled it."""
+    tauctl = os.path.join(WORKSPACE, "tauctl")
+    if os.path.exists(tauctl):
+        try:
+            result = subprocess.run(
+                [tauctl, "_agent_restart"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            # Exit code 0 means supervisor is handling restart
+            # Exit code 2 means fallback to direct restart
+            return result.returncode == 0
+        except Exception:
+            pass
+    return False
+
+
 @bot.message_handler(commands=['restart'])
 def restart_bot(message):
-    """Restart the bot process."""
+    """Restart the bot process via supervisor."""
     append_chat_history("user", f"/restart")
     response = "Restarting..."
     bot.reply_to(message, response)
     append_chat_history("assistant", response)
     bot.stop_polling()
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+    
+    # Try supervisor restart first
+    if restart_via_supervisor():
+        # Supervisor will restart us - just exit cleanly
+        sys.exit(0)
+    else:
+        # Fallback to direct exec restart
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 @bot.message_handler(commands=['adapt'])
 def adapt_bot(message):
@@ -126,7 +152,12 @@ def adapt_bot(message):
         bot.reply_to(message, restart_msg)
         append_chat_history("assistant", restart_msg)
         bot.stop_polling()
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        
+        # Try supervisor restart first
+        if restart_via_supervisor():
+            sys.exit(0)
+        else:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
         
     except subprocess.TimeoutExpired:
         error_msg = "Adaptation timed out."

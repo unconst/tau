@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+#
+# tauctl - Control script for Tau agent
+#
+# Usage:
+#   tauctl start     - Start tau (and supervisord if needed)
+#   tauctl stop      - Stop tau
+#   tauctl restart   - Restart tau
+#   tauctl status    - Check tau status
+#   tauctl logs      - Tail tau logs
+#   tauctl logs -f   - Follow tau logs
+#   tauctl supervisor start  - Start supervisord daemon
+#   tauctl supervisor stop   - Stop supervisord daemon
+#
+
+set -e
+
+# Colors
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+CYAN=$'\033[0;36m'
+NC=$'\033[0m'
+
+# Find tau directory (where this script lives)
+TAU_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SUPERVISOR_CONF="$TAU_DIR/supervisord.conf"
+SUPERVISOR_SOCK="$TAU_DIR/.supervisor.sock"
+SUPERVISOR_PID="$TAU_DIR/.supervisord.pid"
+LOG_DIR="$TAU_DIR/logs"
+
+# Ensure log directory exists
+mkdir -p "$LOG_DIR"
+
+# Load environment variables
+load_env() {
+    if [ -f "$TAU_DIR/.env" ]; then
+        set -a
+        source "$TAU_DIR/.env"
+        set +a
+    fi
+}
+
+# Check if supervisord is running
+is_supervisord_running() {
+    if [ -f "$SUPERVISOR_PID" ]; then
+        local pid=$(cat "$SUPERVISOR_PID" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Start supervisord daemon
+start_supervisord() {
+    if is_supervisord_running; then
+        echo "${GREEN}✓${NC} Supervisord is already running"
+        return 0
+    fi
+    
+    echo "${CYAN}→${NC} Starting supervisord..."
+    load_env
+    "$TAU_DIR/.venv/bin/supervisord" -c "$SUPERVISOR_CONF"
+    
+    # Wait for socket to be ready
+    local retries=10
+    while [ $retries -gt 0 ] && [ ! -S "$SUPERVISOR_SOCK" ]; do
+        sleep 0.5
+        retries=$((retries - 1))
+    done
+    
+    if is_supervisord_running; then
+        echo "${GREEN}✓${NC} Supervisord started"
+    else
+        echo "${RED}✗${NC} Failed to start supervisord"
+        return 1
+    fi
+}
+
+# Stop supervisord daemon
+stop_supervisord() {
+    if ! is_supervisord_running; then
+        echo "${YELLOW}⚠${NC} Supervisord is not running"
+        return 0
+    fi
+    
+    echo "${CYAN}→${NC} Stopping supervisord..."
+    "$TAU_DIR/.venv/bin/supervisorctl" -c "$SUPERVISOR_CONF" shutdown 2>/dev/null || true
+    
+    # Wait for shutdown
+    local retries=10
+    while [ $retries -gt 0 ] && is_supervisord_running; do
+        sleep 0.5
+        retries=$((retries - 1))
+    done
+    
+    if ! is_supervisord_running; then
+        echo "${GREEN}✓${NC} Supervisord stopped"
+    else
+        echo "${YELLOW}⚠${NC} Force killing supervisord..."
+        local pid=$(cat "$SUPERVISOR_PID" 2>/dev/null)
+        if [ -n "$pid" ]; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        rm -f "$SUPERVISOR_PID" "$SUPERVISOR_SOCK"
+    fi
+}
+
+# Run supervisorctl command
+supervisorctl_cmd() {
+    if ! is_supervisord_running; then
+        echo "${RED}✗${NC} Supervisord is not running"
+        echo "  Run: ${CYAN}tauctl supervisor start${NC}"
+        return 1
+    fi
+    
+    "$TAU_DIR/.venv/bin/supervisorctl" -c "$SUPERVISOR_CONF" "$@"
+}
+
+# Main command handling
+case "${1:-}" in
+    start)
+        start_supervisord
+        echo ""
+        supervisorctl_cmd start tau 2>/dev/null || supervisorctl_cmd status tau
+        ;;
+    
+    stop)
+        if is_supervisord_running; then
+            supervisorctl_cmd stop tau
+        else
+            echo "${YELLOW}⚠${NC} Tau is not running (supervisord not active)"
+        fi
+        ;;
+    
+    restart)
+        if ! is_supervisord_running; then
+            start_supervisord
+            echo ""
+        fi
+        supervisorctl_cmd restart tau
+        ;;
+    
+    status)
+        if ! is_supervisord_running; then
+            echo "${YELLOW}⚠${NC} Supervisord is not running"
+            echo "  Tau is ${RED}stopped${NC}"
+            exit 1
+        fi
+        supervisorctl_cmd status tau
+        ;;
+    
+    logs)
+        shift
+        if [ "${1:-}" = "-f" ]; then
+            tail -f "$LOG_DIR/tau.log"
+        else
+            tail -100 "$LOG_DIR/tau.log"
+        fi
+        ;;
+    
+    supervisor)
+        case "${2:-}" in
+            start)
+                start_supervisord
+                ;;
+            stop)
+                stop_supervisord
+                ;;
+            status)
+                if is_supervisord_running; then
+                    echo "${GREEN}✓${NC} Supervisord is running (PID: $(cat "$SUPERVISOR_PID"))"
+                else
+                    echo "${RED}✗${NC} Supervisord is not running"
+                fi
+                ;;
+            *)
+                echo "Usage: tauctl supervisor {start|stop|status}"
+                exit 1
+                ;;
+        esac
+        ;;
+    
+    # Hidden command for agent to use for restart
+    _agent_restart)
+        # This signals supervisord to restart tau
+        # The agent calls this, then exits - supervisord handles the restart
+        if is_supervisord_running; then
+            # Use nohup to ensure the restart command completes even after tau exits
+            nohup "$TAU_DIR/.venv/bin/supervisorctl" -c "$SUPERVISOR_CONF" restart tau >/dev/null 2>&1 &
+            echo "Restart initiated"
+        else
+            echo "Supervisord not running - using direct exec restart"
+            exit 2  # Signal to agent to use fallback
+        fi
+        ;;
+    
+    ""|help|--help|-h)
+        echo "Tau Control Script"
+        echo ""
+        echo "Usage: tauctl <command>"
+        echo ""
+        echo "Commands:"
+        echo "  start             Start tau (and supervisord if needed)"
+        echo "  stop              Stop tau"
+        echo "  restart           Restart tau"
+        echo "  status            Check tau status"
+        echo "  logs              View last 100 lines of tau logs"
+        echo "  logs -f           Follow tau logs"
+        echo "  supervisor start  Start supervisord daemon"
+        echo "  supervisor stop   Stop supervisord daemon"
+        echo "  supervisor status Check supervisord status"
+        echo ""
+        ;;
+    
+    *)
+        echo "${RED}Unknown command: $1${NC}"
+        echo "Run 'tauctl help' for usage"
+        exit 1
+        ;;
+esac

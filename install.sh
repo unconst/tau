@@ -257,18 +257,19 @@ install_python_macos() {
 step_welcome() {
     print_header "Welcome to Tau"
     
-    printf "%sTau%s is a self-adapting autonomous agent with Telegram integration.\n" "$BOLD" "$NC"
+    printf "%sTau%s A chat agent that learns from you, writes its own software to upgrade itself, and solve problems for you. \n" "$BOLD" "$NC"
     printf "\n"
     printf "This installer will guide you through:\n"
     printf "\n"
     printf "  %sStep 1%s → Check & install system dependencies (git, python, dev tools)\n" "$CYAN" "$NC"
     printf "  %sStep 2%s → Install uv (Python package manager)\n" "$CYAN" "$NC"
     printf "  %sStep 3%s → Clone the Tau repository\n" "$CYAN" "$NC"
-    printf "  %sStep 4%s → Set up Python environment\n" "$CYAN" "$NC"
+    printf "  %sStep 4%s → Set up Python environment & supervisor\n" "$CYAN" "$NC"
     printf "  %sStep 5%s → Install Cursor agent CLI\n" "$CYAN" "$NC"
     printf "  %sStep 6%s → Configure Telegram bot token\n" "$CYAN" "$NC"
     printf "  %sStep 7%s → Configure OpenAI API key (optional)\n" "$CYAN" "$NC"
-    printf "  %sStep 8%s → Launch Tau!\n" "$CYAN" "$NC"
+    printf "  %sStep 8%s → Set up auto-start on login\n" "$CYAN" "$NC"
+    printf "  %sStep 9%s → Launch Tau!\n" "$CYAN" "$NC"
     printf "\n"
     printf "%sSupported systems:%s macOS (Intel/Apple Silicon), Linux (Ubuntu, Debian, Fedora, Arch, etc.)\n" "$BOLD" "$NC"
     printf "\n"
@@ -525,6 +526,15 @@ step_setup_python() {
     echo ""
     uv pip install -e .
     echo ""
+    
+    print_step "Installing supervisor (process manager)..."
+    uv pip install supervisor
+    print_success "Supervisor installed"
+    
+    # Create logs directory
+    mkdir -p "$INSTALL_DIR/logs"
+    
+    echo ""
     print_success "Dependencies installed!"
     
     wait_continue
@@ -561,14 +571,26 @@ step_setup_cursor_agent() {
         printf "\n"
         if command_exists agent; then
             print_success "Cursor agent CLI installed successfully!"
+            
+            printf "\n"
+            print_step "Logging in to Cursor agent..."
+            printf "\n"
+            printf "This will open a browser window for authentication.\n"
+            printf "\n"
+            
+            agent login
+            
+            printf "\n"
+            print_success "Cursor agent login complete!"
         else
             print_warning "Cursor agent CLI installed but not found in PATH."
             print_info "You may need to restart your terminal or add it to your PATH."
-            print_info "Tau will still start - just ensure 'agent' is available."
+            print_info "Then run: agent login"
         fi
     else
         print_info "Skipped. You can install it later with:"
         printf "  %scurl https://cursor.com/install -fsSL | bash%s\n" "$CYAN" "$NC"
+        printf "  %sagent login%s\n" "$CYAN" "$NC"
     fi
     
     wait_continue
@@ -671,21 +693,160 @@ step_setup_openai_key() {
     wait_continue
 }
 
-# Step 9: Launch Tau
+# Step 9: Setup startup on login
+step_setup_startup() {
+    print_header "Step 8: Setting Up Auto-Start"
+    
+    local OS=$(detect_os)
+    
+    printf "Tau can start automatically when you log in.\n"
+    printf "This uses %ssupervisord%s to manage the process.\n" "$BOLD" "$NC"
+    printf "\n"
+    printf "Benefits:\n"
+    printf "  • Tau restarts automatically if it crashes\n"
+    printf "  • Starts automatically on login\n"
+    printf "  • Easy control with %stauctl%s command\n" "$CYAN" "$NC"
+    printf "\n"
+    
+    printf "Enable auto-start on login? (Y/n): "
+    read -r -n 1 REPLY </dev/tty
+    printf "\n"
+    
+    if [[ $REPLY =~ ^[Nn]$ ]]; then
+        print_info "Skipped auto-start setup."
+        print_info "You can run Tau manually with: tauctl start"
+        wait_continue
+        return
+    fi
+    
+    if [ "$OS" = "macos" ]; then
+        setup_launchd_startup
+    elif [ "$OS" = "linux" ]; then
+        setup_systemd_startup
+    else
+        print_warning "Auto-start not supported on this OS."
+        print_info "Run Tau manually with: tauctl start"
+    fi
+    
+    wait_continue
+}
+
+# Setup launchd on macOS
+setup_launchd_startup() {
+    local PLIST_DIR="$HOME/Library/LaunchAgents"
+    local PLIST_FILE="$PLIST_DIR/com.tau.supervisor.plist"
+    
+    mkdir -p "$PLIST_DIR"
+    
+    print_step "Creating LaunchAgent for supervisord..."
+    
+    cat > "$PLIST_FILE" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tau.supervisor</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$INSTALL_DIR/.venv/bin/supervisord</string>
+        <string>-n</string>
+        <string>-c</string>
+        <string>$INSTALL_DIR/supervisord.conf</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>$INSTALL_DIR</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>$INSTALL_DIR/logs/launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>$INSTALL_DIR/logs/launchd.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>$INSTALL_DIR/.venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
+EOF
+    
+    print_success "LaunchAgent created at $PLIST_FILE"
+    
+    # Load the agent
+    print_step "Loading LaunchAgent..."
+    launchctl unload "$PLIST_FILE" 2>/dev/null || true
+    launchctl load "$PLIST_FILE"
+    
+    print_success "Tau will now start automatically on login!"
+    printf "\n"
+    print_info "To disable auto-start later:"
+    printf "  %slaunchctl unload %s%s\n" "$CYAN" "$PLIST_FILE" "$NC"
+}
+
+# Setup systemd on Linux
+setup_systemd_startup() {
+    local SERVICE_DIR="$HOME/.config/systemd/user"
+    local SERVICE_FILE="$SERVICE_DIR/tau-supervisor.service"
+    
+    mkdir -p "$SERVICE_DIR"
+    
+    print_step "Creating systemd user service..."
+    
+    cat > "$SERVICE_FILE" << EOF
+[Unit]
+Description=Tau Supervisord
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=$INSTALL_DIR
+ExecStart=$INSTALL_DIR/.venv/bin/supervisord -n -c $INSTALL_DIR/supervisord.conf
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+    
+    print_success "Service created at $SERVICE_FILE"
+    
+    # Reload and enable
+    print_step "Enabling systemd service..."
+    systemctl --user daemon-reload
+    systemctl --user enable tau-supervisor
+    systemctl --user start tau-supervisor
+    
+    # Enable lingering so user services start at boot
+    print_step "Enabling user service persistence..."
+    loginctl enable-linger "$USER" 2>/dev/null || print_warning "Could not enable linger (may need sudo)"
+    
+    print_success "Tau will now start automatically on login!"
+    printf "\n"
+    print_info "To disable auto-start later:"
+    printf "  %ssystemctl --user disable tau-supervisor%s\n" "$CYAN" "$NC"
+}
+
+# Step 10: Launch Tau
 step_launch_tau() {
-    print_header "Step 8: Launching Tau!"
+    print_header "Step 9: Launching Tau!"
     
     printf "%sInstallation complete!%s\n" "$GREEN" "$NC"
     printf "\n"
-    printf "Tau is ready to run.\n"
+    printf "Tau is managed by %ssupervisord%s for reliable operation.\n" "$BOLD" "$NC"
     printf "\n"
-    printf "%sWhat happens next:%s\n" "$BOLD" "$NC"
+    printf "%sControl commands:%s\n" "$BOLD" "$NC"
     printf "\n"
-    printf "  1. Tau will start and connect to Telegram\n"
-    printf "  2. Open Telegram and find your bot\n"
-    printf "  3. Send %s/start%s to begin\n" "$CYAN" "$NC"
+    printf "  %stauctl start%s    - Start tau\n" "$CYAN" "$NC"
+    printf "  %stauctl stop%s     - Stop tau\n" "$CYAN" "$NC"
+    printf "  %stauctl restart%s  - Restart tau\n" "$CYAN" "$NC"
+    printf "  %stauctl status%s   - Check status\n" "$CYAN" "$NC"
+    printf "  %stauctl logs%s     - View logs\n" "$CYAN" "$NC"
+    printf "  %stauctl logs -f%s  - Follow logs\n" "$CYAN" "$NC"
     printf "\n"
-    printf "%sAvailable commands:%s\n" "$BOLD" "$NC"
+    printf "%sTelegram commands:%s\n" "$BOLD" "$NC"
     printf "\n"
     printf "  %s/start%s     - Initialize the bot\n" "$CYAN" "$NC"
     printf "  %s/task%s      - Add a new task\n" "$CYAN" "$NC"
@@ -693,30 +854,25 @@ step_launch_tau() {
     printf "  %s/adapt%s     - Self-modify the bot\n" "$CYAN" "$NC"
     printf "  %s/restart%s   - Restart the bot\n" "$CYAN" "$NC"
     printf "\n"
-    printf "%sTo run Tau later:%s\n" "$BOLD" "$NC"
+    
+    # Add tauctl to PATH info
+    printf "%sTo use tauctl from anywhere:%s\n" "$BOLD" "$NC"
     printf "\n"
-    printf "  %scd %s && ./start.sh%s\n" "$CYAN" "$INSTALL_DIR" "$NC"
+    printf "  Add to your shell config (~/.zshrc or ~/.bashrc):\n"
+    printf "  %sexport PATH=\"%s:\$PATH\"%s\n" "$CYAN" "$INSTALL_DIR" "$NC"
     printf "\n"
     
-    # Create start.sh for future use
-    START_SCRIPT="$INSTALL_DIR/start.sh"
-    cat > "$START_SCRIPT" << 'STARTEOF'
-#!/usr/bin/env bash
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
-
-# Load environment variables
-if [ -f .env ]; then
-    set -a
-    source .env
-    set +a
-fi
-
-# Activate virtual environment and run
-source .venv/bin/activate
-python -m tau
-STARTEOF
-    chmod +x "$START_SCRIPT"
+    # Check if tau is already running via supervisor
+    if [ -f "$INSTALL_DIR/.supervisord.pid" ]; then
+        local pid=$(cat "$INSTALL_DIR/.supervisord.pid" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            print_success "Tau is already running via supervisord!"
+            printf "\n"
+            printf "Open Telegram and message your bot to get started.\n"
+            printf "\n"
+            return
+        fi
+    fi
     
     printf "Launch Tau now? (Y/n): "
     read -r -n 1 REPLY </dev/tty
@@ -734,57 +890,25 @@ STARTEOF
         source .env
         set +a
         
-        # Activate virtual environment
-        source .venv/bin/activate
+        # Start via tauctl
+        "$INSTALL_DIR/tauctl" start
         
-        # Run Tau
-        exec python -m tau
+        printf "\n"
+        print_success "Tau is running!"
+        printf "\n"
+        printf "Open Telegram and message your bot to get started.\n"
+        printf "Use %stauctl logs -f%s to follow the logs.\n" "$CYAN" "$NC"
     else
         printf "\n"
         print_info "To start Tau later, run:"
         printf "\n"
-        printf "  %scd %s && ./start.sh%s\n" "$CYAN" "$INSTALL_DIR" "$NC"
+        printf "  %scd %s && ./tauctl start%s\n" "$CYAN" "$INSTALL_DIR" "$NC"
         printf "\n"
     fi
 }
 
 # Main installation flow
 main() {
-    # Handle --systemd flag
-    if [[ "$1" == "--systemd" ]]; then
-        if [[ "$(detect_os)" != "linux" ]]; then
-            print_error "Systemd services are only available on Linux"
-            exit 1
-        fi
-        
-        SERVICE_FILE="$HOME/.config/systemd/user/tau.service"
-        mkdir -p "$(dirname "$SERVICE_FILE")"
-        
-        cat > "$SERVICE_FILE" << EOF
-[Unit]
-Description=Tau Self-Adapting Agent
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=$INSTALL_DIR
-ExecStart=$INSTALL_DIR/start.sh
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=default.target
-EOF
-        
-        print_success "Created systemd service at $SERVICE_FILE"
-        echo ""
-        echo "To enable and start:"
-        echo "  systemctl --user daemon-reload"
-        echo "  systemctl --user enable tau"
-        echo "  systemctl --user start tau"
-        exit 0
-    fi
-    
     # Handle custom install directory
     if [[ -n "$1" ]] && [[ "$1" != --* ]]; then
         INSTALL_DIR="$1"
@@ -799,6 +923,7 @@ EOF
     step_setup_cursor_agent
     step_setup_telegram_token
     step_setup_openai_key
+    step_setup_startup
     step_launch_tau
 }
 
