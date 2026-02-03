@@ -14,10 +14,10 @@ Use `<prompt>` calls to ask questions normally
 > (i.e. "how do I use you?"). 
 
 Use `/adapt <prompt>` to change the agent code directly 
-> (i.e. "Change the code to accept a new `/plan` command").
+> (i.e. "/adapt Change the code to accept a new `/plan` command").
 
 Use `/task <prompt>` to add a longer running challenge which the agent comes back to periodically. 
-> (i.e. "send me a message at 5pm") 
+> (i.e. "/task send me a message at 5pm") 
 
 ## How does it work?
 
