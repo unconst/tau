@@ -158,7 +158,7 @@ def get_chat_history(max_lines: int = 100) -> str:
         if len(lines) <= max_lines:
             return "".join(lines)
         
-        # Return header (first 10 lines) + last (max_lines - 10) lines
+        # Return header (first 10 lines + last (max_lines - 10) lines
         header = lines[:10]
         recent = lines[-(max_lines - 10):]
         return "".join(header) + "\n[... earlier messages truncated ...]\n\n" + "".join(recent)

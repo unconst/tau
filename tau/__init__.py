@@ -163,7 +163,8 @@ def run_cron_loop(stop_event=None):
                 
                 # Build prompt with context
                 from .telegram import get_chat_history
-                chat_history = get_chat_history()
+                # Get recent chat history (last 50 lines is enough for cron context)
+                chat_history = get_chat_history(max_lines=50)
                 
                 prompt_with_context = f"""TELEGRAM CHAT HISTORY:
 {chat_history}
@@ -171,13 +172,13 @@ def run_cron_loop(stop_event=None):
 CRON JOB PROMPT (runs every {job['interval_seconds']}s):
 {job['prompt']}
 
-Please execute this scheduled task."""
+Please execute this scheduled task. Provide a fresh update based on the current state or by using your tools. Do not simply repeat previous messages."""
                 
                 result = subprocess.run(
                     [
                         "agent",
                         "--force",
-                        "--model", "gemini-3-flash",
+                        "--model", "opus-4.5",
                         "--mode=ask",
                         "--output-format=text",
                         "--print",
