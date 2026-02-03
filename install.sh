@@ -572,8 +572,22 @@ step_launch() {
         local OS=$(detect_os)
         if [ "$OS" = "macos" ]; then
             setup_launchd
+            # launchd already started supervisord, wait for it
+            if [ "$do_start" = true ]; then
+                wait_for_ready &
+                spinner $! "Starting" true
+                print_final
+                return
+            fi
         elif [ "$OS" = "linux" ]; then
             setup_systemd
+            # systemd already started supervisord, wait for it
+            if [ "$do_start" = true ]; then
+                wait_for_ready &
+                spinner $! "Starting" true
+                print_final
+                return
+            fi
         fi
     fi
     
@@ -588,6 +602,25 @@ step_launch() {
         info "Run ./tauctl start when ready"
         log ""
     fi
+}
+
+wait_for_ready() {
+    local retries=30
+    while [ $retries -gt 0 ]; do
+        if [ -f "$INSTALL_DIR/.supervisord.pid" ]; then
+            local pid=$(cat "$INSTALL_DIR/.supervisord.pid" 2>/dev/null)
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                # Supervisord is running, check if tau is up
+                if [ -S "$INSTALL_DIR/.supervisor.sock" ]; then
+                    sleep 1
+                    return 0
+                fi
+            fi
+        fi
+        sleep 0.5
+        retries=$((retries - 1))
+    done
+    return 1
 }
 
 print_final() {
