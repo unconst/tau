@@ -10,9 +10,15 @@ from pathlib import Path
 from openai import OpenAI
 from .telegram import bot, save_chat_id, notify, WORKSPACE, append_chat_history
 from .agent import run_loop, run_story_loop, run_story_prune_loop, TASKS_DIR, get_all_tasks, git_commit_changes, set_debug_mode
+import re
 
 # Debug mode flag - controls verbose notifications
 DEBUG_MODE = False
+
+# Storage for active cron jobs: list of {id, interval_seconds, prompt, next_run, chat_id}
+_cron_jobs = []
+_cron_lock = threading.Lock()
+_next_cron_id = 1
 
 # Configure logging
 LOG_FILE = os.path.join(WORKSPACE, "logs", "tau.log")
@@ -96,11 +102,234 @@ def transcribe_voice(voice_path: str) -> str:
         raise Exception(f"Failed to transcribe voice: {str(e)}")
 
 
+def parse_interval(interval_str: str) -> int:
+    """Parse interval string like '5min', '30sec', '2h' into seconds.
+    
+    Supported formats:
+    - Xsec, Xs, Xsecond, Xseconds
+    - Xmin, Xm, Xminute, Xminutes  
+    - Xh, Xhr, Xhour, Xhours
+    
+    If parsing fails, assumes minutes.
+    Returns interval in seconds.
+    """
+    interval_str = interval_str.lower().strip()
+    
+    # Try to extract number and unit
+    match = re.match(r'^(\d+)\s*([a-z]*)$', interval_str)
+    if not match:
+        # Try to parse as just a number (assume minutes)
+        try:
+            return int(interval_str) * 60
+        except ValueError:
+            return 5 * 60  # Default to 5 minutes
+    
+    number = int(match.group(1))
+    unit = match.group(2)
+    
+    if unit in ('s', 'sec', 'second', 'seconds'):
+        return number
+    elif unit in ('m', 'min', 'minute', 'minutes'):
+        return number * 60
+    elif unit in ('h', 'hr', 'hour', 'hours'):
+        return number * 3600
+    else:
+        # Default to minutes if unit not recognized
+        return number * 60
+
+
+def run_cron_loop(stop_event=None):
+    """Background loop that runs cron jobs at their scheduled times."""
+    import time
+    
+    while True:
+        if stop_event and stop_event.is_set():
+            break
+        
+        now = time.time()
+        jobs_to_run = []
+        
+        with _cron_lock:
+            for job in _cron_jobs:
+                if now >= job['next_run']:
+                    jobs_to_run.append(job.copy())
+                    # Schedule next run
+                    job['next_run'] = now + job['interval_seconds']
+        
+        # Execute jobs outside the lock
+        for job in jobs_to_run:
+            try:
+                logger.info(f"Running cron job {job['id']}: {job['prompt'][:50]}...")
+                
+                # Build prompt with context
+                from .telegram import get_chat_history
+                chat_history = get_chat_history()
+                
+                prompt_with_context = f"""TELEGRAM CHAT HISTORY:
+{chat_history}
+
+CRON JOB PROMPT (runs every {job['interval_seconds']}s):
+{job['prompt']}
+
+Please execute this scheduled task."""
+                
+                result = subprocess.run(
+                    [
+                        "agent",
+                        "--force",
+                        "--model", "gemini-3-flash",
+                        "--mode=ask",
+                        "--output-format=text",
+                        "--print",
+                        prompt_with_context
+                    ],
+                    capture_output=True,
+                    text=True,
+                    stdin=subprocess.DEVNULL,
+                    timeout=120
+                )
+                
+                response = result.stdout.strip() if result.stdout else result.stderr.strip()
+                if response:
+                    # Send result to user
+                    try:
+                        bot.send_message(job['chat_id'], f"⏰ Cron #{job['id']}:\n{response[:4000]}")
+                        append_chat_history("assistant", f"[cron #{job['id']}]: {response}")
+                    except Exception as e:
+                        logger.error(f"Failed to send cron result: {e}")
+                        
+            except subprocess.TimeoutExpired:
+                logger.error(f"Cron job {job['id']} timed out")
+            except Exception as e:
+                logger.error(f"Cron job {job['id']} error: {e}")
+        
+        # Sleep for 1 second between checks
+        time.sleep(1)
+
+
+@bot.message_handler(commands=['cron'])
+def add_cron(message):
+    """Add a cron job that runs a prompt at specified intervals."""
+    global _next_cron_id
+    
+    save_chat_id(message.chat.id)
+    
+    # Parse: /cron <interval> <prompt>
+    text = message.text.replace('/cron', '', 1).strip()
+    append_chat_history("user", f"/cron {text}")
+    
+    if not text:
+        response = "Usage: /cron <interval> <prompt>\nExamples:\n  /cron 5min check the weather\n  /cron 30sec ping\n  /cron 1h summarize news"
+        bot.reply_to(message, response)
+        append_chat_history("assistant", response)
+        return
+    
+    # Split into interval and prompt
+    parts = text.split(None, 1)
+    if len(parts) < 2:
+        response = "Usage: /cron <interval> <prompt>\nNeed both an interval and a prompt."
+        bot.reply_to(message, response)
+        append_chat_history("assistant", response)
+        return
+    
+    interval_str, prompt = parts
+    interval_seconds = parse_interval(interval_str)
+    
+    # Create cron job
+    import time
+    with _cron_lock:
+        cron_id = _next_cron_id
+        _next_cron_id += 1
+        
+        job = {
+            'id': cron_id,
+            'interval_seconds': interval_seconds,
+            'prompt': prompt,
+            'next_run': time.time() + interval_seconds,
+            'chat_id': message.chat.id
+        }
+        _cron_jobs.append(job)
+    
+    # Format interval for display
+    if interval_seconds < 60:
+        interval_display = f"{interval_seconds}sec"
+    elif interval_seconds < 3600:
+        interval_display = f"{interval_seconds // 60}min"
+    else:
+        interval_display = f"{interval_seconds // 3600}h"
+    
+    response = f"✅ Cron #{cron_id} created: every {interval_display}\nPrompt: {prompt[:100]}"
+    bot.reply_to(message, response)
+    append_chat_history("assistant", response)
+
+
+@bot.message_handler(commands=['crons'])
+def list_crons(message):
+    """List all active cron jobs."""
+    save_chat_id(message.chat.id)
+    append_chat_history("user", "/crons")
+    
+    with _cron_lock:
+        if not _cron_jobs:
+            response = "No active cron jobs."
+        else:
+            lines = ["Active cron jobs:"]
+            for job in _cron_jobs:
+                interval = job['interval_seconds']
+                if interval < 60:
+                    interval_display = f"{interval}sec"
+                elif interval < 3600:
+                    interval_display = f"{interval // 60}min"
+                else:
+                    interval_display = f"{interval // 3600}h"
+                lines.append(f"  #{job['id']}: every {interval_display} - {job['prompt'][:50]}...")
+            response = "\n".join(lines)
+    
+    bot.reply_to(message, response)
+    append_chat_history("assistant", response)
+
+
+@bot.message_handler(commands=['uncron'])
+def remove_cron(message):
+    """Remove a cron job by ID."""
+    save_chat_id(message.chat.id)
+    
+    text = message.text.replace('/uncron', '', 1).strip()
+    append_chat_history("user", f"/uncron {text}")
+    
+    if not text:
+        response = "Usage: /uncron <id>\nUse /crons to see active jobs."
+        bot.reply_to(message, response)
+        append_chat_history("assistant", response)
+        return
+    
+    try:
+        cron_id = int(text.replace('#', ''))
+    except ValueError:
+        response = "Invalid cron ID. Use /crons to see active jobs."
+        bot.reply_to(message, response)
+        append_chat_history("assistant", response)
+        return
+    
+    with _cron_lock:
+        for i, job in enumerate(_cron_jobs):
+            if job['id'] == cron_id:
+                _cron_jobs.pop(i)
+                response = f"✅ Cron #{cron_id} removed."
+                bot.reply_to(message, response)
+                append_chat_history("assistant", response)
+                return
+    
+    response = f"Cron #{cron_id} not found. Use /crons to see active jobs."
+    bot.reply_to(message, response)
+    append_chat_history("assistant", response)
+
+
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     save_chat_id(message.chat.id)
     append_chat_history("user", f"/start")
-    response = "Hello! I'm Tau. Commands:\n/task <description> - Add a task\n/status - See recent activity\n/adapt <prompt> - Self-modify\n/restart - Restart bot\n/debug - Toggle debug mode"
+    response = "Hello! I'm Tau. Commands:\n/task <description> - Add a task\n/status - See recent activity\n/adapt <prompt> - Self-modify\n/cron <interval> <prompt> - Schedule recurring prompt\n/crons - List active crons\n/uncron <id> - Remove a cron\n/restart - Restart bot\n/debug - Toggle debug mode"
     bot.reply_to(message, response)
     append_chat_history("assistant", response)
 
@@ -541,6 +770,15 @@ def main():
         name="StoryPruneLoop"
     )
     prune_thread.start()
+    
+    # Start cron loop in background thread
+    cron_thread = threading.Thread(
+        target=run_cron_loop,
+        args=(_stop_event,),
+        daemon=True,
+        name="CronLoop"
+    )
+    cron_thread.start()
     
     # Start Bitcoin price scheduler in background thread (if available)
     if run_hourly_scheduler:

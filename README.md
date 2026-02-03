@@ -23,6 +23,9 @@ Use `/adapt <prompt>` to change the agent code directly
 Use `/task <prompt>` to add a longer running challenge which the agent comes back to periodically. 
 > (i.e. "/task send me a message at 5pm") 
 
+Use `/task <prompt>` to add a longer running challenge which the agent comes back to periodically. 
+> (i.e. "/task send me a message at 5pm") 
+
 ## How does it work?
 
 Tau maintains a directory on your computer (where you installed it) this is the full agent context. You can add files to it etc and it will all come into contact with your agent.
