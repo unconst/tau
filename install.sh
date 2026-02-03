@@ -775,8 +775,10 @@ setup_launchd_startup() {
     <string>$INSTALL_DIR/logs/launchd.log</string>
     <key>EnvironmentVariables</key>
     <dict>
+        <key>HOME</key>
+        <string>$HOME</string>
         <key>PATH</key>
-        <string>$INSTALL_DIR/.venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>$INSTALL_DIR/.venv/bin:$HOME/.local/bin:$HOME/.cursor/bin:/usr/local/bin:/usr/bin:/bin</string>
     </dict>
 </dict>
 </plist>
