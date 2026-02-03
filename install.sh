@@ -548,7 +548,6 @@ EOF
 
 step_launch() {
     section "Launch"
-    log ""
     
     local do_autostart=false
     local do_start=false
@@ -596,8 +595,7 @@ print_final() {
     log ""
     printf "${GREEN}✓ Tau is live${NC}\n"
     log ""
-    info "Message your bot to begin"
-    printf "  ${CYAN}This agent can modify itself.${NC}\n"
+    printf "  ${BOLD}Message your bot to begin${NC}\n"
     log ""
 }
 
