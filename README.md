@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="tauninja.png" alt="Tau Ninja" width="480" />
+  <img src="tauninja.png" alt="Tau Ninja" width="800" />
 </p>
 
 An agent that can do stuff and upgrade its own code in real time.
