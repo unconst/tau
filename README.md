@@ -1,5 +1,9 @@
 # Tau Ninja
 
+<p align="center">
+  <img src="https://tau.ninja/tauninja.png" alt="Tau Ninja" width="256" />
+</p>
+
 An agent that can do stuff and upgrade its own code in real time.
 
 ## How to install?
