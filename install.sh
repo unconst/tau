@@ -48,12 +48,12 @@ BOT_TOKEN=""
 
 log() { [ "$QUIET" = "1" ] || printf "%s\n" "$1"; }
 
-section()  { log ""; log "${BOLD}▸ $1${NC}"; log ""; }
-action()   { log "  → $1"; }
-ok()       { log "  ${GREEN}✓${NC} $1"; }
-info()     { log "  ${DIM}·${NC} $1"; }
-warn()     { log "  ${YELLOW}!${NC} $1"; }
-err()      { log "  ${RED}✗${NC} $1"; }
+section()      { log ""; log "${BOLD}▸ $1${NC}"; }
+section_done() { printf "\r${BOLD}▸ $1 ${GREEN}✓${NC}\n"; }
+ok()           { log "  ${GREEN}✓${NC} $1"; }
+info()         { log "  $1"; }
+warn()         { log "  ${YELLOW}!${NC} $1"; }
+err()          { log "  ${RED}✗${NC} $1"; }
 
 check_ok()      { log "  ${GREEN}✓${NC} $1${DIM}${2:+ ($2)}${NC}"; }
 check_missing() { log "  ${RED}✗${NC} $1"; }
@@ -61,7 +61,7 @@ check_pending() { log "  ${DIM}○${NC} $1 ${DIM}(will install)${NC}"; }
 
 pause() {
     [ "$FAST" = "1" ] && return
-    printf "\n  ${DIM}▸ Continue ⏎${NC} "
+    printf "\n${DIM}▸ Continue ⏎${NC} "
     read -r </dev/tty
 }
 
@@ -76,6 +76,7 @@ prompt_yn() {
 spinner() {
     local pid=$1
     local msg="$2"
+    local silent="${3:-false}"
     local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
     local i=0
     
@@ -90,7 +91,9 @@ spinner() {
     wait "$pid"
     local code=$?
     
-    if [ $code -eq 0 ]; then
+    if [ "$silent" = "true" ]; then
+        printf "\r%*s\r" $((${#msg} + 6)) ""
+    elif [ $code -eq 0 ]; then
         printf "\r  ${GREEN}✓${NC} %s\n" "$msg"
     else
         printf "\r  ${RED}✗${NC} %s\n" "$msg"
@@ -102,6 +105,12 @@ run_spin() {
     local msg="$1"; shift
     "$@" >/dev/null 2>&1 &
     spinner $! "$msg"
+}
+
+run_silent() {
+    local msg="$1"; shift
+    "$@" >/dev/null 2>&1 &
+    spinner $! "$msg" true
 }
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
@@ -209,6 +218,7 @@ step_welcome() {
 
 step_dependencies() {
     section "Dependencies"
+    log ""
     
     local OS=$(detect_os)
     local missing_git=false
@@ -340,14 +350,15 @@ step_install_uv() {
 
 step_clone() {
     section "Install"
+    log ""
     
     step_install_uv
     
     if [ "$RUNNING_FROM_REPO" = true ]; then
-        if prompt_yn "Pull latest changes"; then
+        if prompt_yn "Pull latest"; then
             cd "$INSTALL_DIR"
             git pull origin main >/dev/null 2>&1 &
-            spinner $! "Pulled latest" || warn "Could not pull"
+            spinner $! "Pulling" true || warn "Could not pull"
         fi
         
         cd "$INSTALL_DIR"
@@ -357,15 +368,15 @@ step_clone() {
     if [ -d "$INSTALL_DIR" ]; then
         if [ ! -f "$INSTALL_DIR/tauctl" ]; then
             cd "$INSTALL_DIR"
-            run_spin "Repo updated" git pull origin main
-        elif prompt_yn "Pull latest changes"; then
+            run_silent "Updating" git pull origin main
+        elif prompt_yn "Pull latest"; then
             cd "$INSTALL_DIR"
             git pull origin main >/dev/null 2>&1 &
-            spinner $! "Pulled latest" || true
+            spinner $! "Pulling" true || true
         fi
     else
         mkdir -p "$(dirname "$INSTALL_DIR")"
-        run_spin "Repo cloned" git clone "$REPO_URL" "$INSTALL_DIR"
+        run_silent "Cloning" git clone "$REPO_URL" "$INSTALL_DIR"
     fi
     
     cd "$INSTALL_DIR"
@@ -375,17 +386,15 @@ step_python() {
     cd "$INSTALL_DIR"
     
     if [ ! -d ".venv" ]; then
-        run_spin "Environment created" uv venv .venv
+        run_silent "Creating environment" uv venv .venv
     fi
     
     source .venv/bin/activate
     
-    run_spin "Tau installed" uv pip install -e .
-    run_spin "Supervisor installed" uv pip install supervisor
+    run_silent "Installing" uv pip install -e .
+    run_silent "Installing" uv pip install supervisor
     
     mkdir -p "$INSTALL_DIR/logs"
-    
-    pause
 }
 
 step_cursor_agent() {
@@ -416,16 +425,12 @@ step_cursor_agent() {
 
 step_telegram() {
     section "Telegram"
+    log ""
     
     if [ -n "$TAU_BOT_TOKEN" ]; then
-        ok "Bot token detected"
+        info "Using existing token"
         BOT_TOKEN="$TAU_BOT_TOKEN"
-        if [ "$FAST" != "1" ] && ! prompt_yn "Use existing token"; then
-            BOT_TOKEN=""
-        fi
-    fi
-    
-    if [ -z "$BOT_TOKEN" ]; then
+    else
         info "Create a bot via @BotFather → /newbot"
         log ""
         printf "  ${DIM}Token:${NC} "
@@ -442,7 +447,6 @@ step_telegram() {
     fi
     
     echo "TAU_BOT_TOKEN=$BOT_TOKEN" > "$INSTALL_DIR/.env"
-    ok "Token saved"
     
     pause
 }
@@ -450,26 +454,21 @@ step_telegram() {
 step_openai() {
     local ENV_FILE="$INSTALL_DIR/.env"
     
-    section "Optional"
-    
     if [ -n "$OPENAI_API_KEY" ]; then
         grep -q "OPENAI_API_KEY" "$ENV_FILE" 2>/dev/null || \
             echo "OPENAI_API_KEY=$OPENAI_API_KEY" >> "$ENV_FILE"
-        ok "OpenAI API key detected"
         return
     fi
     
     [ "$FAST" = "1" ] && return
     
-    info "OpenAI key enables voice transcription"
-    printf "  API key ${DIM}(Enter to skip)${NC}: "
+    log ""
+    printf "  ${DIM}OpenAI key (voice):${NC} "
     read -r API_KEY </dev/tty
     
     if [ -n "$API_KEY" ]; then
         echo "OPENAI_API_KEY=$API_KEY" >> "$ENV_FILE"
-        ok "API key saved"
     fi
-    :
 }
 
 setup_launchd() {
@@ -516,8 +515,6 @@ EOF
     
     launchctl unload "$PLIST_FILE" 2>/dev/null || true
     launchctl load "$PLIST_FILE"
-    
-    ok "Auto-start enabled"
 }
 
 setup_systemd() {
@@ -547,53 +544,57 @@ EOF
     systemctl --user enable "$SERVICE_NAME" >/dev/null 2>&1
     systemctl --user start "$SERVICE_NAME"
     loginctl enable-linger "$USER" 2>/dev/null || true
-    
-    ok "Auto-start enabled"
 }
 
 step_launch() {
     section "Launch"
+    log ""
     
-    # Auto-start option
-    if prompt_yn "Enable auto-start"; then
-        local OS=$(detect_os)
-        
-        if [ "$OS" = "macos" ]; then
-            setup_launchd
-        elif [ "$OS" = "linux" ]; then
-            setup_systemd
-        else
-            warn "Auto-start not supported"
-        fi
-    fi
+    local do_autostart=false
+    local do_start=false
     
     # Check if already running
     if [ -f "$INSTALL_DIR/.supervisord.pid" ]; then
         local pid=$(cat "$INSTALL_DIR/.supervisord.pid" 2>/dev/null)
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            ok "Tau already running"
             print_final
             return
         fi
     fi
     
-    if prompt_yn "Start Tau now"; then
+    if prompt_yn "Auto-start on boot"; then
+        do_autostart=true
+    fi
+    
+    if prompt_yn "Start now"; then
+        do_start=true
+    fi
+    
+    if [ "$do_autostart" = true ]; then
+        local OS=$(detect_os)
+        if [ "$OS" = "macos" ]; then
+            setup_launchd
+        elif [ "$OS" = "linux" ]; then
+            setup_systemd
+        fi
+    fi
+    
+    if [ "$do_start" = true ]; then
         cd "$INSTALL_DIR"
         set -a; source .env; set +a
-        
         "$INSTALL_DIR/tauctl" start >/dev/null 2>&1 &
-        spinner $! "Tau started"
-        
+        spinner $! "Starting" true
         print_final
     else
         log ""
-        info "Start later: cd $INSTALL_DIR && ./tauctl start"
+        info "Run ./tauctl start when ready"
+        log ""
     fi
 }
 
 print_final() {
     log ""
-    printf "  ${BOLD}${GREEN}✓ Tau is live${NC}\n"
+    printf "${GREEN}✓ Tau is live${NC}\n"
     log ""
     info "Message your bot to begin"
     printf "  ${CYAN}This agent can modify itself.${NC}\n"
