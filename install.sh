@@ -1,888 +1,476 @@
 #!/usr/bin/env bash
 #
 # Tau Installation Script
-# 
+#
 # Usage:
-#   # Install via curl (will prompt for install location):
 #   curl -fsSL https://raw.githubusercontent.com/unconst/tau/main/install.sh | bash
-#
-#   # Install to a specific directory via curl:
-#   TAU_INSTALL_DIR=/path/to/my-tau curl -fsSL https://raw.githubusercontent.com/unconst/tau/main/install.sh | bash
-#
-#   # Run from a cloned repo (installs in current directory):
-#   git clone https://github.com/unconst/tau.git my-tau
-#   cd my-tau && ./install.sh
-#
-#   # Specify custom install directory:
-#   ./install.sh /path/to/install
-#
-# Multiple Instances:
-#   You can run multiple Tau bots on the same machine by installing to
-#   different directories. Each instance gets unique service names derived
-#   from the installation path, preventing conflicts.
+#   TAU_INSTALL_DIR=/path/to/tau curl -fsSL ... | bash
+#   TAU_QUIET=1 ./install.sh
 #
 
 set -e
 
-# Colors for output (using $'...' syntax for proper escape handling)
+# ─────────────────────────────────────────────────────────────────────────────
+# Colors
+# ─────────────────────────────────────────────────────────────────────────────
+
 RED=$'\033[0;31m'
 GREEN=$'\033[0;32m'
 YELLOW=$'\033[1;33m'
-BLUE=$'\033[0;34m'
 CYAN=$'\033[0;36m'
 NC=$'\033[0m'
 BOLD=$'\033[1m'
+DIM=$'\033[2m'
 
-# Repo URL for cloning (only used if not running from existing repo)
+# ─────────────────────────────────────────────────────────────────────────────
+# Settings
+# ─────────────────────────────────────────────────────────────────────────────
+
+QUIET=${TAU_QUIET:-0}
+FAST=${TAU_FAST:-0}
 REPO_URL="${TAU_REPO_URL:-https://github.com/unconst/tau.git}"
 
-# Detect if running from an existing repo (local execution vs curl pipe)
-detect_install_context() {
-    local script_dir=""
-    
-    # Check if script is being run from a file (not piped)
-    if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
-        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-        
-        # Check if this looks like a tau repo (has key files)
-        if [ -f "$script_dir/tauctl" ] && [ -f "$script_dir/supervisord.conf" ] && [ -d "$script_dir/tau" ]; then
-            # Running from existing repo - use this directory
-            INSTALL_DIR="$script_dir"
-            RUNNING_FROM_REPO=true
-            return 0
-        fi
-    fi
-    
-    # Not running from repo - need to clone or use specified directory
-    RUNNING_FROM_REPO=false
-    
-    # Use environment variable if set
-    if [ -n "${TAU_INSTALL_DIR:-}" ]; then
-        INSTALL_DIR="$TAU_INSTALL_DIR"
-        return 0
-    fi
-    
-    # Default: will prompt user during welcome step
-    INSTALL_DIR=""
-}
-
-# Generate a unique instance ID from the installation path
-# This ensures multiple taobots don't conflict with each other
-generate_instance_id() {
-    local path="$1"
-    # Create a short, safe identifier from the path
-    # Use the last component of the path, sanitized
-    local base_name=$(basename "$path")
-    # Sanitize: lowercase, replace non-alphanumeric with dashes
-    local sanitized=$(echo "$base_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//')
-    
-    # If the sanitized name is empty or just "tau", add a hash of the full path
-    if [ -z "$sanitized" ] || [ "$sanitized" = "tau" ]; then
-        # Add first 6 chars of md5 hash for uniqueness
-        local hash=$(echo -n "$path" | md5 2>/dev/null || echo -n "$path" | md5sum | cut -d' ' -f1)
-        hash="${hash:0:6}"
-        if [ -z "$sanitized" ]; then
-            sanitized="tau-$hash"
-        else
-            sanitized="$sanitized-$hash"
-        fi
-    fi
-    
-    echo "$sanitized"
-}
-
-# Instance ID will be set after INSTALL_DIR is determined
+INSTALL_DIR=""
 INSTANCE_ID=""
-
-# Detect installation context on script load
-detect_install_context
-
-# Store the token for later use
+RUNNING_FROM_REPO=false
 BOT_TOKEN=""
 
-# Print colored output using printf for reliability
-print_header() {
-    printf "\n"
-    printf "%s%s═══════════════════════════════════════════════════════════%s\n" "$BOLD" "$CYAN" "$NC"
-    printf "%s%s  %s%s\n" "$BOLD" "$CYAN" "$1" "$NC"
-    printf "%s%s═══════════════════════════════════════════════════════════%s\n" "$BOLD" "$CYAN" "$NC"
-    printf "\n"
-}
+# ─────────────────────────────────────────────────────────────────────────────
+# Output helpers — consistent icon semantics
+#
+#   ▸  Section header
+#   →  Action / choice
+#   ✓  Success
+#   ·  Info
+#   !  Warning
+#   ✗  Error
+# ─────────────────────────────────────────────────────────────────────────────
 
-print_step() {
-    printf "%s→%s %s\n" "$BLUE" "$NC" "$1"
-}
+log() { [ "$QUIET" = "1" ] || printf "%s\n" "$1"; }
 
-print_success() {
-    printf "%s✓%s %s\n" "$GREEN" "$NC" "$1"
-}
+section()  { log ""; log "${BOLD}▸ $1${NC}"; log ""; }
+action()   { log "  → $1"; }
+ok()       { log "  ${GREEN}✓${NC} $1"; }
+info()     { log "  ${DIM}·${NC} $1"; }
+warn()     { log "  ${YELLOW}!${NC} $1"; }
+err()      { log "  ${RED}✗${NC} $1"; }
 
-print_warning() {
-    printf "%s⚠%s %s\n" "$YELLOW" "$NC" "$1"
-}
+check_ok()      { log "  ${GREEN}✓${NC} $1${DIM}${2:+ ($2)}${NC}"; }
+check_missing() { log "  ${RED}✗${NC} $1"; }
+check_pending() { log "  ${DIM}○${NC} $1 ${DIM}(will install)${NC}"; }
 
-print_error() {
-    printf "%s✗%s %s\n" "$RED" "$NC" "$1"
-}
-
-print_info() {
-    printf "%sℹ%s %s\n" "$CYAN" "$NC" "$1"
-}
-
-# Wait for user to continue (read from /dev/tty for curl pipe compatibility)
-wait_continue() {
-    printf "\n"
-    printf "Press Enter to continue..."
+pause() {
+    [ "$FAST" = "1" ] && return
+    printf "\n  ${DIM}▸${NC} "
     read -r </dev/tty
+}
+
+prompt_yn() {
+    [ "$FAST" = "1" ] && return 0
+    printf "  → %s [Y/n]: " "$1"
+    read -r -n 1 REPLY </dev/tty
     printf "\n"
+    [[ ! $REPLY =~ ^[Nn]$ ]]
 }
 
-# Read user input (compatible with curl pipe)
-read_input() {
-    read -r "$@" </dev/tty
+spinner() {
+    local pid=$1
+    local msg="$2"
+    local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    local i=0
+    
+    printf "\033[?25l"
+    while kill -0 "$pid" 2>/dev/null; do
+        i=$(( (i+1) % 10 ))
+        printf "\r  %s%s%s %s" "$CYAN" "${spin:$i:1}" "$NC" "$msg"
+        sleep 0.1
+    done
+    printf "\033[?25h"
+    
+    wait "$pid"
+    local code=$?
+    
+    if [ $code -eq 0 ]; then
+        printf "\r  ${GREEN}✓${NC} %s\n" "$msg"
+    else
+        printf "\r  ${RED}✗${NC} %s\n" "$msg"
+    fi
+    return $code
 }
 
-# Check if a command exists
-command_exists() {
-    command -v "$1" >/dev/null 2>&1
+run_spin() {
+    local msg="$1"; shift
+    "$@" >/dev/null 2>&1 &
+    spinner $! "$msg"
 }
 
-# Detect OS
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+
 detect_os() {
     case "$(uname -s)" in
-        Darwin*)    OS="macos";;
-        Linux*)     OS="linux";;
-        *)          OS="unknown";;
+        Darwin*) echo "macos";;
+        Linux*)  echo "linux";;
+        *)       echo "unknown";;
     esac
-    echo "$OS"
 }
 
-# Detect Linux distro
 detect_linux_distro() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
         echo "$ID"
     elif [ -f /etc/debian_version ]; then
         echo "debian"
-    elif [ -f /etc/redhat-release ]; then
-        echo "rhel"
     else
         echo "unknown"
     fi
 }
 
-# Install macOS developer tools (Xcode Command Line Tools)
-install_macos_dev_tools() {
-    print_step "Installing Xcode Command Line Tools..."
-    printf "\n"
-    printf "%sThis will open a dialog to install Apple's developer tools.%s\n" "$YELLOW" "$NC"
-    printf "These tools include git, compilers, and other essentials.\n"
-    printf "\n"
+generate_instance_id() {
+    local path="$1"
+    local base=$(basename "$path" | tr '[:upper:]' '[:lower:]' | \
+                 sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//')
     
-    # Check if already installed
-    if xcode-select -p &>/dev/null; then
-        print_success "Xcode Command Line Tools already installed"
-        return 0
+    if [ -z "$base" ] || [ "$base" = "tau" ]; then
+        local hash=$(echo -n "$path" | md5 2>/dev/null || \
+                     echo -n "$path" | md5sum | cut -d' ' -f1)
+        base="${base:-tau}-${hash:0:6}"
     fi
-    
-    # Trigger the install dialog
-    xcode-select --install 2>/dev/null || true
-    
-    printf "\n"
-    printf "%sPlease complete the installation in the dialog that appeared.%s\n" "$YELLOW" "$NC"
-    printf "Press Enter once the installation is complete..."
-    read -r </dev/tty
-    
-    # Verify installation
-    if xcode-select -p &>/dev/null; then
-        print_success "Xcode Command Line Tools installed successfully"
-        return 0
-    else
-        print_warning "Could not verify installation. Continuing anyway..."
-        return 1
-    fi
+    echo "$base"
 }
 
-# Install Linux dependencies based on distro
-install_linux_dependencies() {
-    local distro=$(detect_linux_distro)
+detect_install_context() {
+    local script_dir=""
     
-    print_step "Installing system dependencies for $distro..."
-    printf "\n"
-    
-    case "$distro" in
-        ubuntu|debian|pop|linuxmint|elementary)
-            print_info "Using apt package manager"
-            printf "\n"
-            printf "This will run: %ssudo apt update && sudo apt install -y git python3 python3-pip python3-venv curl build-essential%s\n" "$CYAN" "$NC"
-            printf "\n"
-            printf "Continue? (Y/n): "
-            read -r -n 1 REPLY </dev/tty
-            printf "\n"
-            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-                sudo apt update
-                sudo apt install -y git python3 python3-pip python3-venv curl build-essential
-            fi
-            ;;
-        fedora|rhel|centos|rocky|alma)
-            print_info "Using dnf package manager"
-            printf "\n"
-            printf "This will run: %ssudo dnf install -y git python3 python3-pip python3-devel curl gcc gcc-c++ make%s\n" "$CYAN" "$NC"
-            printf "\n"
-            printf "Continue? (Y/n): "
-            read -r -n 1 REPLY </dev/tty
-            printf "\n"
-            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-                sudo dnf install -y git python3 python3-pip python3-devel curl gcc gcc-c++ make
-            fi
-            ;;
-        arch|manjaro|endeavouros)
-            print_info "Using pacman package manager"
-            printf "\n"
-            printf "This will run: %ssudo pacman -Sy --noconfirm git python python-pip curl base-devel%s\n" "$CYAN" "$NC"
-            printf "\n"
-            printf "Continue? (Y/n): "
-            read -r -n 1 REPLY </dev/tty
-            printf "\n"
-            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-                sudo pacman -Sy --noconfirm git python python-pip curl base-devel
-            fi
-            ;;
-        opensuse*|suse*)
-            print_info "Using zypper package manager"
-            printf "\n"
-            printf "This will run: %ssudo zypper install -y git python3 python3-pip curl gcc gcc-c++ make%s\n" "$CYAN" "$NC"
-            printf "\n"
-            printf "Continue? (Y/n): "
-            read -r -n 1 REPLY </dev/tty
-            printf "\n"
-            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-                sudo zypper install -y git python3 python3-pip curl gcc gcc-c++ make
-            fi
-            ;;
-        alpine)
-            print_info "Using apk package manager"
-            printf "\n"
-            printf "This will run: %ssudo apk add git python3 py3-pip curl build-base%s\n" "$CYAN" "$NC"
-            printf "\n"
-            printf "Continue? (Y/n): "
-            read -r -n 1 REPLY </dev/tty
-            printf "\n"
-            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-                sudo apk add git python3 py3-pip curl build-base
-            fi
-            ;;
-        *)
-            print_warning "Unknown Linux distribution: $distro"
-            printf "\n"
-            printf "Please manually install: git, python3, python3-pip, python3-venv, curl, and build tools\n"
-            printf "\n"
-            printf "Press Enter to continue..."
-            read -r </dev/tty
-            ;;
-    esac
-}
-
-# Install Homebrew on macOS (optional, for Python installation)
-install_homebrew() {
-    if command_exists brew; then
-        print_success "Homebrew is already installed"
-        return 0
-    fi
-    
-    printf "Homebrew is a package manager that can install Python and other tools.\n"
-    printf "\n"
-    printf "Install Homebrew? (Y/n): "
-    read -r -n 1 REPLY </dev/tty
-    printf "\n"
-    
-    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-        print_step "Installing Homebrew..."
-        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
         
-        # Add to PATH for Apple Silicon Macs
-        if [ -f "/opt/homebrew/bin/brew" ]; then
-            eval "$(/opt/homebrew/bin/brew shellenv)"
+        if [ -f "$script_dir/tauctl" ] && [ -d "$script_dir/tau" ]; then
+            INSTALL_DIR="$script_dir"
+            RUNNING_FROM_REPO=true
+            return 0
         fi
-        
-        print_success "Homebrew installed"
-    fi
-}
-
-# Install Python via Homebrew on macOS
-install_python_macos() {
-    if ! command_exists brew; then
-        install_homebrew
     fi
     
-    if command_exists brew; then
-        print_step "Installing Python via Homebrew..."
-        brew install python3
-        print_success "Python installed"
-    else
-        print_error "Cannot install Python without Homebrew"
-        print_info "Please install Python manually from https://python.org"
-        return 1
-    fi
+    RUNNING_FROM_REPO=false
+    [ -n "${TAU_INSTALL_DIR:-}" ] && INSTALL_DIR="$TAU_INSTALL_DIR"
 }
 
-# Step 1: Welcome
+# ─────────────────────────────────────────────────────────────────────────────
+# Installation steps
+# ─────────────────────────────────────────────────────────────────────────────
+
 step_welcome() {
-    print_header "Welcome to Tau"
-    
-    printf "%sTau%s A chat agent that learns from you, writes its own software to upgrade itself, and solve problems for you. \n" "$BOLD" "$NC"
     printf "\n"
+    printf "%s%s" "$CYAN" "$BOLD"
+    printf "   ████████╗ █████╗ ██╗   ██╗\n"
+    printf "   ╚══██╔══╝██╔══██╗██║   ██║\n"
+    printf "      ██║   ███████║██║   ██║\n"
+    printf "      ██║   ██╔══██║██║   ██║\n"
+    printf "      ██║   ██║  ██║╚██████╔╝\n"
+    printf "      ╚═╝   ╚═╝  ╚═╝ ╚═════╝\n"
+    printf "%s" "$NC"
+    printf "   %sSelf-upgrading agent%s\n\n" "$DIM" "$NC"
     
-    # Determine installation directory if not already set
     if [ -z "$INSTALL_DIR" ]; then
-        printf "%sWhere would you like to install Tau?%s\n" "$BOLD" "$NC"
-        printf "\n"
-        printf "Enter installation path (or press Enter for %s$HOME/tau%s): " "$CYAN" "$NC"
-        read -r INSTALL_PATH </dev/tty
+        if [ "$FAST" != "1" ]; then
+            printf "Install path ${DIM}(default: ~/tau)${NC}: "
+            read -r INSTALL_PATH </dev/tty
+        else
+            INSTALL_PATH=""
+        fi
         
         if [ -z "$INSTALL_PATH" ]; then
             INSTALL_DIR="$HOME/tau"
         else
-            # Expand ~ to $HOME
             INSTALL_DIR="${INSTALL_PATH/#\~/$HOME}"
-            # Convert to absolute path
-            INSTALL_DIR="$(cd "$(dirname "$INSTALL_DIR")" 2>/dev/null && pwd)/$(basename "$INSTALL_DIR")" || INSTALL_DIR="$INSTALL_PATH"
         fi
         printf "\n"
     fi
     
-    # Generate unique instance ID from the installation path
     INSTANCE_ID=$(generate_instance_id "$INSTALL_DIR")
     
-    if [ "$RUNNING_FROM_REPO" = true ]; then
-        printf "%sDetected existing Tau repository%s\n" "$GREEN" "$NC"
+    [ "$RUNNING_FROM_REPO" = true ] && ok "Using existing repo"
+    
+    info "Installing to $INSTALL_DIR"
+    
+    if [ "$FAST" != "1" ]; then
+        printf "\n  → Begin [Y/n]: "
+        read -r -n 1 REPLY </dev/tty
         printf "\n"
-    fi
-    
-    printf "This installer will guide you through:\n"
-    printf "\n"
-    printf "  %sStep 1%s → Check & install system dependencies (git, python, dev tools)\n" "$CYAN" "$NC"
-    printf "  %sStep 2%s → Install uv (Python package manager)\n" "$CYAN" "$NC"
-    if [ "$RUNNING_FROM_REPO" = true ]; then
-        printf "  %sStep 3%s → (Skipped - using existing repository)\n" "$CYAN" "$NC"
-    else
-        printf "  %sStep 3%s → Clone the Tau repository\n" "$CYAN" "$NC"
-    fi
-    printf "  %sStep 4%s → Set up Python environment & supervisor\n" "$CYAN" "$NC"
-    printf "  %sStep 5%s → Install Cursor agent CLI\n" "$CYAN" "$NC"
-    printf "  %sStep 6%s → Configure Telegram bot token\n" "$CYAN" "$NC"
-    printf "  %sStep 7%s → Configure OpenAI API key (optional)\n" "$CYAN" "$NC"
-    printf "  %sStep 8%s → Set up auto-start on login\n" "$CYAN" "$NC"
-    printf "  %sStep 9%s → Launch Tau!\n" "$CYAN" "$NC"
-    printf "\n"
-    printf "%sSupported systems:%s macOS (Intel/Apple Silicon), Linux (Ubuntu, Debian, Fedora, Arch, etc.)\n" "$BOLD" "$NC"
-    printf "\n"
-    printf "Installation directory: %s%s%s\n" "$BOLD" "$INSTALL_DIR" "$NC"
-    printf "Instance ID: %s%s%s (used for service naming)\n" "$CYAN" "$INSTANCE_ID" "$NC"
-    printf "\n"
-    printf "%sNote:%s You can run multiple Tau bots on this machine by installing to different directories.\n" "$YELLOW" "$NC"
-    printf "Each instance will have its own configuration and run independently.\n"
-    printf "\n"
-    
-    printf "Ready to begin? (Y/n): "
-    read -r -n 1 REPLY </dev/tty
-    printf "\n"
-    if [[ $REPLY =~ ^[Nn]$ ]]; then
-        printf "Installation cancelled.\n"
-        exit 0
+        if [[ $REPLY =~ ^[Nn]$ ]]; then
+            exit 0
+        fi
     fi
 }
 
-# Step 2: Check dependencies
-step_check_dependencies() {
-    print_header "Step 1: Checking Dependencies"
+step_dependencies() {
+    section "Dependencies"
     
     local OS=$(detect_os)
     local missing_git=false
     local missing_python=false
     local missing_curl=false
     
-    # Check curl (needed for uv installation)
-    print_step "Checking for curl..."
     if command_exists curl; then
-        print_success "curl is installed"
+        check_ok "curl"
     else
-        print_error "curl is not installed"
+        check_missing "curl"
         missing_curl=true
     fi
     
-    # Check git
-    print_step "Checking for git..."
     if command_exists git; then
-        print_success "git is installed ($(git --version | cut -d' ' -f3))"
+        check_ok "git" "$(git --version | cut -d' ' -f3)"
     else
-        print_error "git is not installed"
+        check_missing "git"
         missing_git=true
     fi
     
-    # Check Python
-    print_step "Checking for Python 3..."
     if command_exists python3; then
-        PYTHON_VERSION=$(python3 --version 2>&1 | cut -d' ' -f2)
-        print_success "Python $PYTHON_VERSION is installed"
+        check_ok "python3" "$(python3 --version 2>&1 | cut -d' ' -f2)"
     else
-        print_error "Python 3 is not installed"
+        check_missing "python3"
         missing_python=true
     fi
     
-    # Check uv
-    print_step "Checking for uv..."
     if command_exists uv; then
-        print_success "uv is installed"
+        check_ok "uv"
     else
-        print_warning "uv is not installed (will install in next step)"
+        check_pending "uv"
     fi
     
-    # Check Cursor agent CLI
-    print_step "Checking for Cursor agent CLI..."
     if command_exists agent; then
-        print_success "Cursor agent CLI is installed"
+        check_ok "cursor agent"
     else
-        print_warning "Cursor agent CLI is not installed (will guide installation)"
+        check_pending "cursor agent"
     fi
     
-    # Handle missing dependencies
-    if [ "$missing_git" = true ] || [ "$missing_python" = true ] || [ "$missing_curl" = true ]; then
-        echo ""
-        print_warning "Missing some required dependencies"
-        printf "\n"
+    if [ "$missing_git" = true ] || [ "$missing_python" = true ] || \
+       [ "$missing_curl" = true ]; then
+        log ""
+        warn "Missing dependencies"
         
         if [ "$OS" = "macos" ]; then
-            printf "On %smacOS%s, we can install developer tools automatically.\n" "$BOLD" "$NC"
-            printf "\n"
-            printf "Install missing dependencies? (Y/n): "
-            read -r -n 1 REPLY </dev/tty
-            printf "\n"
-            
-            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-                # Install Xcode Command Line Tools (provides git, curl, etc.)
-                if [ "$missing_git" = true ] || [ "$missing_curl" = true ]; then
-                    install_macos_dev_tools
-                fi
-                
-                # Install Python if missing
-                if [ "$missing_python" = true ]; then
-                    install_python_macos
-                fi
-                
-                # Re-check dependencies
-                printf "\n"
-                print_step "Re-checking dependencies..."
-                
-                if ! command_exists git; then
-                    print_error "git is still not installed"
-                else
-                    print_success "git is now available"
-                fi
-                
-                if ! command_exists python3; then
-                    print_error "Python 3 is still not installed"
-                else
-                    print_success "Python 3 is now available"
-                fi
-                
-                if ! command_exists curl; then
-                    print_error "curl is still not installed"
-                else
-                    print_success "curl is now available"
-                fi
+            if prompt_yn "Install missing"; then
+                install_macos_deps "$missing_git" "$missing_curl" "$missing_python"
             fi
-            
         elif [ "$OS" = "linux" ]; then
-            printf "On %sLinux%s, we can install dependencies using your package manager.\n" "$BOLD" "$NC"
-            printf "\n"
-            printf "Install missing dependencies? (Y/n): "
-            read -r -n 1 REPLY </dev/tty
-            printf "\n"
-            
-            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-                install_linux_dependencies
-                
-                # Re-check dependencies
-                printf "\n"
-                print_step "Re-checking dependencies..."
-                
-                if ! command_exists git; then
-                    print_error "git is still not installed"
-                else
-                    print_success "git is now available"
-                fi
-                
-                if ! command_exists python3; then
-                    print_error "Python 3 is still not installed"
-                else
-                    print_success "Python 3 is now available"
-                fi
-                
-                if ! command_exists curl; then
-                    print_error "curl is still not installed"
-                else
-                    print_success "curl is now available"
-                fi
+            if prompt_yn "Install missing"; then
+                install_linux_deps
             fi
-        else
-            print_error "Unknown operating system. Please install git, python3, and curl manually."
         fi
         
-        # Final check - exit if still missing critical dependencies
-        if ! command_exists git || ! command_exists python3 || ! command_exists curl; then
-            echo ""
-            print_error "Missing critical dependencies. Cannot continue."
-            printf "\n"
-            printf "Please manually install:\n"
-            if ! command_exists git; then printf "  - git\n"; fi
-            if ! command_exists python3; then printf "  - python3\n"; fi
-            if ! command_exists curl; then printf "  - curl\n"; fi
-            printf "\n"
+        if ! command_exists git || ! command_exists python3 || \
+           ! command_exists curl; then
+            err "Missing: git, python3, curl"
             exit 1
         fi
     fi
     
-    wait_continue
+    pause
 }
 
-# Step 3: Install uv
-step_install_uv() {
-    print_header "Step 2: Installing uv"
+install_macos_deps() {
+    local need_git="$1"
+    local need_curl="$2"
+    local need_python="$3"
     
-    if command_exists uv; then
-        print_success "uv is already installed"
-        wait_continue
-        return
+    if [ "$need_git" = true ] || [ "$need_curl" = true ]; then
+        if ! xcode-select -p &>/dev/null; then
+            info "Installing Xcode Command Line Tools"
+            info "Complete the dialog, then press Enter"
+            xcode-select --install 2>/dev/null || true
+            pause
+        fi
     fi
     
-    echo "uv is a fast Python package manager that Tau uses."
-    echo ""
-    print_step "Installing uv from https://astral.sh/uv..."
-    echo ""
+    if [ "$need_python" = true ]; then
+        if ! command_exists brew; then
+            if prompt_yn "Install Homebrew"; then
+                /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+                [ -f "/opt/homebrew/bin/brew" ] && eval "$(/opt/homebrew/bin/brew shellenv)"
+            fi
+        fi
+        
+        if command_exists brew; then
+            run_spin "Python installed" brew install python3
+        fi
+    fi
+}
+
+install_linux_deps() {
+    local distro=$(detect_linux_distro)
     
-    curl -LsSf https://astral.sh/uv/install.sh | sh
+    case "$distro" in
+        ubuntu|debian|pop|linuxmint)
+            sudo apt update >/dev/null 2>&1
+            sudo apt install -y git python3 python3-pip python3-venv curl build-essential
+            ;;
+        fedora|rhel|centos|rocky)
+            sudo dnf install -y git python3 python3-pip python3-devel curl gcc gcc-c++ make
+            ;;
+        arch|manjaro)
+            sudo pacman -Sy --noconfirm git python python-pip curl base-devel
+            ;;
+        *)
+            warn "Unknown distro: $distro"
+            info "Install manually: git python3 python3-pip curl"
+            ;;
+    esac
+}
+
+step_install_uv() {
+    command_exists uv && return
     
-    # Add to PATH for current session
+    (curl -LsSf https://astral.sh/uv/install.sh | sh) >/dev/null 2>&1 &
+    spinner $! "uv installed"
+    
     export PATH="$HOME/.local/bin:$PATH"
     
-    if command_exists uv; then
-        echo ""
-        print_success "uv installed successfully!"
-    else
-        print_error "Failed to install uv"
+    if ! command_exists uv; then
+        err "Failed to install uv"
         exit 1
     fi
-    
-    wait_continue
 }
 
-# Step 4: Clone repository
-step_clone_repo() {
-    print_header "Step 3: Cloning Tau Repository"
+step_clone() {
+    section "Install"
     
-    # If running from existing repo, we just need to be in that directory
+    step_install_uv
+    
     if [ "$RUNNING_FROM_REPO" = true ]; then
-        print_success "Using existing repository at $INSTALL_DIR"
-        printf "\n"
-        
-        # Offer to update
-        printf "Update to latest version? (Y/n): "
-        read -r -n 1 REPLY </dev/tty
-        printf "\n"
-        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-            print_step "Updating repository..."
+        if prompt_yn "Pull latest changes"; then
             cd "$INSTALL_DIR"
-            git pull origin main || print_warning "Could not pull updates (you may have local changes)"
-        else
-            print_info "Using current version"
+            git pull origin main >/dev/null 2>&1 &
+            spinner $! "Pulled latest" || warn "Could not pull"
         fi
         
         cd "$INSTALL_DIR"
-        wait_continue
         return
     fi
     
     if [ -d "$INSTALL_DIR" ]; then
-        print_info "Tau directory already exists at $INSTALL_DIR"
-        printf "\n"
-        
-        # Check if critical files are missing - force update if so
-        if [ ! -f "$INSTALL_DIR/tauctl" ] || [ ! -f "$INSTALL_DIR/supervisord.conf" ]; then
-            print_warning "Missing critical files - updating required"
-            print_step "Updating repository..."
+        if [ ! -f "$INSTALL_DIR/tauctl" ]; then
             cd "$INSTALL_DIR"
-            git pull origin main || print_warning "Could not pull updates"
-        else
-            printf "Update existing installation? (Y/n): "
-            read -r -n 1 REPLY </dev/tty
-            printf "\n"
-            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-                print_step "Updating repository..."
-                cd "$INSTALL_DIR"
-                git pull origin main || print_warning "Could not pull updates"
-            else
-                print_info "Using existing installation"
-            fi
+            run_spin "Repo updated" git pull origin main
+        elif prompt_yn "Pull latest changes"; then
+            cd "$INSTALL_DIR"
+            git pull origin main >/dev/null 2>&1 &
+            spinner $! "Pulled latest" || true
         fi
     else
-        # Create parent directory if needed
         mkdir -p "$(dirname "$INSTALL_DIR")"
-        
-        print_step "Cloning from $REPO_URL..."
-        echo ""
-        git clone "$REPO_URL" "$INSTALL_DIR"
-        echo ""
-        print_success "Repository cloned to $INSTALL_DIR"
+        run_spin "Repo cloned" git clone "$REPO_URL" "$INSTALL_DIR"
     fi
     
     cd "$INSTALL_DIR"
-    wait_continue
 }
 
-# Step 5: Setup Python environment
-step_setup_python() {
-    print_header "Step 4: Setting Up Python Environment"
-    
+step_python() {
     cd "$INSTALL_DIR"
     
-    # Create virtual environment
-    if [ ! -d ".venv" ]; then
-        print_step "Creating Python virtual environment..."
-        uv venv .venv
-        print_success "Virtual environment created"
-    else
-        print_info "Virtual environment already exists"
-    fi
+    [ ! -d ".venv" ] && run_spin "Environment created" uv venv .venv
     
-    echo ""
-    
-    # Activate and install
-    print_step "Activating virtual environment..."
     source .venv/bin/activate
-    print_success "Virtual environment activated"
     
-    echo ""
+    run_spin "Tau installed" uv pip install -e .
+    run_spin "Supervisor installed" uv pip install supervisor
     
-    print_step "Installing Tau and dependencies..."
-    echo ""
-    uv pip install -e .
-    echo ""
-    
-    print_step "Installing supervisor (process manager)..."
-    uv pip install supervisor
-    print_success "Supervisor installed"
-    
-    # Create logs directory
     mkdir -p "$INSTALL_DIR/logs"
     
-    echo ""
-    print_success "Dependencies installed!"
-    
-    wait_continue
+    pause
 }
 
-# Step 6: Setup Cursor agent
-step_setup_cursor_agent() {
-    print_header "Step 5: Setting Up Cursor Agent CLI"
+step_cursor_agent() {
+    command_exists agent && return
     
-    if command_exists agent; then
-        print_success "Cursor agent CLI is already installed!"
-        wait_continue
-        return
-    fi
+    log ""
+    info "Cursor agent CLI required"
     
-    printf "%sThe Cursor agent CLI is required for Tau to function.%s\n" "$YELLOW" "$NC"
-    printf "\n"
-    printf "This will install the Cursor agent CLI from %shttps://cursor.com/install%s\n" "$CYAN" "$NC"
-    printf "\n"
-    
-    printf "Install Cursor agent CLI? (Y/n): "
-    read -r -n 1 REPLY </dev/tty
-    printf "\n"
-    
-    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-        print_step "Installing Cursor agent CLI..."
-        printf "\n"
-        
+    if prompt_yn "Install Cursor CLI"; then
         curl https://cursor.com/install -fsSL | bash
         
-        # Add common install locations to PATH for current session
         export PATH="$HOME/.cursor/bin:$HOME/.local/bin:$PATH"
         
-        printf "\n"
         if command_exists agent; then
-            print_success "Cursor agent CLI installed successfully!"
-            
-            printf "\n"
-            print_step "Logging in to Cursor agent..."
-            printf "\n"
-            printf "This will open a browser window for authentication.\n"
-            printf "\n"
-            
+            ok "Cursor CLI installed"
+            info "Opening browser for auth"
+            log ""
             agent login
-            
-            printf "\n"
-            print_success "Cursor agent login complete!"
+            ok "Authenticated"
         else
-            print_warning "Cursor agent CLI installed but not found in PATH."
-            print_info "You may need to restart your terminal or add it to your PATH."
-            print_info "Then run: agent login"
+            warn "Installed but not in PATH"
+            info "Restart terminal, then: agent login"
         fi
     else
-        print_info "Skipped. You can install it later with:"
-        printf "  %scurl https://cursor.com/install -fsSL | bash%s\n" "$CYAN" "$NC"
-        printf "  %sagent login%s\n" "$CYAN" "$NC"
+        info "Add later: curl https://cursor.com/install -fsSL | bash"
     fi
-    
-    wait_continue
 }
 
-# Step 7: Setup Telegram token
-step_setup_telegram_token() {
-    print_header "Step 6: Configure Telegram Bot Token"
+step_telegram() {
+    section "Telegram"
     
-    printf "Tau communicates with you through a Telegram bot.\n"
-    printf "\n"
-    printf "%sTo create your Telegram bot:%s\n" "$BOLD" "$NC"
-    printf "\n"
-    printf "  %s1.%s Open Telegram on your phone or desktop\n" "$BOLD" "$NC"
-    printf "\n"
-    printf "  %s2.%s Search for %s@BotFather%s and start a chat\n" "$BOLD" "$NC" "$CYAN" "$NC"
-    printf "\n"
-    printf "  %s3.%s Send %s/newbot%s\n" "$BOLD" "$NC" "$CYAN" "$NC"
-    printf "\n"
-    printf "  %s4.%s Follow the prompts to name your bot\n" "$BOLD" "$NC"
-    printf "\n"
-    printf "  %s5.%s Copy the %sHTTP API token%s that BotFather gives you\n" "$BOLD" "$NC" "$YELLOW" "$NC"
-    printf "     (looks like: %s123456789:ABCdefGHIjklMNOpqrsTUVwxyz%s)\n" "$CYAN" "$NC"
-    printf "\n"
-    
-    # Check if token is already set in environment
     if [ -n "$TAU_BOT_TOKEN" ]; then
-        print_info "TAU_BOT_TOKEN is already set in your environment"
+        ok "Bot token detected"
         BOT_TOKEN="$TAU_BOT_TOKEN"
-        printf "Use existing token? (Y/n): "
-        read -r -n 1 REPLY </dev/tty
-        printf "\n"
-        if [[ $REPLY =~ ^[Nn]$ ]]; then
+        if [ "$FAST" != "1" ] && ! prompt_yn "Use existing token"; then
             BOT_TOKEN=""
         fi
     fi
     
     if [ -z "$BOT_TOKEN" ]; then
-        printf "\n"
-        printf "Paste your Telegram Bot Token: "
+        info "Tau uses Telegram for control"
+        info "Create a bot via @BotFather → /newbot"
+        log ""
+        printf "  Paste bot token:\n  > "
         read -r BOT_TOKEN </dev/tty
         
         if [ -z "$BOT_TOKEN" ]; then
-            print_error "No token provided. Tau requires a Telegram bot token to run."
-            printf "\n"
-            printf "Try again? (Y/n): "
-            read -r -n 1 REPLY </dev/tty
-            printf "\n"
-            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-                step_setup_telegram_token
+            err "Token required"
+            if prompt_yn "Retry"; then
+                step_telegram
                 return
-            else
-                print_error "Cannot continue without a Telegram bot token."
-                exit 1
             fi
+            exit 1
         fi
     fi
     
-    # Save to .env file
-    ENV_FILE="$INSTALL_DIR/.env"
-    echo "TAU_BOT_TOKEN=$BOT_TOKEN" > "$ENV_FILE"
+    echo "TAU_BOT_TOKEN=$BOT_TOKEN" > "$INSTALL_DIR/.env"
+    ok "Token saved"
     
-    echo ""
-    print_success "Token saved to $ENV_FILE"
-    
-    wait_continue
+    pause
 }
 
-# Step 8: Setup OpenAI key (optional)
-step_setup_openai_key() {
-    print_header "Step 7: Configure OpenAI API Key (Optional)"
+step_openai() {
+    local ENV_FILE="$INSTALL_DIR/.env"
     
-    printf "OpenAI API key enables voice message transcription.\n"
-    printf "\n"
-    printf "This is %soptional%s - Tau works without it.\n" "$BOLD" "$NC"
-    printf "\n"
+    section "Optional"
     
     if [ -n "$OPENAI_API_KEY" ]; then
-        print_info "OPENAI_API_KEY is already set in your environment"
-        # Append to .env if not already there
-        ENV_FILE="$INSTALL_DIR/.env"
-        if ! grep -q "OPENAI_API_KEY" "$ENV_FILE" 2>/dev/null; then
+        grep -q "OPENAI_API_KEY" "$ENV_FILE" 2>/dev/null || \
             echo "OPENAI_API_KEY=$OPENAI_API_KEY" >> "$ENV_FILE"
-        fi
-        wait_continue
+        ok "OpenAI API key detected"
         return
     fi
     
-    printf "Enter OpenAI API Key (or press Enter to skip): "
+    [ "$FAST" = "1" ] && return
+    
+    info "OpenAI key enables voice transcription"
+    printf "  API key ${DIM}(Enter to skip)${NC}: "
     read -r API_KEY </dev/tty
     
     if [ -n "$API_KEY" ]; then
-        ENV_FILE="$INSTALL_DIR/.env"
         echo "OPENAI_API_KEY=$API_KEY" >> "$ENV_FILE"
-        print_success "API key saved"
-    else
-        print_info "Skipped. Voice features will be disabled."
+        ok "API key saved"
     fi
-    
-    wait_continue
+    :
 }
 
-# Step 9: Setup startup on login
-step_setup_startup() {
-    print_header "Step 8: Setting Up Auto-Start"
-    
-    local OS=$(detect_os)
-    
-    printf "Tau can start automatically when you log in.\n"
-    printf "This uses %ssupervisord%s to manage the process.\n" "$BOLD" "$NC"
-    printf "\n"
-    printf "Benefits:\n"
-    printf "  • Tau restarts automatically if it crashes\n"
-    printf "  • Starts automatically on login\n"
-    printf "  • Easy control with %stauctl%s command\n" "$CYAN" "$NC"
-    printf "\n"
-    
-    printf "Enable auto-start on login? (Y/n): "
-    read -r -n 1 REPLY </dev/tty
-    printf "\n"
-    
-    if [[ $REPLY =~ ^[Nn]$ ]]; then
-        print_info "Skipped auto-start setup."
-        print_info "You can run Tau manually with: tauctl start"
-        wait_continue
-        return
-    fi
-    
-    if [ "$OS" = "macos" ]; then
-        setup_launchd_startup
-    elif [ "$OS" = "linux" ]; then
-        setup_systemd_startup
-    else
-        print_warning "Auto-start not supported on this OS."
-        print_info "Run Tau manually with: tauctl start"
-    fi
-    
-    wait_continue
-}
-
-# Setup launchd on macOS
-setup_launchd_startup() {
+setup_launchd() {
     local PLIST_DIR="$HOME/Library/LaunchAgents"
-    # Use unique plist name based on instance ID to support multiple taobots
     local PLIST_NAME="com.tau.$INSTANCE_ID.supervisor"
     local PLIST_FILE="$PLIST_DIR/$PLIST_NAME.plist"
     
     mkdir -p "$PLIST_DIR"
-    
-    print_step "Creating LaunchAgent for supervisord (instance: $INSTANCE_ID)..."
     
     cat > "$PLIST_FILE" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -919,33 +507,22 @@ setup_launchd_startup() {
 </plist>
 EOF
     
-    print_success "LaunchAgent created at $PLIST_FILE"
-    
-    # Load the agent
-    print_step "Loading LaunchAgent..."
     launchctl unload "$PLIST_FILE" 2>/dev/null || true
     launchctl load "$PLIST_FILE"
     
-    print_success "Tau ($INSTANCE_ID) will now start automatically on login!"
-    printf "\n"
-    print_info "To disable auto-start later:"
-    printf "  %slaunchctl unload %s%s\n" "$CYAN" "$PLIST_FILE" "$NC"
+    ok "Auto-start enabled"
 }
 
-# Setup systemd on Linux
-setup_systemd_startup() {
+setup_systemd() {
     local SERVICE_DIR="$HOME/.config/systemd/user"
-    # Use unique service name based on instance ID to support multiple taobots
     local SERVICE_NAME="tau-$INSTANCE_ID"
     local SERVICE_FILE="$SERVICE_DIR/$SERVICE_NAME.service"
     
     mkdir -p "$SERVICE_DIR"
     
-    print_step "Creating systemd user service (instance: $INSTANCE_ID)..."
-    
     cat > "$SERVICE_FILE" << EOF
 [Unit]
-Description=Tau Supervisord ($INSTANCE_ID)
+Description=Tau ($INSTANCE_ID)
 After=network.target
 
 [Service]
@@ -959,129 +536,101 @@ RestartSec=10
 WantedBy=default.target
 EOF
     
-    print_success "Service created at $SERVICE_FILE"
-    
-    # Reload and enable
-    print_step "Enabling systemd service..."
     systemctl --user daemon-reload
-    systemctl --user enable "$SERVICE_NAME"
+    systemctl --user enable "$SERVICE_NAME" >/dev/null 2>&1
     systemctl --user start "$SERVICE_NAME"
+    loginctl enable-linger "$USER" 2>/dev/null || true
     
-    # Enable lingering so user services start at boot
-    print_step "Enabling user service persistence..."
-    loginctl enable-linger "$USER" 2>/dev/null || print_warning "Could not enable linger (may need sudo)"
-    
-    print_success "Tau ($INSTANCE_ID) will now start automatically on login!"
-    printf "\n"
-    print_info "To disable auto-start later:"
-    printf "  %ssystemctl --user disable %s%s\n" "$CYAN" "$SERVICE_NAME" "$NC"
+    ok "Auto-start enabled"
 }
 
-# Step 10: Launch Tau
-step_launch_tau() {
-    print_header "Step 9: Launching Tau!"
+step_launch() {
+    section "Launch"
     
-    printf "%sInstallation complete!%s\n" "$GREEN" "$NC"
-    printf "\n"
-    printf "Tau is managed by %ssupervisord%s for reliable operation.\n" "$BOLD" "$NC"
-    printf "\n"
-    printf "%sControl commands:%s\n" "$BOLD" "$NC"
-    printf "\n"
-    printf "  %stauctl start%s    - Start tau\n" "$CYAN" "$NC"
-    printf "  %stauctl stop%s     - Stop tau\n" "$CYAN" "$NC"
-    printf "  %stauctl restart%s  - Restart tau\n" "$CYAN" "$NC"
-    printf "  %stauctl status%s   - Check status\n" "$CYAN" "$NC"
-    printf "  %stauctl logs%s     - View logs\n" "$CYAN" "$NC"
-    printf "  %stauctl logs -f%s  - Follow logs\n" "$CYAN" "$NC"
-    printf "\n"
-    printf "%sTelegram commands:%s\n" "$BOLD" "$NC"
-    printf "\n"
-    printf "  %s/start%s     - Initialize the bot\n" "$CYAN" "$NC"
-    printf "  %s/task%s      - Add a new task\n" "$CYAN" "$NC"
-    printf "  %s/status%s    - Check current status\n" "$CYAN" "$NC"
-    printf "  %s/adapt%s     - Self-modify the bot\n" "$CYAN" "$NC"
-    printf "  %s/restart%s   - Restart the bot\n" "$CYAN" "$NC"
-    printf "\n"
+    # Auto-start option
+    if prompt_yn "Enable auto-start"; then
+        local OS=$(detect_os)
+        
+        if [ "$OS" = "macos" ]; then
+            setup_launchd
+        elif [ "$OS" = "linux" ]; then
+            setup_systemd
+        else
+            warn "Auto-start not supported"
+        fi
+    fi
     
-    # Add tauctl to PATH info
-    printf "%sTo use tauctl from anywhere:%s\n" "$BOLD" "$NC"
-    printf "\n"
-    printf "  Add to your shell config (~/.zshrc or ~/.bashrc):\n"
-    printf "  %sexport PATH=\"%s:\$PATH\"%s\n" "$CYAN" "$INSTALL_DIR" "$NC"
-    printf "\n"
-    
-    # Check if tau is already running via supervisor
+    # Check if already running
     if [ -f "$INSTALL_DIR/.supervisord.pid" ]; then
         local pid=$(cat "$INSTALL_DIR/.supervisord.pid" 2>/dev/null)
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            print_success "Tau is already running via supervisord!"
-            printf "\n"
-            printf "Open Telegram and message your bot to get started.\n"
-            printf "\n"
+            ok "Tau already running"
+            print_final
             return
         fi
     fi
     
-    printf "Launch Tau now? (Y/n): "
-    read -r -n 1 REPLY </dev/tty
-    printf "\n"
-    
-    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-        printf "\n"
-        print_step "Starting Tau..."
-        echo ""
-        
+    if prompt_yn "Start Tau now"; then
         cd "$INSTALL_DIR"
+        set -a; source .env; set +a
         
-        # Load environment variables
-        set -a
-        source .env
-        set +a
+        "$INSTALL_DIR/tauctl" start >/dev/null 2>&1 &
+        spinner $! "Tau started"
         
-        # Start via tauctl
-        "$INSTALL_DIR/tauctl" start
-        
-        printf "\n"
-        print_success "Tau is running!"
-        printf "\n"
-        printf "Open Telegram and message your bot to get started.\n"
-        printf "Use %stauctl logs -f%s to follow the logs.\n" "$CYAN" "$NC"
+        print_final
     else
-        printf "\n"
-        print_info "To start Tau later, run:"
-        printf "\n"
-        printf "  %scd %s && ./tauctl start%s\n" "$CYAN" "$INSTALL_DIR" "$NC"
-        printf "\n"
+        log ""
+        info "Start later: cd $INSTALL_DIR && ./tauctl start"
     fi
 }
 
-# Main installation flow
+print_final() {
+    log ""
+    printf "  ${BOLD}${GREEN}✓ Tau is live${NC}\n"
+    log ""
+    info "Message your bot to begin"
+    info "Give it real tasks"
+    log ""
+    printf "  ${CYAN}This agent can modify itself.${NC}\n"
+    log ""
+    log "  ${DIM}▸ Optional${NC}"
+    log ""
+    log "    ${DIM}Commands:${NC}"
+    log "      tauctl start"
+    log "      tauctl stop"
+    log "      tauctl logs"
+    log ""
+    log "    ${DIM}Add tauctl to PATH:${NC}"
+    log "      export PATH=\"$INSTALL_DIR:\$PATH\""
+    log ""
+    ok "Setup complete"
+    log ""
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+detect_install_context
+
 main() {
-    # Handle custom install directory from command line (overrides auto-detection)
-    if [[ -n "$1" ]] && [[ "$1" != --* ]]; then
-        INSTALL_DIR="$1"
-        # Expand ~ to $HOME
-        INSTALL_DIR="${INSTALL_DIR/#\~/$HOME}"
-        # Check if this is an existing repo
-        if [ -f "$INSTALL_DIR/tauctl" ] && [ -f "$INSTALL_DIR/supervisord.conf" ] && [ -d "$INSTALL_DIR/tau" ]; then
+    if [[ -n "${1:-}" ]] && [[ "$1" != --* ]]; then
+        INSTALL_DIR="${1/#\~/$HOME}"
+        if [ -f "$INSTALL_DIR/tauctl" ] && [ -d "$INSTALL_DIR/tau" ]; then
             RUNNING_FROM_REPO=true
         else
             RUNNING_FROM_REPO=false
         fi
     fi
     
-    # Run installation steps
     step_welcome
-    step_check_dependencies
-    step_install_uv
-    step_clone_repo
-    step_setup_python
-    step_setup_cursor_agent
-    step_setup_telegram_token
-    step_setup_openai_key
-    step_setup_startup
-    step_launch_tau
+    step_dependencies
+    step_clone
+    step_python
+    step_cursor_agent
+    step_telegram
+    step_openai
+    step_launch
 }
 
-# Run main function
 main "$@"

@@ -5,6 +5,6 @@ alwaysApply: true
 
 # Context System
 
-Before starting any task, you MUST read `context/ENTRY.md` and follow its instructions to load relevant context files.
+Before starting any task, you MUST read `context/CONTEXT.md` and follow its instructions to load relevant context files.
 
 This is your first action in every session.

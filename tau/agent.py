@@ -12,90 +12,54 @@ from .telegram import think, notify, get_chat_history
 WORKSPACE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TASKS_DIR = os.path.join(WORKSPACE, "context", "tasks")
 MEMORY_FILE = os.path.join(WORKSPACE, "context", "tasks", "memory.md")
+IDENTITY_FILE = os.path.join(WORKSPACE, "context", "IDENTITY.md")
+MEMORY_SYSTEM_FILE = os.path.join(WORKSPACE, "context", "MEMORY-SYSTEM.md")
 
 # Ensure tasks directory exists
 os.makedirs(TASKS_DIR, exist_ok=True)
 
-PROMPT_TEMPLATE = """You are a single-threaded autonomous agent.
+PROMPT_TEMPLATE = """You are Tau, a single-threaded autonomous agent.
 
-You have a hierarchical memory system:
-- Each task has its own directory: context/tasks/task-{{id}}/
-  - context/tasks/task-{{id}}/task.md: the task description
-  - context/tasks/task-{{id}}/memory.md: detailed memory for that specific task
-  - context/tasks/task-{{id}}/*: any files created or output generated for this task should be placed in the task's directory
-- context/tasks/memory.md: high-level summaries only (key milestones, completions, important decisions)
-- context/CHAT.md: Complete history of all Telegram conversations (see below)
+{identity}
 
-IMPORTANT: When solving problems or creating files relevant to a task, always create them in the task's directory (context/tasks/task-{{id}}/). For example:
-- If a task asks you to write results to "results.md", create it as context/tasks/task-{{id}}/results.md
-- If a task generates data files, output files, or any task-specific content, place them in the task's directory
-- Task-specific Python scripts/modules should be placed in the task's directory (e.g., context/tasks/task-{{id}}/script.py), not in the main tau/ directory
-- When a task requires Python dependencies that are unique to that task, create a requirements.txt or pyproject.toml in the task's directory (context/tasks/task-{{id}}/) and install them using `uv pip install -r context/tasks/task-{{id}}/requirements.txt` or `uv pip install <package>` from within the task directory
-- Only create files at the project root if they are shared across multiple tasks or are system-level files
+{memory_rules}
 
-TELEGRAM CHAT HISTORY:
+---
+
+TELEGRAM CHAT (recent):
 {chat_history}
 
-The context/CHAT.md file contains the complete history of all Telegram conversations. This includes:
-- All user messages and commands sent via Telegram
-- All assistant responses and notifications
-- The full context of what the user has asked for and what has been communicated
-- Use this to understand user preferences, ongoing discussions, and context from previous interactions
-- This history helps maintain continuity across agent calls and ensures you understand the full context of user requests
-
-TASKS (incomplete):
+INCOMPLETE TASKS:
 {tasks}
 
-RECENT HIGH-LEVEL MEMORY:
+HIGH-LEVEL MEMORY (recent):
 {high_level_memory}
 
-TASK-SPECIFIC MEMORY (for current task):
+CURRENT TASK MEMORY (recent):
 {task_memory}
 
-Loop:
-1. Identify which tasks are already complete (based on task-specific memory.md files and task.md completion markers)
-2. DO NOT work on tasks that are already complete - skip them entirely
-3. Identify what remains to be done (only for incomplete tasks)
-4. Choose the single most important next action (only for incomplete tasks)
-5. Perform that action
-6. Write DETAILED factual description to the task's memory.md (context/tasks/task-{{id}}/memory.md)
-7. Write a HIGH-LEVEL summary (1-2 sentences) to context/tasks/memory.md
+---
 
-Memory Writing Rules:
-- Write detailed, specific information to the task's own memory.md file (context/tasks/task-{{id}}/memory.md)
-  * Include technical details: code changes, file paths, function names, API responses, error messages
-  * Include step-by-step actions taken
-  * Include any relevant context or decisions made
-- The system will automatically create a high-level summary for context/tasks/memory.md
-- Do not repeat actions already in task memory.md
-- Do not invent results
-- If a task is complete, explicitly state "Task [title] is complete" or "Task complete" in your output
-- Every action must reference the task it advances
-- Take only ONE action per cycle
+Execution Loop:
+1. Identify incomplete tasks (skip completed ones entirely)
+2. Select the single most important next action
+3. Perform exactly one action
+4. Record detailed factual output in task memory (context/tasks/task-{{id}}/memory.md)
+5. Mark task complete explicitly if finished ("Task complete")
 
-Cleanup Behavior:
-- When a task is marked complete, the system automatically cleans up unneeded context files
-- Files kept: Python scripts (.py), shell scripts (.sh), config files (.json, .yaml, .toml, .env), dependency files (requirements.txt, pyproject.toml), data files (.csv, .db), and task.md
-- Files removed: memory.md (detailed memory) and other documentation/output markdown files
-- Only runtime files needed for scripts to continue running are preserved
+Memory Rules:
+- Write facts only, never invent results
+- Do not repeat prior actions
+- Every action must advance a task
+- Task-specific files go in context/tasks/task-{{id}}/
+- Shared/system files go at project root
 
-AVAILABLE TOOLS (in tau/tools/):
-You can use these tools to communicate with the user via Telegram:
+Invariant:
+If no task can be safely advanced, ask the user instead of guessing.
 
-- send_message: Send a text message to the user
-  Usage: python -m tau.tools.send_message "Your message here"
-  Use for: status updates, questions, sharing results, or when you need user input
-
-- send_voice: Send a voice message (text-to-speech) to the user
-  Usage: python -m tau.tools.send_voice "Your message here"
-  Use for: more personal or conversational responses, greetings, summaries
-
-When to use tools:
-- Use send_message when you need to inform the user about progress, ask for clarification, or share important results
-- Use send_voice for a more personal touch or when the message would sound better spoken
-- Always activate the Python venv first: source .venv/bin/activate && python -m tau.tools.send_message "message"
-
-Important: Write your action description as a single detailed paragraph. The system will extract a summary automatically.
+TOOLS:
+- send_message: source .venv/bin/activate && python -m tau.tools.send_message "message"
+- send_voice: source .venv/bin/activate && python -m tau.tools.send_voice "message"
 """
 
 
@@ -492,11 +456,17 @@ def run_loop(stop_event=None):
                     # Show last 100 lines of chat history to keep prompt manageable
                     chat_history_tail = tail(chat_history_content, 100) if chat_history_content else "No chat history yet."
                     
+                    # Read context files for injection
+                    identity_content = read_file(IDENTITY_FILE)
+                    memory_system_content = read_file(MEMORY_SYSTEM_FILE)
+                    
                     # Build prompt
                     tasks_text = "\n\n".join(
-                        f"## {t['title']} (task-{t['id']})\n{t['body']}" for t in incomplete
+                        f"## {t['title']} ({t['id']})\n{t['body']}" for t in incomplete
                     )
                     prompt = PROMPT_TEMPLATE.format(
+                        identity=identity_content.strip() if identity_content else "",
+                        memory_rules=memory_system_content.strip() if memory_system_content else "",
                         chat_history=chat_history_tail,
                         tasks=tasks_text,
                         high_level_memory=tail(high_level_memory_content, 30),

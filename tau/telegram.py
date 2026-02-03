@@ -30,12 +30,75 @@ def think(msg: str):
             pass  # Don't crash if Telegram fails
 
 
+def split_message(msg: str, max_length: int = 4000) -> list[str]:
+    """Split a long message into chunks that fit within Telegram's limit.
+    
+    Tries to split at natural boundaries (newlines, sentences, words) to maintain readability.
+    """
+    if len(msg) <= max_length:
+        return [msg]
+    
+    chunks = []
+    remaining = msg
+    
+    while remaining:
+        if len(remaining) <= max_length:
+            chunks.append(remaining)
+            break
+        
+        # Find a good split point within the limit
+        chunk = remaining[:max_length]
+        
+        # Try to split at double newline (paragraph break)
+        split_idx = chunk.rfind('\n\n')
+        if split_idx > max_length // 2:
+            chunks.append(remaining[:split_idx].rstrip())
+            remaining = remaining[split_idx:].lstrip()
+            continue
+        
+        # Try to split at single newline
+        split_idx = chunk.rfind('\n')
+        if split_idx > max_length // 2:
+            chunks.append(remaining[:split_idx].rstrip())
+            remaining = remaining[split_idx:].lstrip()
+            continue
+        
+        # Try to split at sentence boundary (. ! ?)
+        for sep in ['. ', '! ', '? ']:
+            split_idx = chunk.rfind(sep)
+            if split_idx > max_length // 2:
+                chunks.append(remaining[:split_idx + 1].rstrip())
+                remaining = remaining[split_idx + 1:].lstrip()
+                break
+        else:
+            # Try to split at word boundary (space)
+            split_idx = chunk.rfind(' ')
+            if split_idx > max_length // 2:
+                chunks.append(remaining[:split_idx].rstrip())
+                remaining = remaining[split_idx:].lstrip()
+            else:
+                # Hard split if no good boundary found
+                chunks.append(remaining[:max_length])
+                remaining = remaining[max_length:]
+    
+    return chunks
+
+
 def notify(msg: str):
-    """Send a notification to Telegram (no emoji prefix)."""
+    """Send a notification to Telegram (no emoji prefix).
+    
+    If the message is too long, it will be split into multiple messages.
+    """
     chat_id = get_chat_id()
     if chat_id:
         try:
-            bot.send_message(chat_id, msg[:4000])
+            chunks = split_message(msg)
+            for i, chunk in enumerate(chunks):
+                # Add continuation indicator for multi-part messages
+                if len(chunks) > 1:
+                    part_indicator = f"({i + 1}/{len(chunks)}) " if i > 0 else ""
+                    chunk = part_indicator + chunk
+                bot.send_message(chat_id, chunk)
         except Exception:
             pass
 
