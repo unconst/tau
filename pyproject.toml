@@ -6,6 +6,10 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["pytelegrambotapi", "openai", "python-dotenv", "supervisor"]
 
+[project.optional-dependencies]
+# Eve (Eden.art) creative tools integration - install with: uv pip install -e ".[eve]"
+eve = ["eve @ git+https://github.com/edenartlab/eve.git"]
+
 [project.scripts]
 tau = "tau:main"
 

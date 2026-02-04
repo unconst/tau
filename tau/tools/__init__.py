@@ -6,6 +6,7 @@ Each tool is a standalone script that can be run from the command line.
 Available tools:
 - send_message: Send a text message to the user via Telegram
 - send_voice: Send a voice message (TTS) to the user via Telegram
+- search_skills: Search for creative AI skills/tools (Eve/Eden.art ecosystem)
 """
 
 # Tool registry for programmatic access
@@ -19,6 +20,17 @@ TOOLS = {
         "command": "python -m tau.tools.send_voice",
         "description": "Send a voice message (TTS) to the user via Telegram",
         "usage": 'python -m tau.tools.send_voice "Your message here"',
+    },
+    "search_skills": {
+        "command": "python -m tau.tools.search_skills",
+        "description": "Search for creative AI skills/tools (image, video, audio generation, social media, etc.)",
+        "usage": 'python -m tau.tools.search_skills "query" or python -m tau.tools.search_skills --category image',
+        "examples": [
+            'python -m tau.tools.search_skills                    # List all skills',
+            'python -m tau.tools.search_skills "image"            # Search for image skills',
+            'python -m tau.tools.search_skills --category video   # Filter by category',
+            'python -m tau.tools.search_skills --details flux     # Get skill details',
+        ],
     },
 }
 

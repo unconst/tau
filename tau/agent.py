@@ -74,6 +74,13 @@ If no task can be safely advanced, ask the user instead of guessing.
 TOOLS:
 - send_message: source .venv/bin/activate && python -m tau.tools.send_message "message"
 - send_voice: source .venv/bin/activate && python -m tau.tools.send_voice "message"
+- search_skills: source .venv/bin/activate && python -m tau.tools.search_skills "query"
+  (Search for creative AI skills - image/video/audio generation, social media posting, etc.)
+  Examples:
+    - python -m tau.tools.search_skills                    # List all skills
+    - python -m tau.tools.search_skills "image"            # Search for image skills
+    - python -m tau.tools.search_skills --category video   # Filter by category (image, video, audio, social, utility)
+    - python -m tau.tools.search_skills --details flux     # Get detailed info about a specific skill
 """
 
 def read_file(path: str) -> str:

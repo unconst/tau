@@ -18,4 +18,10 @@ For the active task:
 - `context/tasks/memory.md` (recent)
 - `context/CHAT.md` (recent)
 
+## Skills Reference
+
+For tool/skill usage:
+- `context/skills/agent.md` - Cursor CLI agent documentation
+- `context/skills/eve-skills.md` - Eve (Eden.art) creative skills integration
+
 If required context is missing or ambiguous, ask the user.
