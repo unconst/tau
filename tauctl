@@ -139,7 +139,59 @@ case "${1:-}" in
             start_supervisord
             echo ""
         fi
-        supervisorctl_cmd restart tau
+        echo "${CYAN}→${NC} Restarting tau (may take ~5s)..."
+
+        # Stop tau (ignore if not running)
+        "$TAU_DIR/.venv/bin/supervisorctl" -c "$SUPERVISOR_CONF" stop tau >/dev/null 2>&1 || true
+
+        # Start tau in the background. We ignore SIGINT in the child so a Ctrl+C
+        # doesn't print a Python traceback to the terminal.
+        (
+            trap '' INT
+            exec "$TAU_DIR/.venv/bin/supervisorctl" -c "$SUPERVISOR_CONF" start tau >/dev/null 2>&1
+        ) &
+        ctl_pid=$!
+
+        cleanup_restart() {
+            if [ -n "${ctl_pid:-}" ] && kill -0 "$ctl_pid" 2>/dev/null; then
+                kill "$ctl_pid" 2>/dev/null || true
+            fi
+        }
+
+        trap 'cleanup_restart; echo ""; echo "${YELLOW}⚠${NC} Restart cancelled (tau may still be starting)."; exit 130' INT TERM
+
+        last_status=""
+        deadline=$((SECONDS + 20))
+        while [ $SECONDS -lt $deadline ]; do
+            status_out=$("$TAU_DIR/.venv/bin/supervisorctl" -c "$SUPERVISOR_CONF" status tau 2>/dev/null || true)
+
+            if [ -n "$status_out" ] && [ "$status_out" != "$last_status" ]; then
+                echo "  $status_out"
+                last_status="$status_out"
+            fi
+
+            case "$status_out" in
+                *RUNNING*)
+                    trap - INT TERM
+                    cleanup_restart
+                    echo "${GREEN}✓${NC} Tau is running"
+                    exit 0
+                    ;;
+                *FATAL*|*BACKOFF*)
+                    trap - INT TERM
+                    cleanup_restart
+                    echo "${RED}✗${NC} Tau failed to start"
+                    echo "  See: ${CYAN}tauctl logs${NC}"
+                    exit 1
+                    ;;
+            esac
+
+            sleep 0.5
+        done
+
+        trap - INT TERM
+        cleanup_restart
+        echo "${YELLOW}⚠${NC} Restart initiated; check: ${CYAN}tauctl status${NC}"
         ;;
     
     status)

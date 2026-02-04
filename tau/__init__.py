@@ -990,9 +990,9 @@ Please respond to the user's message above, considering the full context of our 
         
         # Process transcribed text as normal message
         try:
-            backend = (os.getenv("TAU_CHAT_BACKEND") or "auto").strip().lower()
+            backend = (os.getenv("TAU_CHAT_BACKEND") or "cursor").strip().lower()
             openai_model = os.getenv("TAU_OPENAI_CHAT_MODEL", "gpt-4o-mini")
-            cursor_model = os.getenv("TAU_CURSOR_CHAT_MODEL", "gemini-3-flash")
+            cursor_model = os.getenv("TAU_CURSOR_CHAT_MODEL", "composer-1")
             use_openai = backend in ("openai", "oa") or (backend == "auto" and openai_client is not None)
 
             if use_openai:
@@ -1602,21 +1602,73 @@ def handle_message(message):
     chat_lines = chat_history.strip().split('\n')
     recent_chat = '\n'.join(chat_lines[-20:]) if len(chat_lines) > 20 else chat_history
     
+    # Check if user is asking about commands
+    # Detect questions about available Telegram commands
+    message_lower = message.text.lower()
+    # Simple detection: if message mentions "command" or "commands" and is a question
+    is_command_question = ('command' in message_lower or 'commands' in message_lower) and (
+        'what' in message_lower or 'which' in message_lower or 'tell' in message_lower or 
+        'help' in message_lower or 'list' in message_lower or 'available' in message_lower or
+        'can i' in message_lower or 'how do' in message_lower
+    )
+    
     # Backend + model selection:
-    # - default is "auto": use OpenAI if OPENAI_API_KEY is available, else Cursor agent
-    backend = (os.getenv("TAU_CHAT_BACKEND") or "auto").strip().lower()
+    # - default is "cursor": use Cursor agent (composer) for normal chat
+    # - set TAU_CHAT_BACKEND=auto to use OpenAI when OPENAI_API_KEY is available
+    backend = (os.getenv("TAU_CHAT_BACKEND") or "cursor").strip().lower()
     openai_model = os.getenv("TAU_OPENAI_CHAT_MODEL", "gpt-4o-mini")
-    cursor_model = os.getenv("TAU_CURSOR_CHAT_MODEL", "gemini-3-flash")
+    cursor_model = os.getenv("TAU_CURSOR_CHAT_MODEL", "composer-1")
     use_openai = backend in ("openai", "oa") or (backend == "auto" and openai_client is not None)
 
+    # Available Telegram commands (matches /start handler response)
+    available_commands = """Available Telegram commands:
+/task <description> - Add a task
+/status - See recent activity
+/adapt <prompt> - Self-modify
+/cron <interval> <prompt> - Schedule recurring prompt
+/crons - List active crons
+/uncron <id> - Remove a cron
+/clear - Stop active agent processes
+/restart - Restart bot
+/kill - Stop the bot
+/debug - Toggle debug mode"""
+
     # OpenAI prompt: keep it small for speed
-    openai_prompt = f"""RECENT CONTEXT (for continuity):
+    # Include commands only when user asks about them
+    if is_command_question:
+        openai_prompt = f"""{available_commands}
+
+RECENT CONTEXT (for continuity):
+{recent_chat}
+
+USER: {message.text}"""
+    else:
+        openai_prompt = f"""RECENT CONTEXT (for continuity):
 {recent_chat}
 
 USER: {message.text}"""
 
-    # Cursor agent prompt (kept as-is)
-    prompt_with_context = f"""You are Tau, a helpful assistant. Answer the user's question directly and concisely.
+    # Cursor agent prompt
+    # Include commands only when user asks about them
+    if is_command_question:
+        prompt_with_context = f"""You are Tau, a helpful assistant. Answer the user's question directly and concisely.
+
+{available_commands}
+
+RECENT CONTEXT (for continuity):
+{recent_chat}
+
+USER: {message.text}
+
+INSTRUCTIONS:
+- Answer directly without preamble
+- Be concise - just give the answer
+- Do NOT say "Is there anything else..." or similar closing phrases
+- Do NOT explain your thinking process in the response
+- If the question is simple (like factual questions), give a short direct answer
+- When asked about commands, list the actual commands shown above"""
+    else:
+        prompt_with_context = f"""You are Tau, a helpful assistant. Answer the user's question directly and concisely.
 
 RECENT CONTEXT (for continuity):
 {recent_chat}
@@ -1727,9 +1779,22 @@ def main():
     
     # Run Telegram bot in main thread
     try:
-        bot.polling()
-    except KeyboardInterrupt:
-        print("\nShutting down...")
+        backoff_s = 1
+        while not _stop_event.is_set():
+            try:
+                bot.polling()
+                backoff_s = 1  # reset on clean return
+            except KeyboardInterrupt:
+                print("\nShutting down...")
+                break
+            except Exception as e:
+                # Telebot may raise on startup if Telegram is unreachable (e.g. DNS issues).
+                # Don't crash-loop under supervisord; keep running and retry with backoff.
+                logger.error(f"Telegram polling crashed: {e}", exc_info=True)
+                sleep_s = min(backoff_s, 60)
+                logger.info(f"Retrying Telegram polling in {sleep_s}s...")
+                time.sleep(sleep_s)
+                backoff_s = min(backoff_s * 2, 60)
     finally:
         _stop_event.set()
         if DEBUG_MODE:
