@@ -5,6 +5,15 @@ alwaysApply: true
 
 # Context System
 
-Before starting any task, you MUST read `context/CONTEXT.md` and follow its instructions to load relevant context files.
+Before starting any task, you MUST:
 
-This is your first action in every session.
+1. Read `context/CONTEXT.md` to understand the context structure
+2. Read `context/IDENTITY.md` for core identity
+3. **Load skills based on keywords in the user's request:**
+   - "lium", "gpu", "rent", "instance" → load `context/skills/lium-skills.md`
+   - "eve", "creative", "art", "image" → load `context/skills/eve-skills.md`
+   - "agent", "cursor", "cli" → load `context/skills/agent.md`
+   - "basilica" → load `context/skills/basilica.md`
+   - "targon" → load `context/skills/targon.md`
+
+This is your first action in every session. If the user mentions a skill-related topic, you MUST load the corresponding skill file before answering.
