@@ -473,13 +473,16 @@ def run_adapt_streaming(
     reply_to_message_id: int | None = None,
     timeout_seconds: int = 3600,
 ) -> str:
-    """Run the agent CLI for adaptation and stream thinking/progress to Telegram."""
+    """Run the agent CLI for adaptation and stream thinking/progress to Telegram.
+    
+    Streams minor updates during the process, then sends a final summary of what was done.
+    """
     stream = TelegramStreamingMessage(
         chat_id,
         reply_to_message_id=reply_to_message_id,
         initial_text="🫡 Starting...",
-        min_edit_interval_seconds=2.0,  # Slower edits for adapt (less frequent updates)
-        min_chars_delta=30,  # Require more change before editing
+        min_edit_interval_seconds=1.5,  # Faster updates to show thinking
+        min_chars_delta=15,  # More responsive updates
     )
 
     cmd = [
@@ -496,9 +499,11 @@ def run_adapt_streaming(
 
     start_time = time.time()
     thinking_updates: list[str] = []
+    thinking_text_buffer: str = ""  # Buffer for streaming assistant text
     final_result_text: str | None = None
     stderr_lines: list[str] = []
     current_tool: str | None = None
+    last_thinking_snippet: str = ""  # Track last shown thinking snippet
 
     try:
         proc = subprocess.Popen(
@@ -558,6 +563,25 @@ def run_adapt_streaming(
     stderr_thread.start()
 
     timed_out = False
+    
+    def build_display():
+        """Build the display message showing current thinking and actions."""
+        lines = ["🫡 Adapting...\n"]
+        
+        # Show recent thinking snippet if we have one
+        if last_thinking_snippet:
+            # Show a brief snippet of the agent's current thinking
+            snippet = last_thinking_snippet[:100]
+            if len(last_thinking_snippet) > 100:
+                snippet += "..."
+            lines.append(f"💭 {snippet}\n")
+        
+        # Show recent tool actions
+        if thinking_updates:
+            lines.append("")
+            lines.extend(thinking_updates[-6:])
+        
+        return "\n".join(lines)
 
     try:
         while True:
@@ -623,24 +647,25 @@ def run_adapt_streaming(
                         filename = os.path.basename(path) if path else "file"
                         update = f"🔧 Editing {filename}..."
                     elif tool_name == "Shell":
-                        cmd_str = tool_input.get("command", "")[:30]
-                        update = f"💻 Running: {cmd_str}..."
+                        cmd_str = tool_input.get("command", "")[:40]
+                        update = f"💻 {cmd_str}..."
                     elif tool_name == "Grep":
-                        pattern = tool_input.get("pattern", "")[:20]
+                        pattern = tool_input.get("pattern", "")[:25]
                         update = f"🔍 Searching: {pattern}..."
                     elif tool_name == "Glob":
-                        pattern = tool_input.get("glob_pattern", "")[:20]
+                        pattern = tool_input.get("glob_pattern", "")[:25]
                         update = f"📁 Finding: {pattern}..."
                     elif tool_name == "SemanticSearch":
-                        query = tool_input.get("query", "")[:30]
-                        update = f"🧠 Searching: {query}..."
+                        query = tool_input.get("query", "")[:40]
+                        update = f"🧠 {query}..."
+                    elif tool_name == "WebFetch":
+                        url = tool_input.get("url", "")[:40]
+                        update = f"🌐 Fetching: {url}..."
                     else:
                         update = f"🔧 {tool_name}..."
                     
                     thinking_updates.append(update)
-                    # Show the last few updates
-                    display = "🫡 Adapting...\n\n" + "\n".join(thinking_updates[-5:])
-                    stream.set_text(display)
+                    stream.set_text(build_display())
                 
                 # Handle tool result events
                 elif event_type == "tool_result":
@@ -648,8 +673,7 @@ def run_adapt_streaming(
                         # Mark the tool as done
                         if thinking_updates:
                             thinking_updates[-1] = thinking_updates[-1].replace("...", " ✓")
-                            display = "🫡 Adapting...\n\n" + "\n".join(thinking_updates[-5:])
-                            stream.set_text(display)
+                            stream.set_text(build_display())
                         current_tool = None
                 
                 # Handle assistant text output (thinking/explanation)
@@ -659,9 +683,21 @@ def run_adapt_streaming(
                     for part in content:
                         if isinstance(part, dict) and part.get("type") == "text":
                             text = part.get("text", "")
-                            if text and len(text) > 20:
-                                # This might be a summary or explanation
-                                final_result_text = text
+                            if text:
+                                thinking_text_buffer += text
+                                # Extract a meaningful snippet of the thinking
+                                # Skip very short fragments
+                                if len(text) > 10:
+                                    # Clean up the text for display
+                                    snippet = text.strip().replace("\n", " ")
+                                    # Only update if this is a meaningful change
+                                    if snippet and snippet != last_thinking_snippet:
+                                        last_thinking_snippet = snippet
+                                        stream.set_text(build_display())
+                                
+                                # Keep track of full text for final summary
+                                if len(thinking_text_buffer) > 50:
+                                    final_result_text = thinking_text_buffer
                 
                 elif event_type == "result":
                     res = event.get("result")
@@ -684,23 +720,30 @@ def run_adapt_streaming(
         stream.set_text(msg)
         return msg
 
-    # Build final summary
+    # Build final summary describing what was done
+    # Prefer the agent's own explanation if available
     if final_result_text:
-        # Truncate to reasonable length
+        # Clean up and truncate the result
         summary = final_result_text.strip()
-        if len(summary) > 500:
-            # Find a good cut point
-            cut = summary[:500].rfind('. ')
-            if cut > 200:
+        # Remove markdown code blocks for cleaner display
+        summary = re.sub(r'```[\s\S]*?```', '[code]', summary)
+        if len(summary) > 600:
+            # Find a good cut point at sentence boundary
+            cut = summary[:600].rfind('. ')
+            if cut > 300:
                 summary = summary[:cut+1]
             else:
-                summary = summary[:497] + "..."
+                cut = summary[:600].rfind('\n')
+                if cut > 300:
+                    summary = summary[:cut]
+                else:
+                    summary = summary[:597] + "..."
         final_msg = f"✅ Done\n\n{summary}"
     else:
-        # Use the tool operations as summary
+        # Fallback: Use the tool operations as summary
         ops = [u.replace("...", "").replace(" ✓", "") for u in thinking_updates]
         if ops:
-            final_msg = "✅ Done\n\n" + "\n".join(ops[-8:])
+            final_msg = "✅ Done\n\nChanges made:\n" + "\n".join(ops[-10:])
         else:
             final_msg = "✅ Done"
     
