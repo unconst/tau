@@ -957,7 +957,7 @@ Please respond to the user's message above, considering the full context of our 
                 prompt_with_context,
                 chat_id=message.chat.id,
                 existing_message_id=processing_msg.message_id,
-                initial_text="🎤 Processing voice message...",
+                initial_text="🎤 Thinking...",
                 model="gemini-3-flash",
                 timeout_seconds=600,
             )
@@ -1012,13 +1012,16 @@ def run_agent_ask_streaming(
     chat_id: int,
     reply_to_message_id: int | None = None,
     existing_message_id: int | None = None,
-    initial_text: str = "🤔",
+    initial_text: str = "🤔 Thinking...",
     model: str = "gemini-3-flash",
     timeout_seconds: int = 600,
 ) -> str:
     """Run the agent CLI in ask mode and stream output by editing one Telegram message.
     
-    Shows thinking process and tool operations similar to /adapt streaming.
+    Shows thinking process and tool operations with the same structure as /adapt:
+    - Start with thinking emoji
+    - Stream thought bubble with thinking
+    - End with just the final answer
     """
     stream = TelegramStreamingMessage(
         chat_id,
@@ -1052,8 +1055,14 @@ def run_agent_ask_streaming(
     last_thinking_snippet: str = ""
     
     def build_display():
-        """Build the display message showing current thinking and actions."""
-        lines = []
+        """Build the display message showing current thinking and actions.
+        
+        Uses same structure as /adapt:
+        - 🤔 Thinking...
+        - 💭 {thinking snippet}
+        - {tool actions}
+        """
+        lines = ["🤔 Thinking...\n"]
         
         # Show recent thinking snippet if we have one
         if last_thinking_snippet:
@@ -1064,17 +1073,10 @@ def run_agent_ask_streaming(
         
         # Show recent tool actions
         if thinking_updates:
-            if lines:
-                lines.append("")
+            lines.append("")
             lines.extend(thinking_updates[-6:])
         
-        # If we have raw output (the actual response), show it
-        if raw_output.strip():
-            if lines:
-                lines.append("\n---\n")
-            lines.append(raw_output)
-        
-        return "\n".join(lines) if lines else initial_text
+        return "\n".join(lines)
 
     try:
         proc = subprocess.Popen(
@@ -1293,7 +1295,7 @@ def run_agent_ask_streaming(
         processes.untrack(proc)
 
     if processes.pop_cancelled(proc.pid):
-        msg = "Cancelled."
+        msg = "❌ Cancelled."
         stream.set_text(msg)
         return msg
 
@@ -1309,7 +1311,7 @@ def run_agent_ask_streaming(
     output = raw_output.strip()
 
     if timed_out:
-        msg = "Request timed out."
+        msg = "⏰ Request timed out."
         stream.set_text(msg)
         return msg
 
@@ -1319,7 +1321,7 @@ def run_agent_ask_streaming(
         stream.set_text(msg)
         return msg
 
-    # Final display: just the clean response without thinking artifacts
+    # Final display: just the clean response (same as /adapt ending with final answer)
     stream.set_text(output)
     return output
 
@@ -1372,7 +1374,7 @@ Please respond to the user's message above, considering the full context of our 
             prompt_with_context,
             chat_id=message.chat.id,
             reply_to_message_id=message.message_id,
-            initial_text="🤔",
+            initial_text="🤔 Thinking...",
             model="gemini-3-flash",
             timeout_seconds=300,
         )
