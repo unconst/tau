@@ -1012,7 +1012,7 @@ def run_agent_ask_streaming(
     chat_id: int,
     reply_to_message_id: int | None = None,
     existing_message_id: int | None = None,
-    initial_text: str = "…",
+    initial_text: str = "🤔",
     model: str = "gemini-3-flash",
     timeout_seconds: int = 600,
 ) -> str:
@@ -1372,7 +1372,7 @@ Please respond to the user's message above, considering the full context of our 
             prompt_with_context,
             chat_id=message.chat.id,
             reply_to_message_id=message.message_id,
-            initial_text="…",
+            initial_text="🤔",
             model="gemini-3-flash",
             timeout_seconds=300,
         )

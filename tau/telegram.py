@@ -107,7 +107,7 @@ class TelegramStreamingMessage:
         *,
         reply_to_message_id: int | None = None,
         existing_message_id: int | None = None,
-        initial_text: str = "…",
+        initial_text: str = "🤔",
         max_length: int = 4000,
         min_edit_interval_seconds: float = 1.0,
         min_chars_delta: int = 12,
