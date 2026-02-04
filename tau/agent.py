@@ -277,7 +277,7 @@ def run_cursor(prompt: str) -> str:
             start_new_session=True,
         )
         processes.track(proc, label="agent:loop", cmd=cmd, own_process_group=True)
-        stdout, stderr = proc.communicate(timeout=300)
+        stdout, stderr = proc.communicate(timeout=600)
     except subprocess.TimeoutExpired:
         # Kill the whole process group (agent can spawn children).
         try:
@@ -304,7 +304,7 @@ def run_cursor(prompt: str) -> str:
                         proc.kill()
                 except Exception:
                     pass
-        return "Error: Agent timed out after 5 minutes"
+        return "Error: Agent timed out after 10 minutes"
     except Exception as e:
         return f"Error: {str(e)}"
     finally:

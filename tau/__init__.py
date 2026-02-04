@@ -187,7 +187,7 @@ Please execute this scheduled task. Provide a fresh update based on the current 
                         cmd=cmd,
                         own_process_group=True,
                     )
-                    stdout, stderr = proc.communicate(timeout=300)  # 5 minutes
+                    stdout, stderr = proc.communicate(timeout=600)  # 10 minutes
                 except subprocess.TimeoutExpired:
                     # Ensure we clean up the process group before propagating.
                     try:
@@ -937,7 +937,7 @@ Please respond to the user's message above, considering the full context of our 
                 existing_message_id=processing_msg.message_id,
                 initial_text="🎤 Processing voice message...",
                 model="gemini-3-flash",
-                timeout_seconds=300,
+                timeout_seconds=600,
             )
             append_chat_history("assistant", response)
         finally:
@@ -992,7 +992,7 @@ def run_agent_ask_streaming(
     existing_message_id: int | None = None,
     initial_text: str = "…",
     model: str = "gemini-3-flash",
-    timeout_seconds: int = 300,
+    timeout_seconds: int = 600,
 ) -> str:
     """Run the agent CLI in ask mode and stream output by editing one Telegram message."""
     stream = TelegramStreamingMessage(
