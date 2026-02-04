@@ -693,7 +693,7 @@ Please respond to the user's message above, considering the full context of our 
             capture_output=True,
             text=True,
             stdin=subprocess.DEVNULL,
-            timeout=60
+            timeout=300  # 5 minutes
         )
         
         elapsed = (datetime.now() - start_time).total_seconds()
