@@ -685,11 +685,33 @@ def run_adapt_streaming(
                             text = part.get("text", "")
                             if text:
                                 thinking_text_buffer += text
-                                # Extract a meaningful snippet of the thinking
-                                # Skip very short fragments
-                                if len(text) > 10:
-                                    # Clean up the text for display
-                                    snippet = text.strip().replace("\n", " ")
+                                
+                                # Extract a meaningful snippet - only update at sentence boundaries
+                                # This makes streaming more natural by waiting for complete thoughts
+                                cleaned = thinking_text_buffer.strip().replace("\n", " ")
+                                
+                                # Find the last complete sentence (ends with . ! or ?)
+                                last_sentence_end = -1
+                                for i in range(len(cleaned) - 1, -1, -1):
+                                    if cleaned[i] in '.!?' and (i == len(cleaned) - 1 or cleaned[i + 1] in ' \n\t'):
+                                        last_sentence_end = i
+                                        break
+                                
+                                if last_sentence_end > 0:
+                                    # Get the last complete sentence(s) for display
+                                    complete_text = cleaned[:last_sentence_end + 1]
+                                    # Take the last ~100 chars of complete sentences
+                                    if len(complete_text) > 100:
+                                        # Find a sentence boundary within the last 100 chars
+                                        snippet_start = len(complete_text) - 100
+                                        for i in range(snippet_start, len(complete_text)):
+                                            if complete_text[i] in '.!?' and i + 1 < len(complete_text):
+                                                snippet_start = i + 2
+                                                break
+                                        snippet = complete_text[snippet_start:].strip()
+                                    else:
+                                        snippet = complete_text
+                                    
                                     # Only update if this is a meaningful change
                                     if snippet and snippet != last_thinking_snippet:
                                         last_thinking_snippet = snippet
