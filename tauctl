@@ -27,7 +27,7 @@ TAU_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUPERVISOR_CONF="$TAU_DIR/supervisord.conf"
 SUPERVISOR_SOCK="$TAU_DIR/.supervisor.sock"
 SUPERVISOR_PID="$TAU_DIR/.supervisord.pid"
-LOG_DIR="$TAU_DIR/logs"
+LOG_DIR="$TAU_DIR/context/logs"
 
 # Ensure log directory exists
 mkdir -p "$LOG_DIR"
@@ -193,6 +193,19 @@ case "${1:-}" in
         else
             echo "Supervisord not running - using direct exec restart"
             exit 2  # Signal to agent to use fallback
+        fi
+        ;;
+
+    # Hidden command for bot to stop itself under supervisord
+    _agent_stop)
+        # Ask supervisord to stop tau so it won't auto-restart
+        if is_supervisord_running; then
+            # Use nohup to ensure the stop command completes even after tau exits
+            nohup "$TAU_DIR/.venv/bin/supervisorctl" -c "$SUPERVISOR_CONF" stop tau >/dev/null 2>&1 &
+            echo "Stop initiated"
+        else
+            echo "Supervisord not running"
+            exit 2
         fi
         ;;
     

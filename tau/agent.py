@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .telegram import think as _think_impl, notify, get_chat_history
+from . import processes
 
 WORKSPACE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -252,26 +253,68 @@ def create_high_level_summary(detailed_content: str, task_title: str) -> str:
 
 def run_cursor(prompt: str) -> str:
     """Run Cursor agent with prompt, return output."""
+    cmd = [
+        "agent",
+        "--force",
+        "--model",
+        "composer-1",
+        "--output-format=text",
+        "--print",
+        prompt,
+    ]
+
+    proc = None
+    stdout = ""
+    stderr = ""
     try:
-        result = subprocess.run(
-            [
-                "agent",
-                "--force",
-                "--model", "composer-1",
-                "--output-format=text",
-                "--print",
-                prompt
-            ],
-            capture_output=True,
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=300,
-            cwd=WORKSPACE
+            stdin=subprocess.DEVNULL,
+            cwd=WORKSPACE,
+            start_new_session=True,
         )
-        return result.stdout.strip() if result.stdout else result.stderr.strip()
+        processes.track(proc, label="agent:loop", cmd=cmd, own_process_group=True)
+        stdout, stderr = proc.communicate(timeout=300)
     except subprocess.TimeoutExpired:
+        # Kill the whole process group (agent can spawn children).
+        try:
+            import signal as _signal
+            if proc is not None:
+                os.killpg(proc.pid, _signal.SIGTERM)
+        except Exception:
+            try:
+                if proc is not None:
+                    proc.terminate()
+            except Exception:
+                pass
+        try:
+            if proc is not None:
+                proc.wait(timeout=2)
+        except Exception:
+            try:
+                import signal as _signal
+                if proc is not None:
+                    os.killpg(proc.pid, _signal.SIGKILL)
+            except Exception:
+                try:
+                    if proc is not None:
+                        proc.kill()
+                except Exception:
+                    pass
         return "Error: Agent timed out after 5 minutes"
     except Exception as e:
         return f"Error: {str(e)}"
+    finally:
+        processes.untrack(proc)
+
+    if proc is not None and processes.pop_cancelled(proc.pid):
+        return "Cancelled."
+
+    out = stdout.strip() if stdout and stdout.strip() else (stderr or "").strip()
+    return out
 
 
 def git_commit_changes(description: str):

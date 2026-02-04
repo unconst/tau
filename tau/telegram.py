@@ -1,6 +1,7 @@
 """Shared Telegram bot for Tau agent."""
 
 import os
+import time
 from pathlib import Path
 
 # Load .env file before accessing any environment variables
@@ -82,6 +83,161 @@ def split_message(msg: str, max_length: int = 4000) -> list[str]:
                 remaining = remaining[max_length:]
     
     return chunks
+
+
+def _is_message_not_modified_error(exc: Exception) -> bool:
+    """Best-effort check for Telegram 'message is not modified' edit errors."""
+    try:
+        return "message is not modified" in str(exc).lower()
+    except Exception:
+        return False
+
+
+class TelegramStreamingMessage:
+    """Stream text into Telegram by editing a single message.
+
+    - Edits are throttled to avoid Telegram rate limits.
+    - If the text exceeds Telegram's message limit, it rolls over to a new
+      message and continues streaming by editing the latest message.
+    """
+
+    def __init__(
+        self,
+        chat_id: int,
+        *,
+        reply_to_message_id: int | None = None,
+        existing_message_id: int | None = None,
+        initial_text: str = "…",
+        max_length: int = 4000,
+        min_edit_interval_seconds: float = 1.0,
+        min_chars_delta: int = 12,
+    ):
+        self.chat_id = chat_id
+        self.reply_to_message_id = reply_to_message_id
+        self.initial_text = initial_text
+        self.max_length = max_length
+        self.min_edit_interval_seconds = min_edit_interval_seconds
+        self.min_chars_delta = min_chars_delta
+
+        self._message_ids: list[int] = []
+        self._current_message_id: int | None = None
+        self._current_text: str = ""
+        self._last_edited_text: str = ""
+        self._last_edit_at: float = 0.0
+
+        if existing_message_id is not None:
+            self._current_message_id = existing_message_id
+            self._message_ids.append(existing_message_id)
+            # Assume the existing message already contains initial_text.
+            self._last_edited_text = initial_text
+            self._last_edit_at = time.time()
+        else:
+            try:
+                msg = bot.send_message(
+                    chat_id,
+                    initial_text,
+                    reply_to_message_id=reply_to_message_id,
+                )
+                self._current_message_id = msg.message_id
+                self._message_ids.append(msg.message_id)
+                self._last_edited_text = initial_text
+                self._last_edit_at = time.time()
+            except Exception:
+                # If we can't create the placeholder message, keep state but
+                # allow the caller to continue without crashing.
+                self._current_message_id = None
+
+    def append(self, delta: str):
+        if not delta or self._current_message_id is None:
+            return
+        self._current_text += delta
+        self._flush_overflow()
+        self._maybe_edit(force=False)
+
+    def finalize(self):
+        """Force a final edit so the latest message is up to date."""
+        if self._current_message_id is None:
+            return
+        self._current_text = self._current_text.rstrip()
+        self._maybe_edit(force=True)
+
+    def set_text(self, text: str):
+        """Replace the current (latest) message text."""
+        if self._current_message_id is None:
+            return
+        self._current_text = text
+        # If caller sets text directly, respect Telegram limits.
+        self._flush_overflow()
+        self._maybe_edit(force=True)
+
+    def _maybe_edit(self, *, force: bool):
+        if self._current_message_id is None:
+            return
+
+        text_to_send = self._current_text if self._current_text else self.initial_text
+        if not text_to_send:
+            text_to_send = " "
+
+        if text_to_send == self._last_edited_text:
+            return
+
+        # If we're still on the placeholder, allow the first real output to
+        # appear immediately (even if within the normal throttle window).
+        force_edit = force or (self._last_edited_text == self.initial_text and bool(self._current_text))
+
+        if not force_edit:
+            now = time.time()
+            if now - self._last_edit_at < self.min_edit_interval_seconds:
+                return
+            if abs(len(text_to_send) - len(self._last_edited_text)) < self.min_chars_delta:
+                return
+
+        try:
+            bot.edit_message_text(text_to_send, self.chat_id, self._current_message_id)
+            self._last_edited_text = text_to_send
+            self._last_edit_at = time.time()
+        except Exception as e:
+            if _is_message_not_modified_error(e):
+                return
+            # Don't crash the bot if Telegram edit fails.
+            return
+
+    def _flush_overflow(self):
+        """If current text exceeds limit, send new messages and continue streaming."""
+        if self._current_message_id is None:
+            return
+
+        while len(self._current_text) > self.max_length:
+            chunks = split_message(self._current_text, max_length=self.max_length)
+            if len(chunks) <= 1:
+                break
+
+            first, rest = chunks[0], chunks[1:]
+
+            # Finalize the current message with the first chunk.
+            self._current_text = first
+            self._maybe_edit(force=True)
+
+            # Send any fully-formed middle chunks.
+            for chunk in rest[:-1]:
+                try:
+                    msg = bot.send_message(self.chat_id, chunk)
+                    self._message_ids.append(msg.message_id)
+                except Exception:
+                    # If sending fails, stop attempting further rollovers.
+                    return
+
+            # The last chunk becomes the new "current" message.
+            last_chunk = rest[-1]
+            try:
+                msg = bot.send_message(self.chat_id, last_chunk)
+                self._message_ids.append(msg.message_id)
+                self._current_message_id = msg.message_id
+                self._current_text = last_chunk
+                self._last_edited_text = last_chunk
+                self._last_edit_at = time.time()
+            except Exception:
+                return
 
 
 def notify(msg: str):

@@ -2,6 +2,8 @@
 
 Tau uses a hierarchical memory model.
 
+Your logs are in `context/logs`.
+
 ## Memory Layers
 
 ### 1. Task Memory

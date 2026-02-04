@@ -9,6 +9,8 @@ dependencies = ["pytelegrambotapi", "openai", "python-dotenv", "supervisor"]
 [project.optional-dependencies]
 # Eve (Eden.art) creative tools integration - install with: uv pip install -e ".[eve]"
 eve = ["eve @ git+https://github.com/edenartlab/eve.git"]
+# Test dependencies - install with: uv pip install -e ".[test]"
+test = ["pytest"]
 
 [project.scripts]
 tau = "tau:main"

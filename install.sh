@@ -393,7 +393,7 @@ step_python() {
     run_silent "Installing" uv pip install -e .
     run_silent "Installing" uv pip install supervisor
     
-    mkdir -p "$INSTALL_DIR/logs"
+    mkdir -p "$INSTALL_DIR/context/logs"
 }
 
 step_cursor_agent() {
@@ -498,9 +498,9 @@ setup_launchd() {
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>$INSTALL_DIR/logs/launchd.log</string>
+    <string>$INSTALL_DIR/context/logs/launchd.log</string>
     <key>StandardErrorPath</key>
-    <string>$INSTALL_DIR/logs/launchd.log</string>
+    <string>$INSTALL_DIR/context/logs/launchd.log</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key>

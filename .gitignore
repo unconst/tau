@@ -18,7 +18,8 @@ chat_id.txt
 # Supervisor runtime files
 .supervisor.sock
 .supervisord.pid
-logs/*.log
+logs/*.log*
+context/logs/*.log*
 
 # Environment files (contain secrets)
 .env

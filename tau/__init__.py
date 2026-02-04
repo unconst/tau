@@ -1,15 +1,19 @@
 import os
+import json
+import queue
 import subprocess
 import sys
 import threading
 import tempfile
+import time
 import logging
 from datetime import datetime
 from pathlib import Path
 
 from openai import OpenAI
-from .telegram import bot, save_chat_id, notify, WORKSPACE, append_chat_history
+from .telegram import bot, save_chat_id, notify, WORKSPACE, append_chat_history, TelegramStreamingMessage
 from .agent import run_loop, TASKS_DIR, get_all_tasks, git_commit_changes, set_debug_mode
+from . import processes
 import re
 
 # Debug mode flag - controls verbose notifications
@@ -21,7 +25,8 @@ _cron_lock = threading.Lock()
 _next_cron_id = 1
 
 # Configure logging
-LOG_FILE = os.path.join(WORKSPACE, "logs", "tau.log")
+LOG_FILE = os.path.join(WORKSPACE, "context", "logs", "tau.log")
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -173,24 +178,53 @@ CRON JOB PROMPT (runs every {job['interval_seconds']}s):
 {job['prompt']}
 
 Please execute this scheduled task. Provide a fresh update based on the current state or by using your tools. Do not simply repeat previous messages."""
-                
-                result = subprocess.run(
-                    [
-                        "agent",
-                        "--force",
-                        "--model", "opus-4.5",
-                        "--mode=ask",
-                        "--output-format=text",
-                        "--print",
-                        prompt_with_context
-                    ],
-                    capture_output=True,
-                    text=True,
-                    stdin=subprocess.DEVNULL,
-                    timeout=120
-                )
-                
-                response = result.stdout.strip() if result.stdout else result.stderr.strip()
+
+                cmd = [
+                    "agent",
+                    "--force",
+                    "--model",
+                    "opus-4.5",
+                    "--mode=ask",
+                    "--output-format=text",
+                    "--print",
+                    prompt_with_context,
+                ]
+
+                proc = None
+                stdout = ""
+                stderr = ""
+                try:
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        stdin=subprocess.DEVNULL,
+                        cwd=WORKSPACE,
+                        start_new_session=True,
+                    )
+                    processes.track(
+                        proc,
+                        label=f"agent:cron:{job['id']}",
+                        cmd=cmd,
+                        own_process_group=True,
+                    )
+                    stdout, stderr = proc.communicate(timeout=300)  # 5 minutes
+                except subprocess.TimeoutExpired:
+                    # Ensure we clean up the process group before propagating.
+                    try:
+                        processes.terminate_all(label_prefix=f"agent:cron:{job['id']}", timeout_seconds=1.0)
+                    except Exception:
+                        pass
+                    raise
+                finally:
+                    processes.untrack(proc)
+
+                if proc is not None and processes.pop_cancelled(proc.pid):
+                    logger.info(f"Cron job {job['id']} cancelled")
+                    continue
+
+                response = stdout.strip() if stdout.strip() else stderr.strip()
                 if response:
                     # Send result to user
                     try:
@@ -330,7 +364,7 @@ def remove_cron(message):
 def send_welcome(message):
     save_chat_id(message.chat.id)
     append_chat_history("user", f"/start")
-    response = "Hello! I'm Tau. Commands:\n/task <description> - Add a task\n/status - See recent activity\n/adapt <prompt> - Self-modify\n/cron <interval> <prompt> - Schedule recurring prompt\n/crons - List active crons\n/uncron <id> - Remove a cron\n/restart - Restart bot\n/debug - Toggle debug mode"
+    response = "Hello! I'm Tau. Commands:\n/task <description> - Add a task\n/status - See recent activity\n/adapt <prompt> - Self-modify\n/cron <interval> <prompt> - Schedule recurring prompt\n/crons - List active crons\n/uncron <id> - Remove a cron\n/clear - Stop active agent processes\n/restart - Restart bot\n/kill - Stop the bot\n/debug - Toggle debug mode"
     bot.reply_to(message, response)
     append_chat_history("assistant", response)
 
@@ -367,6 +401,74 @@ def restart_via_supervisor():
         except Exception:
             pass
     return False
+
+
+def stop_via_supervisor():
+    """Stop tau via supervisorctl. Returns True if supervisor handled it."""
+    tauctl = os.path.join(WORKSPACE, "tauctl")
+    if os.path.exists(tauctl):
+        try:
+            result = subprocess.run(
+                [tauctl, "_agent_stop"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            # Exit code 0 means supervisor is handling stop.
+            return result.returncode == 0
+        except Exception:
+            pass
+    return False
+
+
+@bot.message_handler(commands=['clear'])
+def clear_active_agent_processes(message):
+    """Stop any in-flight agent subprocesses (e.g. stuck /ask, cron, agent loop)."""
+    save_chat_id(message.chat.id)
+    append_chat_history("user", "/clear")
+
+    stopped = processes.terminate_all(label_prefix="agent:", timeout_seconds=2.0)
+    if stopped:
+        response = f"🧹 Stopped {len(stopped)} active agent process(es)."
+    else:
+        response = "No active agent processes."
+
+    bot.reply_to(message, response)
+    append_chat_history("assistant", response)
+
+
+@bot.message_handler(commands=['kill'])
+def kill_bot(message):
+    """Fully stop the bot process (and attempt to stop supervisord-managed service)."""
+    save_chat_id(message.chat.id)
+    append_chat_history("user", "/kill")
+
+    response = "🛑 Killing bot..."
+    bot.reply_to(message, response)
+    append_chat_history("assistant", response)
+
+    # Stop any in-flight agent subprocesses first.
+    try:
+        processes.terminate_all(label_prefix="agent:", timeout_seconds=2.0)
+    except Exception:
+        pass
+
+    # Stop background loops, then stop polling.
+    try:
+        _stop_event.set()
+    except Exception:
+        pass
+    try:
+        bot.stop_polling()
+    except Exception:
+        pass
+
+    # If supervised, ask supervisor to stop the program so it won't auto-restart.
+    if stop_via_supervisor():
+        os._exit(0)
+
+    # Fallback: hard-exit the current process.
+    os._exit(0)
 
 
 @bot.message_handler(commands=['restart'])
@@ -406,15 +508,44 @@ def adapt_bot(message):
     append_chat_history("assistant", "🫡")
     
     try:
-        result = subprocess.run(
-            ["agent", "--force", "--model", "opus-4.5",
-             "--output-format=text", "--print", prompt],
-            capture_output=True,
-            text=True,
-            stdin=subprocess.DEVNULL,  # Prevent agent from waiting for input
-            timeout=3600,  # 1 hour timeout for code changes
-            cwd=WORKSPACE
-        )
+        cmd = [
+            "agent",
+            "--force",
+            "--model",
+            "opus-4.5",
+            "--output-format=text",
+            "--print",
+            prompt,
+        ]
+
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                stdin=subprocess.DEVNULL,  # Prevent agent from waiting for input
+                cwd=WORKSPACE,
+                start_new_session=True,
+            )
+            processes.track(proc, label="agent:adapt", cmd=cmd, own_process_group=True)
+            proc.communicate(timeout=3600)  # 1 hour timeout for code changes
+        except subprocess.TimeoutExpired:
+            # Ensure we stop the process group before bubbling up the timeout.
+            try:
+                processes.terminate_all(label_prefix="agent:adapt", timeout_seconds=1.0)
+            except Exception:
+                pass
+            raise
+        finally:
+            processes.untrack(proc)
+
+        if proc is not None and processes.pop_cancelled(proc.pid):
+            msg = "Cancelled."
+            bot.reply_to(message, msg)
+            append_chat_history("assistant", msg)
+            return
         
         # Commit any changes made by the agent
         git_commit_changes(prompt)
@@ -529,8 +660,8 @@ def handle_voice_message(message):
     """Handle voice messages by transcribing and processing as text."""
     save_chat_id(message.chat.id)
     
-    # Notify user that we're processing the voice message
-    bot.reply_to(message, "🎤 Processing voice message...")
+    # Notify user that we're processing the voice message (we'll edit this message with the answer)
+    processing_msg = bot.reply_to(message, "🎤 Processing voice message...")
     
     voice_path = None
     try:
@@ -542,7 +673,10 @@ def handle_voice_message(message):
         
         if not transcribed_text.strip():
             response = "Could not transcribe voice message. Please try again."
-            bot.reply_to(message, response)
+            try:
+                bot.edit_message_text(response, message.chat.id, processing_msg.message_id)
+            except Exception:
+                bot.reply_to(message, response)
             append_chat_history("user", "[voice message - transcription failed]")
             append_chat_history("assistant", response)
             return
@@ -574,25 +708,14 @@ Please respond to the user's message above, considering the full context of our 
         
         # Process transcribed text as normal message
         try:
-            result = subprocess.run(
-                [
-                    "agent",
-                    "--force",
-                    "--model", "gemini-3-flash",
-                    "--mode=ask",
-                    "--output-format=text",
-                    "--print",
-                    prompt_with_context
-                ],
-                capture_output=True,
-                text=True,
-                stdin=subprocess.DEVNULL,  # Prevent agent from waiting for input
-                timeout=120
+            response = run_agent_ask_streaming(
+                prompt_with_context,
+                chat_id=message.chat.id,
+                existing_message_id=processing_msg.message_id,
+                initial_text="🎤 Processing voice message...",
+                model="gemini-3-flash",
+                timeout_seconds=300,
             )
-            response = result.stdout.strip() if result.stdout else result.stderr.strip()
-            if not response:
-                response = "No response from agent."
-            bot.reply_to(message, response)
             append_chat_history("assistant", response)
         finally:
             # Stop typing indicator
@@ -600,7 +723,10 @@ Please respond to the user's message above, considering the full context of our 
         
     except Exception as e:
         error_msg = f"Error processing voice message: {str(e)}"
-        bot.reply_to(message, error_msg)
+        try:
+            bot.edit_message_text(error_msg, message.chat.id, processing_msg.message_id)
+        except Exception:
+            bot.reply_to(message, error_msg)
         append_chat_history("assistant", error_msg)
     finally:
         # Clean up temporary voice file
@@ -633,6 +759,207 @@ def send_typing_action(chat_id, stop_event):
             pass
         # Wait 4 seconds (typing indicator lasts ~5 seconds)
         stop_event.wait(4)
+
+
+def run_agent_ask_streaming(
+    prompt_with_context: str,
+    *,
+    chat_id: int,
+    reply_to_message_id: int | None = None,
+    existing_message_id: int | None = None,
+    initial_text: str = "…",
+    model: str = "gemini-3-flash",
+    timeout_seconds: int = 300,
+) -> str:
+    """Run the agent CLI in ask mode and stream output by editing one Telegram message."""
+    stream = TelegramStreamingMessage(
+        chat_id,
+        reply_to_message_id=reply_to_message_id,
+        existing_message_id=existing_message_id,
+        initial_text=initial_text,
+    )
+
+    cmd = [
+        "agent",
+        "--force",
+        "--model",
+        model,
+        "--mode=ask",
+        "--output-format",
+        "stream-json",
+        "--stream-partial-output",
+        "--print",
+        prompt_with_context,
+    ]
+
+    start_time = time.time()
+    raw_output = ""
+    final_result_text: str | None = None
+    stderr_lines: list[str] = []
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            cwd=WORKSPACE,
+            bufsize=1,
+            start_new_session=True,
+        )
+        processes.track(
+            proc,
+            label=f"agent:ask:{chat_id}",
+            cmd=cmd,
+            own_process_group=True,
+        )
+    except Exception as e:
+        err = f"Error: {str(e)}"
+        stream.set_text(err)
+        return err
+
+    sentinel = object()
+    q: queue.Queue[object] = queue.Queue()
+
+    def _stdout_reader():
+        try:
+            if proc.stdout is None:
+                return
+            for line in proc.stdout:
+                q.put(line)
+        finally:
+            q.put(sentinel)
+
+    reader_thread = threading.Thread(
+        target=_stdout_reader,
+        daemon=True,
+        name="AgentAskStreamReader",
+    )
+    reader_thread.start()
+
+    def _stderr_reader():
+        try:
+            if proc.stderr is None:
+                return
+            for line in proc.stderr:
+                stderr_lines.append(line)
+        except Exception:
+            pass
+
+    stderr_thread = threading.Thread(
+        target=_stderr_reader,
+        daemon=True,
+        name="AgentAskStderrReader",
+    )
+    stderr_thread.start()
+
+    timed_out = False
+
+    try:
+        while True:
+            if time.time() - start_time > timeout_seconds:
+                timed_out = True
+                # Kill the whole process group (agent can spawn children).
+                try:
+                    import signal as _signal
+                    os.killpg(proc.pid, _signal.SIGTERM)
+                except Exception:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        import signal as _signal
+                        os.killpg(proc.pid, _signal.SIGKILL)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                break
+
+            try:
+                item = q.get(timeout=0.25)
+            except queue.Empty:
+                item = None
+
+            if item is sentinel:
+                break
+
+            if isinstance(item, str) and item:
+                line = item.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    # Ignore non-JSON noise on stdout.
+                    continue
+                
+                event_type = event.get("type")
+                if event_type == "assistant":
+                    msg = event.get("message") or {}
+                    content = msg.get("content") or []
+                    parts: list[str] = []
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            parts.append(part.get("text") or "")
+                    candidate = "".join(parts)
+                    if candidate:
+                        # With --stream-partial-output this is typically a delta,
+                        # but handle both delta and "full so far" outputs safely.
+                        delta = candidate
+                        if candidate.startswith(raw_output):
+                            delta = candidate[len(raw_output):]
+                        if delta:
+                            raw_output += delta
+                            stream.append(delta)
+                elif event_type == "result":
+                    res = event.get("result")
+                    if isinstance(res, str):
+                        final_result_text = res
+
+            # If process exited, loop briefly to drain remaining output.
+            if proc.poll() is not None and q.empty():
+                continue
+    finally:
+        stream.finalize()
+        processes.untrack(proc)
+
+    if processes.pop_cancelled(proc.pid):
+        msg = "Cancelled."
+        stream.set_text(msg)
+        return msg
+
+    if final_result_text:
+        # Ensure we finish with the full terminal result if available.
+        if raw_output and final_result_text.startswith(raw_output):
+            missing = final_result_text[len(raw_output):]
+            if missing:
+                raw_output += missing
+                stream.append(missing)
+                stream.finalize()
+        elif not raw_output:
+            raw_output = final_result_text
+
+    output = raw_output.strip()
+
+    if timed_out:
+        msg = "Request timed out."
+        stream.set_text(msg)
+        return msg
+
+    if not output:
+        stderr_text = "".join(stderr_lines).strip()
+        msg = stderr_text if stderr_text else "No response from agent."
+        stream.set_text(msg)
+        return msg
+
+    return output
 
 
 @bot.message_handler(func=lambda message: True)
@@ -679,36 +1006,18 @@ Please respond to the user's message above, considering the full context of our 
     logger.info("Calling agent CLI...")
     
     try:
-        # CRITICAL: stdin=subprocess.DEVNULL prevents agent from waiting for input
-        result = subprocess.run(
-            [
-                "agent",
-                "--force",
-                "--model", "gemini-3-flash",
-                "--mode=ask",
-                "--output-format=text",
-                "--print",
-                prompt_with_context
-            ],
-            capture_output=True,
-            text=True,
-            stdin=subprocess.DEVNULL,
-            timeout=300  # 5 minutes
+        response = run_agent_ask_streaming(
+            prompt_with_context,
+            chat_id=message.chat.id,
+            reply_to_message_id=message.message_id,
+            initial_text="…",
+            model="gemini-3-flash",
+            timeout_seconds=300,
         )
-        
         elapsed = (datetime.now() - start_time).total_seconds()
-        logger.info(f"Agent completed in {elapsed:.1f}s, exit code: {result.returncode}")
-        
-        response = result.stdout.strip() if result.stdout else result.stderr.strip()
-        if not response:
-            logger.warning("Agent returned empty response")
-            response = "No response from agent."
-        else:
-            logger.info(f"Response preview: {response[:100]}...")
-        
-        bot.reply_to(message, response[:4000])
+        logger.info(f"Agent completed in {elapsed:.1f}s (streamed)")
         append_chat_history("assistant", response)
-        logger.info("Response sent to Telegram")
+        logger.info("Response streamed to Telegram")
         
     except subprocess.TimeoutExpired:
         elapsed = (datetime.now() - start_time).total_seconds()
@@ -740,7 +1049,7 @@ def main():
     if chat_id:
         logger.info(f"Found saved chat_id: {chat_id}")
         if DEBUG_MODE:
-            notify("⚚ Tau is online\n\nCommands:\n/task - Add a task\n/status - Check status\n/adapt - Self-modify\n/restart - Restart bot")
+            notify("⚚ Tau is online\n\nCommands:\n/task - Add a task\n/status - Check status\n/adapt - Self-modify\n/clear - Stop active agent processes\n/restart - Restart bot\n/kill - Stop the bot")
     else:
         logger.info("No saved chat_id, waiting for /start command")
         print("Tau starting... Send /start in Telegram to connect.")
