@@ -412,7 +412,7 @@ def adapt_bot(message):
             capture_output=True,
             text=True,
             stdin=subprocess.DEVNULL,  # Prevent agent from waiting for input
-            timeout=600,  # 10 min timeout for code changes
+            timeout=3600,  # 1 hour timeout for code changes
             cwd=WORKSPACE
         )
         
