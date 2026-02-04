@@ -23,5 +23,6 @@ For the active task:
 For tool/skill usage:
 - `context/skills/agent.md` - Cursor CLI agent documentation
 - `context/skills/eve-skills.md` - Eve (Eden.art) creative skills integration
+- `context/skills/targon.md` - Targon GPU/CPU rental machines
 
 If required context is missing or ambiguous, ask the user.

@@ -7,6 +7,7 @@ Available tools:
 - send_message: Send a text message to the user via Telegram
 - send_voice: Send a voice message (TTS) to the user via Telegram
 - search_skills: Search for creative AI skills/tools (Eve/Eden.art ecosystem)
+- lium: Manage GPU pods on the Lium network (create, delete, SSH, exec)
 """
 
 # Tool registry for programmatic access
@@ -30,6 +31,26 @@ TOOLS = {
             'python -m tau.tools.search_skills "image"            # Search for image skills',
             'python -m tau.tools.search_skills --category video   # Filter by category',
             'python -m tau.tools.search_skills --details flux     # Get skill details',
+        ],
+    },
+    "lium": {
+        "command": "python -m tau.tools.lium",
+        "description": "Manage GPU pods on the Lium network (Bittensor Subnet 51)",
+        "usage": "python -m tau.tools.lium COMMAND [OPTIONS]",
+        "env_required": ["LIUM_API_KEY"],
+        "examples": [
+            "python -m tau.tools.lium ls                          # List available GPU nodes",
+            "python -m tau.tools.lium ls H100                     # List only H100 GPUs",
+            "python -m tau.tools.lium ls --max-price 2.5          # Filter by max price",
+            "python -m tau.tools.lium ps                          # List your active pods",
+            "python -m tau.tools.lium up 1                        # Create pod on executor #1",
+            "python -m tau.tools.lium up --gpu H100 --name my-pod # Create named pod with H100",
+            "python -m tau.tools.lium rm my-pod                   # Remove a pod",
+            "python -m tau.tools.lium rm all                      # Remove all pods",
+            "python -m tau.tools.lium exec my-pod 'nvidia-smi'    # Execute command on pod",
+            "python -m tau.tools.lium ssh my-pod                  # SSH into pod",
+            "python -m tau.tools.lium scp my-pod ./file.py        # Copy file to pod",
+            "python -m tau.tools.lium templates                   # List available templates",
         ],
     },
 }
