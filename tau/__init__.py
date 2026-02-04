@@ -564,9 +564,22 @@ def run_adapt_streaming(
 
     timed_out = False
     
+    # Cycling status messages for interactive feel
+    adapting_phases = [
+        "🫡 Adapting...",
+        "📝 Planning changes...",
+        "🔍 Analyzing code...",
+        "🧠 Reasoning...",
+        "⚙️ Working...",
+        "✨ Making progress...",
+    ]
+    
     def build_display():
         """Build the display message showing current thinking and actions."""
-        lines = ["🫡 Adapting...\n"]
+        # Cycle through phases every 2 seconds
+        elapsed = time.time() - start_time
+        phase_idx = int(elapsed / 2) % len(adapting_phases)
+        lines = [adapting_phases[phase_idx] + "\n"]
         
         # Show current thinking or the last complete snippet
         display_thinking = ""
@@ -596,6 +609,9 @@ def run_adapt_streaming(
         
         return "\n".join(lines)
 
+    # Track when we last updated the display (for periodic refresh)
+    last_display_update = start_time
+    
     try:
         while True:
             if time.time() - start_time > timeout_seconds:
@@ -625,6 +641,11 @@ def run_adapt_streaming(
                 item = q.get(timeout=0.25)
             except queue.Empty:
                 item = None
+                # Periodically refresh display even when no data (cycles adapting phases)
+                now = time.time()
+                if now - last_display_update >= 1.5:
+                    stream.set_text(build_display())
+                    last_display_update = now
 
             if item is sentinel:
                 break
@@ -679,6 +700,7 @@ def run_adapt_streaming(
                     
                     thinking_updates.append(update)
                     stream.set_text(build_display())
+                    last_display_update = time.time()
                 
                 # Handle tool result events
                 elif event_type == "tool_result":
@@ -687,6 +709,7 @@ def run_adapt_streaming(
                         if thinking_updates:
                             thinking_updates[-1] = thinking_updates[-1].replace("...", " ✓")
                             stream.set_text(build_display())
+                            last_display_update = time.time()
                         current_tool = None
                 
                 # Handle assistant text output (thinking/explanation)
@@ -729,6 +752,7 @@ def run_adapt_streaming(
                                     if snippet and snippet != last_thinking_snippet:
                                         last_thinking_snippet = snippet
                                         stream.set_text(build_display())
+                                        last_display_update = time.time()
                                 
                                 # Keep track of full text for final summary
                                 if len(thinking_text_buffer) > 50:
@@ -1177,6 +1201,9 @@ def run_agent_ask_streaming(
 
     timed_out = False
 
+    # Track when we last updated the display (for periodic refresh)
+    last_display_update = start_time
+    
     try:
         while True:
             if time.time() - start_time > timeout_seconds:
@@ -1207,6 +1234,11 @@ def run_agent_ask_streaming(
                 item = q.get(timeout=0.25)
             except queue.Empty:
                 item = None
+                # Periodically refresh display even when no data (cycles thinking phases)
+                now = time.time()
+                if now - last_display_update >= 1.5:
+                    stream.set_text(build_display())
+                    last_display_update = now
 
             if item is sentinel:
                 break
@@ -1262,6 +1294,7 @@ def run_agent_ask_streaming(
                     
                     thinking_updates.append(update)
                     stream.set_text(build_display())
+                    last_display_update = time.time()
                 
                 # Handle tool result events
                 elif event_type == "tool_result":
@@ -1270,6 +1303,7 @@ def run_agent_ask_streaming(
                         if thinking_updates:
                             thinking_updates[-1] = thinking_updates[-1].replace("...", " ✓")
                             stream.set_text(build_display())
+                            last_display_update = time.time()
                         current_tool = None
                 
                 # Handle assistant text output (thinking/explanation)
@@ -1321,6 +1355,7 @@ def run_agent_ask_streaming(
                                 last_thinking_snippet = snippet
                         
                         stream.set_text(build_display())
+                        last_display_update = time.time()
                 
                 elif event_type == "result":
                     res = event.get("result")
