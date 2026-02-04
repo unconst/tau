@@ -101,9 +101,7 @@ def cmd_up(args: List[str]) -> None:
 
 def cmd_rm(args: List[str]) -> None:
     """Remove/stop pods."""
-    # Add force flag to skip confirmation
-    if "--force" not in args and "-f" not in args:
-        args = args + ["--force"]
+    # The lium CLI does not have a --force flag for rm
     run_lium_command(["rm"] + args)
 
 
