@@ -1016,12 +1016,17 @@ def run_agent_ask_streaming(
     model: str = "gemini-3-flash",
     timeout_seconds: int = 600,
 ) -> str:
-    """Run the agent CLI in ask mode and stream output by editing one Telegram message."""
+    """Run the agent CLI in ask mode and stream output by editing one Telegram message.
+    
+    Shows thinking process and tool operations similar to /adapt streaming.
+    """
     stream = TelegramStreamingMessage(
         chat_id,
         reply_to_message_id=reply_to_message_id,
         existing_message_id=existing_message_id,
         initial_text=initial_text,
+        min_edit_interval_seconds=1.5,  # Faster updates for thinking
+        min_chars_delta=15,  # More responsive updates
     )
 
     cmd = [
@@ -1041,6 +1046,35 @@ def run_agent_ask_streaming(
     raw_output = ""
     final_result_text: str | None = None
     stderr_lines: list[str] = []
+    thinking_updates: list[str] = []
+    thinking_text_buffer: str = ""
+    current_tool: str | None = None
+    last_thinking_snippet: str = ""
+    
+    def build_display():
+        """Build the display message showing current thinking and actions."""
+        lines = []
+        
+        # Show recent thinking snippet if we have one
+        if last_thinking_snippet:
+            snippet = last_thinking_snippet[:100]
+            if len(last_thinking_snippet) > 100:
+                snippet += "..."
+            lines.append(f"💭 {snippet}\n")
+        
+        # Show recent tool actions
+        if thinking_updates:
+            if lines:
+                lines.append("")
+            lines.extend(thinking_updates[-6:])
+        
+        # If we have raw output (the actual response), show it
+        if raw_output.strip():
+            if lines:
+                lines.append("\n---\n")
+            lines.append(raw_output)
+        
+        return "\n".join(lines) if lines else initial_text
 
     try:
         proc = subprocess.Popen(
@@ -1146,13 +1180,68 @@ def run_agent_ask_streaming(
                     continue
                 
                 event_type = event.get("type")
-                if event_type == "assistant":
+                
+                # Handle tool use events - show what the agent is doing
+                if event_type == "tool_use":
+                    tool_name = event.get("name", "tool")
+                    tool_input = event.get("input", {})
+                    current_tool = tool_name
+                    
+                    # Create a brief description of what's happening
+                    if tool_name == "Read":
+                        path = tool_input.get("path", "")
+                        filename = os.path.basename(path) if path else "file"
+                        update = f"📖 Reading {filename}..."
+                    elif tool_name == "Write":
+                        path = tool_input.get("path", "")
+                        filename = os.path.basename(path) if path else "file"
+                        update = f"✍️ Writing {filename}..."
+                    elif tool_name == "StrReplace":
+                        path = tool_input.get("path", "")
+                        filename = os.path.basename(path) if path else "file"
+                        update = f"🔧 Editing {filename}..."
+                    elif tool_name == "Shell":
+                        cmd_str = tool_input.get("command", "")[:40]
+                        update = f"💻 {cmd_str}..."
+                    elif tool_name == "Grep":
+                        pattern = tool_input.get("pattern", "")[:25]
+                        update = f"🔍 Searching: {pattern}..."
+                    elif tool_name == "Glob":
+                        pattern = tool_input.get("glob_pattern", "")[:25]
+                        update = f"📁 Finding: {pattern}..."
+                    elif tool_name == "SemanticSearch":
+                        query = tool_input.get("query", "")[:40]
+                        update = f"🧠 {query}..."
+                    elif tool_name == "WebFetch":
+                        url = tool_input.get("url", "")[:40]
+                        update = f"🌐 Fetching: {url}..."
+                    else:
+                        update = f"🔧 {tool_name}..."
+                    
+                    thinking_updates.append(update)
+                    stream.set_text(build_display())
+                
+                # Handle tool result events
+                elif event_type == "tool_result":
+                    if current_tool:
+                        # Mark the tool as done
+                        if thinking_updates:
+                            thinking_updates[-1] = thinking_updates[-1].replace("...", " ✓")
+                            stream.set_text(build_display())
+                        current_tool = None
+                
+                # Handle assistant text output (thinking/explanation)
+                elif event_type == "assistant":
                     msg = event.get("message") or {}
                     content = msg.get("content") or []
                     parts: list[str] = []
                     for part in content:
                         if isinstance(part, dict) and part.get("type") == "text":
-                            parts.append(part.get("text") or "")
+                            text = part.get("text", "")
+                            if text:
+                                parts.append(text)
+                                thinking_text_buffer += text
+                    
                     candidate = "".join(parts)
                     if candidate:
                         # With --stream-partial-output this is typically a delta,
@@ -1162,7 +1251,35 @@ def run_agent_ask_streaming(
                             delta = candidate[len(raw_output):]
                         if delta:
                             raw_output += delta
-                            stream.append(delta)
+                        
+                        # Extract a meaningful snippet for thinking display
+                        # Only update at sentence boundaries for natural streaming
+                        cleaned = thinking_text_buffer.strip().replace("\n", " ")
+                        
+                        # Find the last complete sentence
+                        last_sentence_end = -1
+                        for i in range(len(cleaned) - 1, -1, -1):
+                            if cleaned[i] in '.!?' and (i == len(cleaned) - 1 or cleaned[i + 1] in ' \n\t'):
+                                last_sentence_end = i
+                                break
+                        
+                        if last_sentence_end > 0:
+                            complete_text = cleaned[:last_sentence_end + 1]
+                            if len(complete_text) > 100:
+                                snippet_start = len(complete_text) - 100
+                                for i in range(snippet_start, len(complete_text)):
+                                    if complete_text[i] in '.!?' and i + 1 < len(complete_text):
+                                        snippet_start = i + 2
+                                        break
+                                snippet = complete_text[snippet_start:].strip()
+                            else:
+                                snippet = complete_text
+                            
+                            if snippet and snippet != last_thinking_snippet:
+                                last_thinking_snippet = snippet
+                        
+                        stream.set_text(build_display())
+                
                 elif event_type == "result":
                     res = event.get("result")
                     if isinstance(res, str):
@@ -1186,8 +1303,6 @@ def run_agent_ask_streaming(
             missing = final_result_text[len(raw_output):]
             if missing:
                 raw_output += missing
-                stream.append(missing)
-                stream.finalize()
         elif not raw_output:
             raw_output = final_result_text
 
@@ -1204,6 +1319,8 @@ def run_agent_ask_streaming(
         stream.set_text(msg)
         return msg
 
+    # Final display: just the clean response without thinking artifacts
+    stream.set_text(output)
     return output
 
 
