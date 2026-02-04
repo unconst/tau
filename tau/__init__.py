@@ -1341,57 +1341,93 @@ def run_agent_ask_streaming(
         stream.set_text(msg)
         return msg
 
-    # Extract the final answer, removing any "thinking" preamble
-    # The agent often outputs thinking text first, then the actual answer
-    final_answer = output
+    # Extract just the final answer, removing all thinking/processing text
+    final_answer = _extract_final_answer(output)
     
-    # Pattern 1: Look for "✅" marker in the output (agent sometimes uses this)
-    if "✅" in output:
-        parts = output.split("✅", 1)
-        if len(parts) > 1 and parts[1].strip():
-            final_answer = parts[1].strip()
-    # Pattern 2: If there are multiple paragraphs, filter out thinking preambles
-    elif "\n\n" in output:
-        paragraphs = [p.strip() for p in output.split("\n\n") if p.strip()]
-        # Indicators that a paragraph is "thinking" rather than the answer
-        thinking_indicators = [
-            "let me", "i'll", "i will", "counting", "looking at", 
-            "let's", "thinking", "checking", "analyzing", "let's see",
-            "let me count", "let's count", "the letters are"
-        ]
-        answer_paragraphs = []
-        for p in paragraphs:
-            p_lower = p.lower()
-            is_thinking = any(p_lower.startswith(ind) for ind in thinking_indicators)
-            if not is_thinking:
-                answer_paragraphs.append(p)
-        
-        if answer_paragraphs:
-            # Use the last non-thinking paragraph(s)
-            final_answer = "\n\n".join(answer_paragraphs)
-        elif paragraphs:
-            # If all paragraphs look like thinking, just use the last one
-            final_answer = paragraphs[-1]
-    # Pattern 3: Single paragraph but with a clear answer marker
-    else:
-        # Look for sentences that start with answer indicators
-        sentences = re.split(r'(?<=[.!?])\s+', output)
-        if len(sentences) > 1:
-            answer_indicators = ["there are", "there is", "the answer", "it is", "it's", "yes", "no"]
-            for i, s in enumerate(sentences):
-                s_lower = s.lower()
-                if any(s_lower.startswith(ind) for ind in answer_indicators):
-                    # Found an answer sentence, use from here to end
-                    final_answer = " ".join(sentences[i:])
-                    break
-    
-    # Clean up the final answer
-    final_answer = final_answer.strip()
-    
-    # Final display: just the clean response with checkmark
-    final_msg = f"✅ {final_answer}"
-    stream.set_text(final_msg)
+    # Final display: just the clean response (no checkmark prefix for cleaner look)
+    stream.set_text(final_answer)
     return final_answer
+
+
+def _extract_final_answer(output: str) -> str:
+    """Extract just the final answer from agent output, removing thinking text.
+    
+    The agent may output:
+    - Thinking process ("Let me count...", "Looking at...")
+    - Tool usage descriptions
+    - Multi-paragraph explanations
+    - The actual answer
+    
+    We want only the actual answer.
+    """
+    output = output.strip()
+    
+    # Patterns that indicate thinking/processing (case insensitive)
+    thinking_patterns = [
+        r"^let me\b", r"^i'll\b", r"^i will\b", r"^counting\b", r"^looking at\b",
+        r"^let's\b", r"^thinking\b", r"^checking\b", r"^analyzing\b", r"^first,?\b",
+        r"^to answer\b", r"^the letters\b", r"^i can see\b", r"^i've\b", r"^i have\b",
+        r"^\d+\.\s+\*\*", r"^here'?s?\b", r"^based on\b"
+    ]
+    
+    # Patterns that indicate closing filler to remove
+    closing_patterns = [
+        r"\s*is there anything else.*\??\s*$",
+        r"\s*let me know if.*$",
+        r"\s*feel free to ask.*$",
+        r"\s*would you like.*\??\s*$",
+        r"\s*anything else.*\??\s*$",
+    ]
+    
+    # Split into paragraphs
+    paragraphs = [p.strip() for p in output.split('\n\n') if p.strip()]
+    
+    if not paragraphs:
+        return output
+    
+    # Filter out thinking paragraphs from the start
+    result_paragraphs = []
+    started_real_content = False
+    
+    for para in paragraphs:
+        para_lower = para.lower()
+        
+        # Skip paragraphs that are clearly thinking/process
+        is_thinking = False
+        if not started_real_content:
+            for pattern in thinking_patterns:
+                if re.match(pattern, para_lower):
+                    is_thinking = True
+                    break
+        
+        if not is_thinking:
+            started_real_content = True
+            result_paragraphs.append(para)
+    
+    # If we filtered everything, use the original
+    if not result_paragraphs:
+        result_paragraphs = paragraphs
+    
+    # Remove closing filler from last paragraph
+    if result_paragraphs:
+        last = result_paragraphs[-1]
+        for pattern in closing_patterns:
+            last = re.sub(pattern, '', last, flags=re.IGNORECASE).strip()
+        result_paragraphs[-1] = last
+        
+        # If last paragraph is now empty, remove it
+        if not result_paragraphs[-1]:
+            result_paragraphs = result_paragraphs[:-1]
+    
+    final = '\n\n'.join(result_paragraphs).strip()
+    
+    # Final cleanup: remove any remaining artifacts
+    # Remove markdown code fence artifacts that might have bled through
+    final = re.sub(r'^```[\s\S]*?```\s*', '', final).strip()
+    # Remove leftover checkmarks or emojis at start
+    final = re.sub(r'^[✅🤔💭]\s*', '', final).strip()
+    
+    return final if final else output
 
 
 @bot.message_handler(func=lambda message: True)
@@ -1414,14 +1450,24 @@ def handle_message(message):
     # Now append the user message
     append_chat_history("user", message.text)
     
-    # Build prompt with chat history context
-    prompt_with_context = f"""TELEGRAM CHAT HISTORY:
-{chat_history}
+    # Build prompt with minimal context for simple questions
+    # Only include last 20 lines of chat for continuity, not the full history
+    chat_lines = chat_history.strip().split('\n')
+    recent_chat = '\n'.join(chat_lines[-20:]) if len(chat_lines) > 20 else chat_history
+    
+    prompt_with_context = f"""You are Tau, a helpful assistant. Answer the user's question directly and concisely.
 
-CURRENT USER MESSAGE:
-{message.text}
+RECENT CONTEXT (for continuity):
+{recent_chat}
 
-Please respond to the user's message above, considering the full context of our conversation history."""
+USER: {message.text}
+
+INSTRUCTIONS:
+- Answer directly without preamble
+- Be concise - just give the answer
+- Do NOT say "Is there anything else..." or similar closing phrases
+- Do NOT explain your thinking process in the response
+- If the question is simple (like factual questions), give a short direct answer"""
     
     logger.info(f"Total prompt size: {len(prompt_with_context)} chars")
     
