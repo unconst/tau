@@ -568,13 +568,26 @@ def run_adapt_streaming(
         """Build the display message showing current thinking and actions."""
         lines = ["🫡 Adapting...\n"]
         
-        # Show recent thinking snippet if we have one
-        if last_thinking_snippet:
-            # Show a brief snippet of the agent's current thinking
-            snippet = last_thinking_snippet[:100]
-            if len(last_thinking_snippet) > 100:
-                snippet += "..."
-            lines.append(f"💭 {snippet}\n")
+        # Show current thinking or the last complete snippet
+        display_thinking = ""
+        if thinking_text_buffer.strip():
+            cleaned = thinking_text_buffer.strip().replace("\n", " ")
+            # If we have a last complete snippet, use it as the base
+            if last_thinking_snippet:
+                display_thinking = last_thinking_snippet
+                # If there's more text after the snippet, show a bit of it to show progress
+                if len(cleaned) > len(last_thinking_snippet) + 5:
+                    remaining = cleaned[len(last_thinking_snippet):].strip()
+                    display_thinking += " " + remaining
+            else:
+                # No complete sentence yet, just show what we have
+                display_thinking = cleaned
+            
+            # Truncate for display
+            if len(display_thinking) > 150:
+                display_thinking = "..." + display_thinking[-147:]
+            
+            lines.append(f"💭 {display_thinking}\n")
         
         # Show recent tool actions
         if thinking_updates:
@@ -1064,12 +1077,26 @@ def run_agent_ask_streaming(
         """
         lines = ["🤔 Thinking...\n"]
         
-        # Show recent thinking snippet if we have one
-        if last_thinking_snippet:
-            snippet = last_thinking_snippet[:100]
-            if len(last_thinking_snippet) > 100:
-                snippet += "..."
-            lines.append(f"💭 {snippet}\n")
+        # Show current thinking or the last complete snippet
+        display_thinking = ""
+        if thinking_text_buffer.strip():
+            cleaned = thinking_text_buffer.strip().replace("\n", " ")
+            # If we have a last complete snippet, use it as the base
+            if last_thinking_snippet:
+                display_thinking = last_thinking_snippet
+                # If there's more text after the snippet, show a bit of it to show progress
+                if len(cleaned) > len(last_thinking_snippet) + 5:
+                    remaining = cleaned[len(last_thinking_snippet):].strip()
+                    display_thinking += " " + remaining
+            else:
+                # No complete sentence yet, just show what we have
+                display_thinking = cleaned
+            
+            # Truncate for display
+            if len(display_thinking) > 150:
+                display_thinking = "..." + display_thinking[-147:]
+            
+            lines.append(f"💭 {display_thinking}\n")
         
         # Show recent tool actions
         if thinking_updates:
@@ -1299,21 +1326,14 @@ def run_agent_ask_streaming(
         stream.set_text(msg)
         return msg
 
-    if final_result_text:
-        # Ensure we finish with the full terminal result if available.
-        if raw_output and final_result_text.startswith(raw_output):
-            missing = final_result_text[len(raw_output):]
-            if missing:
-                raw_output += missing
-        elif not raw_output:
-            raw_output = final_result_text
-
-    output = raw_output.strip()
-
     if timed_out:
         msg = "⏰ Request timed out."
         stream.set_text(msg)
         return msg
+
+    # Determine the output to use
+    # Prefer final_result_text from "result" event if available, otherwise use raw_output
+    output = (final_result_text or raw_output or "").strip()
 
     if not output:
         stderr_text = "".join(stderr_lines).strip()
@@ -1321,9 +1341,57 @@ def run_agent_ask_streaming(
         stream.set_text(msg)
         return msg
 
-    # Final display: just the clean response (same as /adapt ending with final answer)
-    stream.set_text(output)
-    return output
+    # Extract the final answer, removing any "thinking" preamble
+    # The agent often outputs thinking text first, then the actual answer
+    final_answer = output
+    
+    # Pattern 1: Look for "✅" marker in the output (agent sometimes uses this)
+    if "✅" in output:
+        parts = output.split("✅", 1)
+        if len(parts) > 1 and parts[1].strip():
+            final_answer = parts[1].strip()
+    # Pattern 2: If there are multiple paragraphs, filter out thinking preambles
+    elif "\n\n" in output:
+        paragraphs = [p.strip() for p in output.split("\n\n") if p.strip()]
+        # Indicators that a paragraph is "thinking" rather than the answer
+        thinking_indicators = [
+            "let me", "i'll", "i will", "counting", "looking at", 
+            "let's", "thinking", "checking", "analyzing", "let's see",
+            "let me count", "let's count", "the letters are"
+        ]
+        answer_paragraphs = []
+        for p in paragraphs:
+            p_lower = p.lower()
+            is_thinking = any(p_lower.startswith(ind) for ind in thinking_indicators)
+            if not is_thinking:
+                answer_paragraphs.append(p)
+        
+        if answer_paragraphs:
+            # Use the last non-thinking paragraph(s)
+            final_answer = "\n\n".join(answer_paragraphs)
+        elif paragraphs:
+            # If all paragraphs look like thinking, just use the last one
+            final_answer = paragraphs[-1]
+    # Pattern 3: Single paragraph but with a clear answer marker
+    else:
+        # Look for sentences that start with answer indicators
+        sentences = re.split(r'(?<=[.!?])\s+', output)
+        if len(sentences) > 1:
+            answer_indicators = ["there are", "there is", "the answer", "it is", "it's", "yes", "no"]
+            for i, s in enumerate(sentences):
+                s_lower = s.lower()
+                if any(s_lower.startswith(ind) for ind in answer_indicators):
+                    # Found an answer sentence, use from here to end
+                    final_answer = " ".join(sentences[i:])
+                    break
+    
+    # Clean up the final answer
+    final_answer = final_answer.strip()
+    
+    # Final display: just the clean response with checkmark
+    final_msg = f"✅ {final_answer}"
+    stream.set_text(final_msg)
+    return final_answer
 
 
 @bot.message_handler(func=lambda message: True)
@@ -1397,7 +1465,6 @@ Please respond to the user's message above, considering the full context of our 
         append_chat_history("assistant", error_msg)
     finally:
         typing_stop.set()
-        logger.info("=== MESSAGE HANDLING COMPLETE ===")
         logger.info("=== MESSAGE HANDLING COMPLETE ===")
 
 def main():
