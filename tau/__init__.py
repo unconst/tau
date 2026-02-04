@@ -1067,15 +1067,28 @@ def run_agent_ask_streaming(
     current_tool: str | None = None
     last_thinking_snippet: str = ""
     
+    # Cycling status messages for interactive feel
+    thinking_phases = [
+        "🤔 Thinking...",
+        "📚 Reading context...",
+        "🔍 Analyzing...",
+        "💭 Processing...",
+        "🧠 Reasoning...",
+        "✨ Forming response...",
+    ]
+    
     def build_display():
         """Build the display message showing current thinking and actions.
         
         Uses same structure as /adapt:
-        - 🤔 Thinking...
+        - 🤔 Thinking... (cycles through phases)
         - 💭 {thinking snippet}
         - {tool actions}
         """
-        lines = ["🤔 Thinking...\n"]
+        # Cycle through phases every 2 seconds
+        elapsed = time.time() - start_time
+        phase_idx = int(elapsed / 2) % len(thinking_phases)
+        lines = [thinking_phases[phase_idx] + "\n"]
         
         # Show current thinking or the last complete snippet
         display_thinking = ""
@@ -1367,7 +1380,8 @@ def _extract_final_answer(output: str) -> str:
         r"^let me\b", r"^i'll\b", r"^i will\b", r"^counting\b", r"^looking at\b",
         r"^let's\b", r"^thinking\b", r"^checking\b", r"^analyzing\b", r"^first,?\b",
         r"^to answer\b", r"^the letters\b", r"^i can see\b", r"^i've\b", r"^i have\b",
-        r"^\d+\.\s+\*\*", r"^here'?s?\b", r"^based on\b"
+        r"^\d+\.\s+\*\*", r"^here'?s?\b", r"^based on\b", r"^now\b", r"^okay\b",
+        r"^i understand\b", r"^i see\b", r"^looked at\b", r"^found\b"
     ]
     
     # Patterns that indicate closing filler to remove
@@ -1377,6 +1391,8 @@ def _extract_final_answer(output: str) -> str:
         r"\s*feel free to ask.*$",
         r"\s*would you like.*\??\s*$",
         r"\s*anything else.*\??\s*$",
+        r"\s*how can i help you today\??\s*$",
+        r"\s*how can i assist you further\??\s*$",
     ]
     
     # Split into paragraphs
@@ -1425,7 +1441,10 @@ def _extract_final_answer(output: str) -> str:
     # Remove markdown code fence artifacts that might have bled through
     final = re.sub(r'^```[\s\S]*?```\s*', '', final).strip()
     # Remove leftover checkmarks or emojis at start
-    final = re.sub(r'^[✅🤔💭]\s*', '', final).strip()
+    final = re.sub(r'^[✅🤔💭🫡✅]\s*', '', final).strip()
+    # Remove fragments like "` and identifies..." or "3. Preventing..."
+    final = re.sub(r'^`?\s*and identifies.*?\.\s*', '', final, flags=re.IGNORECASE | re.DOTALL).strip()
+    final = re.sub(r'^\d+\.\s+Preventing Duplication.*?\.\s*', '', final, flags=re.IGNORECASE | re.DOTALL).strip()
     
     return final if final else output
 
