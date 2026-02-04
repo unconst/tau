@@ -466,6 +466,248 @@ def restart_bot(message):
         # Fallback to direct exec restart
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
+def run_adapt_streaming(
+    prompt: str,
+    *,
+    chat_id: int,
+    reply_to_message_id: int | None = None,
+    timeout_seconds: int = 3600,
+) -> str:
+    """Run the agent CLI for adaptation and stream thinking/progress to Telegram."""
+    stream = TelegramStreamingMessage(
+        chat_id,
+        reply_to_message_id=reply_to_message_id,
+        initial_text="🫡 Starting...",
+        min_edit_interval_seconds=2.0,  # Slower edits for adapt (less frequent updates)
+        min_chars_delta=30,  # Require more change before editing
+    )
+
+    cmd = [
+        "agent",
+        "--force",
+        "--model",
+        "opus-4.5",
+        "--output-format",
+        "stream-json",
+        "--stream-partial-output",
+        "--print",
+        prompt,
+    ]
+
+    start_time = time.time()
+    thinking_updates: list[str] = []
+    final_result_text: str | None = None
+    stderr_lines: list[str] = []
+    current_tool: str | None = None
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            cwd=WORKSPACE,
+            bufsize=1,
+            start_new_session=True,
+        )
+        processes.track(
+            proc,
+            label=f"agent:adapt:{chat_id}",
+            cmd=cmd,
+            own_process_group=True,
+        )
+    except Exception as e:
+        err = f"Error: {str(e)}"
+        stream.set_text(err)
+        return err
+
+    sentinel = object()
+    q: queue.Queue[object] = queue.Queue()
+
+    def _stdout_reader():
+        try:
+            if proc.stdout is None:
+                return
+            for line in proc.stdout:
+                q.put(line)
+        finally:
+            q.put(sentinel)
+
+    reader_thread = threading.Thread(
+        target=_stdout_reader,
+        daemon=True,
+        name="AgentAdaptStreamReader",
+    )
+    reader_thread.start()
+
+    def _stderr_reader():
+        try:
+            if proc.stderr is None:
+                return
+            for line in proc.stderr:
+                stderr_lines.append(line)
+        except Exception:
+            pass
+
+    stderr_thread = threading.Thread(
+        target=_stderr_reader,
+        daemon=True,
+        name="AgentAdaptStderrReader",
+    )
+    stderr_thread.start()
+
+    timed_out = False
+
+    try:
+        while True:
+            if time.time() - start_time > timeout_seconds:
+                timed_out = True
+                try:
+                    import signal as _signal
+                    os.killpg(proc.pid, _signal.SIGTERM)
+                except Exception:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        import signal as _signal
+                        os.killpg(proc.pid, _signal.SIGKILL)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                break
+
+            try:
+                item = q.get(timeout=0.25)
+            except queue.Empty:
+                item = None
+
+            if item is sentinel:
+                break
+
+            if isinstance(item, str) and item:
+                line = item.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    continue
+                
+                event_type = event.get("type")
+                
+                # Handle tool use events - show what the agent is doing
+                if event_type == "tool_use":
+                    tool_name = event.get("name", "tool")
+                    tool_input = event.get("input", {})
+                    current_tool = tool_name
+                    
+                    # Create a brief description of what's happening
+                    if tool_name == "Read":
+                        path = tool_input.get("path", "")
+                        filename = os.path.basename(path) if path else "file"
+                        update = f"📖 Reading {filename}..."
+                    elif tool_name == "Write":
+                        path = tool_input.get("path", "")
+                        filename = os.path.basename(path) if path else "file"
+                        update = f"✍️ Writing {filename}..."
+                    elif tool_name == "StrReplace":
+                        path = tool_input.get("path", "")
+                        filename = os.path.basename(path) if path else "file"
+                        update = f"🔧 Editing {filename}..."
+                    elif tool_name == "Shell":
+                        cmd_str = tool_input.get("command", "")[:30]
+                        update = f"💻 Running: {cmd_str}..."
+                    elif tool_name == "Grep":
+                        pattern = tool_input.get("pattern", "")[:20]
+                        update = f"🔍 Searching: {pattern}..."
+                    elif tool_name == "Glob":
+                        pattern = tool_input.get("glob_pattern", "")[:20]
+                        update = f"📁 Finding: {pattern}..."
+                    elif tool_name == "SemanticSearch":
+                        query = tool_input.get("query", "")[:30]
+                        update = f"🧠 Searching: {query}..."
+                    else:
+                        update = f"🔧 {tool_name}..."
+                    
+                    thinking_updates.append(update)
+                    # Show the last few updates
+                    display = "🫡 Adapting...\n\n" + "\n".join(thinking_updates[-5:])
+                    stream.set_text(display)
+                
+                # Handle tool result events
+                elif event_type == "tool_result":
+                    if current_tool:
+                        # Mark the tool as done
+                        if thinking_updates:
+                            thinking_updates[-1] = thinking_updates[-1].replace("...", " ✓")
+                            display = "🫡 Adapting...\n\n" + "\n".join(thinking_updates[-5:])
+                            stream.set_text(display)
+                        current_tool = None
+                
+                # Handle assistant text output (thinking/explanation)
+                elif event_type == "assistant":
+                    msg = event.get("message") or {}
+                    content = msg.get("content") or []
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            text = part.get("text", "")
+                            if text and len(text) > 20:
+                                # This might be a summary or explanation
+                                final_result_text = text
+                
+                elif event_type == "result":
+                    res = event.get("result")
+                    if isinstance(res, str):
+                        final_result_text = res
+
+            if proc.poll() is not None and q.empty():
+                continue
+    finally:
+        stream.finalize()
+        processes.untrack(proc)
+
+    if processes.pop_cancelled(proc.pid):
+        msg = "❌ Cancelled."
+        stream.set_text(msg)
+        return msg
+
+    if timed_out:
+        msg = "⏰ Adaptation timed out."
+        stream.set_text(msg)
+        return msg
+
+    # Build final summary
+    if final_result_text:
+        # Truncate to reasonable length
+        summary = final_result_text.strip()
+        if len(summary) > 500:
+            # Find a good cut point
+            cut = summary[:500].rfind('. ')
+            if cut > 200:
+                summary = summary[:cut+1]
+            else:
+                summary = summary[:497] + "..."
+        final_msg = f"✅ Done\n\n{summary}"
+    else:
+        # Use the tool operations as summary
+        ops = [u.replace("...", "").replace(" ✓", "") for u in thinking_updates]
+        if ops:
+            final_msg = "✅ Done\n\n" + "\n".join(ops[-8:])
+        else:
+            final_msg = "✅ Done"
+    
+    stream.set_text(final_msg)
+    return final_result_text or "Adaptation complete"
+
+
 @bot.message_handler(commands=['adapt'])
 def adapt_bot(message):
     """Self-modify the bot using cursor agent, then restart."""
@@ -481,56 +723,20 @@ def adapt_bot(message):
     append_chat_history("user", f"/adapt {prompt}")
     save_chat_id(message.chat.id)
     
-    # Acknowledge with single emoji
-    bot.reply_to(message, "🫡")
-    append_chat_history("assistant", "🫡")
-    
     try:
-        cmd = [
-            "agent",
-            "--force",
-            "--model",
-            "opus-4.5",
-            "--output-format=text",
-            "--print",
+        # Run adaptation with streaming progress
+        result = run_adapt_streaming(
             prompt,
-        ]
-
-        proc = None
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                stdin=subprocess.DEVNULL,  # Prevent agent from waiting for input
-                cwd=WORKSPACE,
-                start_new_session=True,
-            )
-            processes.track(proc, label="agent:adapt", cmd=cmd, own_process_group=True)
-            proc.communicate(timeout=3600)  # 1 hour timeout for code changes
-        except subprocess.TimeoutExpired:
-            # Ensure we stop the process group before bubbling up the timeout.
-            try:
-                processes.terminate_all(label_prefix="agent:adapt", timeout_seconds=1.0)
-            except Exception:
-                pass
-            raise
-        finally:
-            processes.untrack(proc)
-
-        if proc is not None and processes.pop_cancelled(proc.pid):
-            msg = "Cancelled."
-            bot.reply_to(message, msg)
-            append_chat_history("assistant", msg)
-            return
+            chat_id=message.chat.id,
+            reply_to_message_id=message.message_id,
+            timeout_seconds=3600,  # 1 hour timeout
+        )
+        
+        append_chat_history("assistant", f"✅ Adaptation complete: {result[:200]}")
         
         # Commit any changes made by the agent
         git_commit_changes(prompt)
         
-        # Just checkmark when done
-        bot.reply_to(message, "✅")
-        append_chat_history("assistant", "✅")
         bot.stop_polling()
         
         # Try supervisor restart first
@@ -539,10 +745,6 @@ def adapt_bot(message):
         else:
             os.execv(sys.executable, [sys.executable] + sys.argv)
         
-    except subprocess.TimeoutExpired:
-        error_msg = "Adaptation timed out."
-        bot.reply_to(message, error_msg)
-        append_chat_history("assistant", error_msg)
     except Exception as e:
         error_msg = f"Adaptation error: {str(e)}"
         bot.reply_to(message, error_msg)
