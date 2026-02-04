@@ -990,14 +990,30 @@ Please respond to the user's message above, considering the full context of our 
         
         # Process transcribed text as normal message
         try:
-            response = run_agent_ask_streaming(
-                prompt_with_context,
-                chat_id=message.chat.id,
-                existing_message_id=processing_msg.message_id,
-                initial_text="🎤 Thinking...",
-                model="gemini-3-flash",
-                timeout_seconds=600,
-            )
+            backend = (os.getenv("TAU_CHAT_BACKEND") or "auto").strip().lower()
+            openai_model = os.getenv("TAU_OPENAI_CHAT_MODEL", "gpt-4o-mini")
+            cursor_model = os.getenv("TAU_CURSOR_CHAT_MODEL", "gemini-3-flash")
+            use_openai = backend in ("openai", "oa") or (backend == "auto" and openai_client is not None)
+
+            if use_openai:
+                response = run_openai_chat_streaming(
+                    prompt_with_context,
+                    chat_id=message.chat.id,
+                    existing_message_id=processing_msg.message_id,
+                    initial_text="🎤 Thinking...",
+                    model=openai_model,
+                    timeout_seconds=60,
+                    max_tokens=500,
+                )
+            else:
+                response = run_agent_ask_streaming(
+                    prompt_with_context,
+                    chat_id=message.chat.id,
+                    existing_message_id=processing_msg.message_id,
+                    initial_text="🎤 Thinking...",
+                    model=cursor_model,
+                    timeout_seconds=600,
+                )
             append_chat_history("assistant", response)
         finally:
             # Stop typing indicator
@@ -1397,6 +1413,83 @@ def run_agent_ask_streaming(
     return final_answer
 
 
+def run_openai_chat_streaming(
+    user_prompt: str,
+    *,
+    chat_id: int,
+    reply_to_message_id: int | None = None,
+    existing_message_id: int | None = None,
+    initial_text: str = "🤔 Thinking...",
+    model: str = "gpt-4o-mini",
+    timeout_seconds: int = 45,
+    max_tokens: int = 400,
+    temperature: float = 0.2,
+) -> str:
+    """Stream a fast OpenAI chat completion into Telegram."""
+    stream = TelegramStreamingMessage(
+        chat_id,
+        reply_to_message_id=reply_to_message_id,
+        existing_message_id=existing_message_id,
+        initial_text=initial_text,
+        min_edit_interval_seconds=0.9,
+        min_chars_delta=20,
+    )
+
+    if not openai_client:
+        msg = "⚠️ OPENAI_API_KEY not set, fast chat unavailable."
+        stream.set_text(msg)
+        return msg
+
+    start_time = time.time()
+    parts: list[str] = []
+
+    try:
+        resp = openai_client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Tau, a helpful assistant. "
+                        "Answer the user directly and concisely. "
+                        "No preamble. No tool logs. No hidden reasoning."
+                    ),
+                },
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
+            timeout=timeout_seconds,
+        )
+
+        for chunk in resp:
+            if time.time() - start_time > timeout_seconds:
+                raise TimeoutError("OpenAI request timed out")
+
+            delta = None
+            try:
+                delta = chunk.choices[0].delta.content  # type: ignore[attr-defined]
+            except Exception:
+                delta = None
+
+            if delta:
+                parts.append(delta)
+                stream.append(delta)
+
+        stream.finalize()
+        final = "".join(parts).strip()
+        if not final:
+            final = "No response."
+            stream.set_text(final)
+        return final
+
+    except Exception as e:
+        msg = f"Error: {str(e)}"
+        stream.set_text(msg)
+        return msg
+
+
 def _extract_final_answer(output: str) -> str:
     """Extract just the final answer from agent output, removing thinking text.
     
@@ -1509,6 +1602,20 @@ def handle_message(message):
     chat_lines = chat_history.strip().split('\n')
     recent_chat = '\n'.join(chat_lines[-20:]) if len(chat_lines) > 20 else chat_history
     
+    # Backend + model selection:
+    # - default is "auto": use OpenAI if OPENAI_API_KEY is available, else Cursor agent
+    backend = (os.getenv("TAU_CHAT_BACKEND") or "auto").strip().lower()
+    openai_model = os.getenv("TAU_OPENAI_CHAT_MODEL", "gpt-4o-mini")
+    cursor_model = os.getenv("TAU_CURSOR_CHAT_MODEL", "gemini-3-flash")
+    use_openai = backend in ("openai", "oa") or (backend == "auto" and openai_client is not None)
+
+    # OpenAI prompt: keep it small for speed
+    openai_prompt = f"""RECENT CONTEXT (for continuity):
+{recent_chat}
+
+USER: {message.text}"""
+
+    # Cursor agent prompt (kept as-is)
     prompt_with_context = f"""You are Tau, a helpful assistant. Answer the user's question directly and concisely.
 
 RECENT CONTEXT (for continuity):
@@ -1524,6 +1631,10 @@ INSTRUCTIONS:
 - If the question is simple (like factual questions), give a short direct answer"""
     
     logger.info(f"Total prompt size: {len(prompt_with_context)} chars")
+    if use_openai:
+        logger.info(f"Using OpenAI fast chat model={openai_model}")
+    else:
+        logger.info(f"Using Cursor agent model={cursor_model}")
     
     # Start typing indicator in background
     typing_stop = threading.Event()
@@ -1535,31 +1646,42 @@ INSTRUCTIONS:
     typing_thread.start()
     
     start_time = datetime.now()
-    logger.info("Calling agent CLI...")
+    logger.info("Generating response...")
     
     try:
-        response = run_agent_ask_streaming(
-            prompt_with_context,
-            chat_id=message.chat.id,
-            reply_to_message_id=message.message_id,
-            initial_text="🤔 Thinking...",
-            model="gemini-3-flash",
-            timeout_seconds=300,
-        )
+        if use_openai:
+            response = run_openai_chat_streaming(
+                openai_prompt,
+                chat_id=message.chat.id,
+                reply_to_message_id=message.message_id,
+                initial_text="🤔 Thinking...",
+                model=openai_model,
+                timeout_seconds=45,
+                max_tokens=400,
+            )
+        else:
+            response = run_agent_ask_streaming(
+                prompt_with_context,
+                chat_id=message.chat.id,
+                reply_to_message_id=message.message_id,
+                initial_text="🤔 Thinking...",
+                model=cursor_model,
+                timeout_seconds=300,
+            )
         elapsed = (datetime.now() - start_time).total_seconds()
-        logger.info(f"Agent completed in {elapsed:.1f}s (streamed)")
+        logger.info(f"Response completed in {elapsed:.1f}s (streamed)")
         append_chat_history("assistant", response)
         logger.info("Response streamed to Telegram")
         
     except subprocess.TimeoutExpired:
         elapsed = (datetime.now() - start_time).total_seconds()
-        logger.error(f"Agent TIMEOUT after {elapsed:.1f}s")
+        logger.error(f"Response TIMEOUT after {elapsed:.1f}s")
         error_msg = "Request timed out."
         bot.reply_to(message, error_msg)
         append_chat_history("assistant", error_msg)
     except Exception as e:
         elapsed = (datetime.now() - start_time).total_seconds()
-        logger.error(f"Agent ERROR after {elapsed:.1f}s: {str(e)}")
+        logger.error(f"Response ERROR after {elapsed:.1f}s: {str(e)}")
         error_msg = f"Error: {str(e)}"
         bot.reply_to(message, error_msg)
         append_chat_history("assistant", error_msg)
