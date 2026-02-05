@@ -4,13 +4,25 @@ import os
 import re
 import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from .telegram import think as _think_impl, notify, get_chat_history
 from . import processes
 
 WORKSPACE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Memory tier paths
+ARCHIVE_DIR = os.path.join(WORKSPACE, "context", "archive")
+CORE_MEMORY_FILE = os.path.join(WORKSPACE, "context", "memory", "CORE_MEMORY.md")
+MID_TERM_FILE = os.path.join(WORKSPACE, "context", "memory", "MID_TERM.md")
+SUMMARY_VERSIONS_DIR = os.path.join(WORKSPACE, "context", "summaries")
+
+# Memory configuration
+MAX_ACTIVE_MEMORY_ENTRIES = 50
+ARCHIVE_AGE_DAYS = 90
+SHORT_TERM_DAYS = 7
+MID_TERM_DAYS = 30
 
 # Debug mode flag - controlled by __init__.py
 _debug_mode = False
@@ -29,6 +41,7 @@ MEMORY_FILE = os.path.join(WORKSPACE, "context", "tasks", "memory.md")
 IDENTITY_FILE = os.path.join(WORKSPACE, "context", "IDENTITY.md")
 MEMORY_SYSTEM_FILE = os.path.join(WORKSPACE, "context", "MEMORY-SYSTEM.md")
 CHAT_HISTORY_FILE = os.path.join(WORKSPACE, "context", "CHAT.md")
+CHAT_SUMMARY_FILE = os.path.join(WORKSPACE, "context", "CHAT_SUMMARY.md")
 
 # Ensure tasks directory exists
 os.makedirs(TASKS_DIR, exist_ok=True)
@@ -41,13 +54,22 @@ PROMPT_TEMPLATE = """You are Tau, a single-threaded autonomous agent.
 
 ---
 
+CORE MEMORY (persistent facts - rarely changes):
+{core_memory}
+
+MID-TERM MEMORY (recent weeks - compressed summaries):
+{mid_term_memory}
+
+CONVERSATION SUMMARY (auto-updated hourly - short-term):
+{chat_summary}
+
 TELEGRAM CHAT (recent):
 {chat_history}
 
 INCOMPLETE TASKS:
 {tasks}
 
-HIGH-LEVEL MEMORY (recent):
+HIGH-LEVEL MEMORY (recent activity):
 {high_level_memory}
 
 CURRENT TASK MEMORY (recent):
@@ -82,6 +104,10 @@ TOOLS:
     - python -m tau.tools.search_skills "image"            # Search for image skills
     - python -m tau.tools.search_skills --category video   # Filter by category (image, video, audio, social, utility)
     - python -m tau.tools.search_skills --details flux     # Get detailed info about a specific skill
+- create_task: source .venv/bin/activate && python -m tau.tools.create_task "Title" "Description"
+  (Create a task for yourself to process later)
+- schedule_message: source .venv/bin/activate && python -m tau.tools.schedule_message --in "2h" "message"
+  (Schedule a future message: --at "14:00", --in "2h", --cron "0 9 * * *")
 """
 
 def read_file(path: str) -> str:
@@ -89,6 +115,338 @@ def read_file(path: str) -> str:
     if os.path.exists(path):
         return open(path).read()
     return ""
+
+
+def compress_high_level_memory():
+    """Archive old entries and keep only recent active memory.
+    
+    - Archives entries older than ARCHIVE_AGE_DAYS
+    - Keeps only MAX_ACTIVE_MEMORY_ENTRIES most recent entries
+    """
+    if not os.path.exists(MEMORY_FILE):
+        return
+    
+    os.makedirs(ARCHIVE_DIR, exist_ok=True)
+    content = read_file(MEMORY_FILE)
+    
+    if not content.strip():
+        return
+    
+    cutoff_date = datetime.now() - timedelta(days=ARCHIVE_AGE_DAYS)
+    archive_entries = []
+    active_entries = []
+    
+    # Parse entries (format: ### YYYY-MM-DD HH:MM\ncontent)
+    current_entry = []
+    entry_date = None
+    
+    for line in content.split("\n"):
+        if line.startswith("### "):
+            if current_entry and entry_date:
+                if entry_date < cutoff_date:
+                    archive_entries.append("\n".join(current_entry))
+                else:
+                    active_entries.append("\n".join(current_entry))
+            current_entry = [line]
+            try:
+                date_str = line[4:].strip()[:16]  # "YYYY-MM-DD HH:MM"
+                entry_date = datetime.strptime(date_str, "%Y-%m-%d %H:%M")
+            except (ValueError, IndexError):
+                entry_date = datetime.now()
+        elif current_entry:
+            current_entry.append(line)
+        # Skip header lines before first entry
+    
+    # Handle last entry
+    if current_entry and entry_date:
+        if entry_date < cutoff_date:
+            archive_entries.append("\n".join(current_entry))
+        else:
+            active_entries.append("\n".join(current_entry))
+    
+    # Archive old entries
+    if archive_entries:
+        archive_file = os.path.join(ARCHIVE_DIR, f"memory_{datetime.now().strftime('%Y%m')}.md")
+        with open(archive_file, "a") as f:
+            f.write("\n\n".join(archive_entries) + "\n")
+        think(f"archived {len(archive_entries)} old memory entries")
+    
+    # Keep only last MAX_ACTIVE_MEMORY_ENTRIES
+    if len(active_entries) > MAX_ACTIVE_MEMORY_ENTRIES:
+        excess = len(active_entries) - MAX_ACTIVE_MEMORY_ENTRIES
+        # Archive excess entries (oldest first)
+        excess_entries = active_entries[:excess]
+        active_entries = active_entries[excess:]
+        
+        archive_file = os.path.join(ARCHIVE_DIR, f"memory_{datetime.now().strftime('%Y%m')}.md")
+        with open(archive_file, "a") as f:
+            f.write("\n\n".join(excess_entries) + "\n")
+        think(f"archived {excess} excess memory entries (keeping {MAX_ACTIVE_MEMORY_ENTRIES})")
+    
+    # Rewrite active memory
+    with open(MEMORY_FILE, "w") as f:
+        f.write("# Memory\n\n<!-- High-level summaries only. Detailed memory is in context/tasks/*/memory.md -->\n")
+        if active_entries:
+            f.write("\n" + "\n\n".join(active_entries))
+
+
+def detect_and_archive_stale_entries():
+    """Detect memory entries that haven't been referenced recently and archive them.
+    
+    Entries older than 30 days that aren't referenced in recent chat are considered stale.
+    """
+    if not os.path.exists(MEMORY_FILE):
+        return
+    
+    content = read_file(MEMORY_FILE)
+    if not content.strip():
+        return
+    
+    # Get recent chat for reference checking
+    recent_chat = get_chat_history(max_lines=500).lower()
+    
+    stale_cutoff = datetime.now() - timedelta(days=30)
+    stale_entries = []
+    active_entries = []
+    
+    current_entry = []
+    entry_date = None
+    entry_content = ""
+    
+    for line in content.split("\n"):
+        if line.startswith("### "):
+            if current_entry:
+                # Check if entry is stale
+                age_days = (datetime.now() - entry_date).days if entry_date else 0
+                
+                # Extract keywords from entry content for reference checking
+                words = entry_content.lower().split()[:15]  # First 15 words
+                is_referenced = any(
+                    len(word) > 4 and word in recent_chat
+                    for word in words
+                    if word.isalnum()
+                )
+                
+                if age_days > 30 and not is_referenced:
+                    stale_entries.append("\n".join(current_entry))
+                else:
+                    active_entries.append("\n".join(current_entry))
+            
+            current_entry = [line]
+            try:
+                date_str = line[4:].strip()[:16]
+                entry_date = datetime.strptime(date_str, "%Y-%m-%d %H:%M")
+            except (ValueError, IndexError):
+                entry_date = datetime.now()
+            entry_content = ""
+        elif current_entry:
+            current_entry.append(line)
+            entry_content += line + " "
+    
+    # Handle last entry
+    if current_entry:
+        active_entries.append("\n".join(current_entry))
+    
+    # Archive stale entries
+    if stale_entries:
+        os.makedirs(ARCHIVE_DIR, exist_ok=True)
+        archive_file = os.path.join(ARCHIVE_DIR, f"stale_{datetime.now().strftime('%Y%m%d')}.md")
+        with open(archive_file, "w") as f:
+            f.write("# Archived Stale Entries\n\n")
+            f.write("\n\n".join(stale_entries))
+        
+        # Rewrite active memory
+        with open(MEMORY_FILE, "w") as f:
+            f.write("# Memory\n\n<!-- High-level summaries only. Detailed memory is in context/tasks/*/memory.md -->\n")
+            if active_entries:
+                f.write("\n" + "\n\n".join(active_entries))
+        
+        think(f"archived {len(stale_entries)} stale memory entries")
+
+
+def compress_summary_content(content: str, target_ratio: float = 0.5) -> str:
+    """Compress a summary to target ratio of original size using the agent."""
+    target_chars = int(len(content) * target_ratio)
+    
+    compress_prompt = f"""Compress this summary to approximately {target_chars} characters.
+Keep only the most important information.
+
+Original:
+{content}
+
+Output ONLY the compressed summary, no preamble."""
+
+    cmd = [
+        "agent",
+        "--force",
+        "--model",
+        "composer-1",
+        "--mode=ask",
+        "--output-format=text",
+        "--print",
+        compress_prompt,
+    ]
+
+    try:
+        from . import processes
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            cwd=WORKSPACE,
+            start_new_session=True,
+        )
+        processes.track(proc, label="agent:compress", cmd=cmd, own_process_group=True)
+        stdout, stderr = proc.communicate(timeout=120)
+        processes.untrack(proc)
+        result = stdout.strip() if stdout.strip() else stderr.strip()
+        return result[:target_chars + 100]  # Allow slight overage
+    except Exception:
+        return content[:target_chars]  # Fallback to truncation
+
+
+def extract_core_facts(summary_content: str) -> list[str]:
+    """Extract important facts that should be stored in core memory."""
+    extract_prompt = f"""Analyze this summary and extract ONLY persistent facts that are:
+1. User preferences or requirements
+2. Important decisions made
+3. Technical constraints discovered
+4. Recurring patterns
+
+Summary:
+{summary_content}
+
+Return a bullet list of core facts (each starting with "- "), or "NONE" if no new core facts.
+Be very selective - only truly persistent information that would be useful months later."""
+
+    cmd = [
+        "agent",
+        "--force",
+        "--model",
+        "composer-1",
+        "--mode=ask",
+        "--output-format=text",
+        "--print",
+        extract_prompt,
+    ]
+
+    try:
+        from . import processes
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            cwd=WORKSPACE,
+            start_new_session=True,
+        )
+        processes.track(proc, label="agent:extract_facts", cmd=cmd, own_process_group=True)
+        stdout, stderr = proc.communicate(timeout=120)
+        processes.untrack(proc)
+        
+        facts = stdout.strip() if stdout.strip() else stderr.strip()
+        if "NONE" in facts.upper() or not facts:
+            return []
+        
+        return [f.strip() for f in facts.split("\n") if f.strip().startswith("-")]
+    except Exception:
+        return []
+
+
+def migrate_summaries_to_tiers():
+    """Migrate old summaries through memory tiers.
+    
+    - Summaries older than MID_TERM_DAYS: Extract core facts, then archive
+    - Summaries older than SHORT_TERM_DAYS: Compress and move to mid-term
+    """
+    if not os.path.exists(SUMMARY_VERSIONS_DIR):
+        return
+    
+    versions = sorted(Path(SUMMARY_VERSIONS_DIR).glob("summary_*.md"))
+    
+    for version_file in versions:
+        # Parse timestamp from filename (format: summary_YYYYMMDD_HHMMSS.md)
+        timestamp_str = version_file.stem.replace("summary_", "")
+        try:
+            file_date = datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
+        except ValueError:
+            continue
+        
+        age_days = (datetime.now() - file_date).days
+        
+        if age_days > MID_TERM_DAYS:
+            # Extract core facts before archiving
+            content = version_file.read_text()
+            
+            # Extract just the summary part
+            if "## Summary" in content:
+                summary_part = content.split("## Summary", 1)[1].split("---")[0].strip()
+            else:
+                summary_part = content
+            
+            core_facts = extract_core_facts(summary_part)
+            
+            if core_facts:
+                os.makedirs(os.path.dirname(CORE_MEMORY_FILE), exist_ok=True)
+                with open(CORE_MEMORY_FILE, "a") as f:
+                    f.write(f"\n### Extracted {datetime.now().strftime('%Y-%m-%d')}\n")
+                    f.write("\n".join(core_facts) + "\n")
+                think(f"extracted {len(core_facts)} core facts from old summary")
+            
+            # Archive the summary
+            os.makedirs(ARCHIVE_DIR, exist_ok=True)
+            archive_file = os.path.join(ARCHIVE_DIR, f"summaries_{file_date.strftime('%Y%m')}.md")
+            with open(archive_file, "a") as f:
+                f.write(f"\n---\n{content}\n")
+            
+            version_file.unlink()
+            think(f"archived summary from {file_date.strftime('%Y-%m-%d')}")
+        
+        elif age_days > SHORT_TERM_DAYS:
+            # Compress and move to mid-term
+            content = version_file.read_text()
+            
+            # Extract just the summary part
+            if "## Summary" in content:
+                summary_part = content.split("## Summary", 1)[1].split("---")[0].strip()
+            else:
+                summary_part = content
+            
+            if len(summary_part) > 200:
+                compressed = compress_summary_content(summary_part)
+            else:
+                compressed = summary_part
+            
+            os.makedirs(os.path.dirname(MID_TERM_FILE), exist_ok=True)
+            with open(MID_TERM_FILE, "a") as f:
+                f.write(f"\n### {file_date.strftime('%Y-%m-%d')}\n{compressed}\n")
+            
+            think(f"migrated summary from {file_date.strftime('%Y-%m-%d')} to mid-term")
+
+
+def run_memory_maintenance():
+    """Run all memory maintenance tasks.
+    
+    Called once at startup and then daily by the maintenance loop.
+    """
+    try:
+        think("running memory maintenance...")
+        
+        # 1. Compress high-level memory
+        compress_high_level_memory()
+        
+        # 2. Migrate summaries through tiers
+        migrate_summaries_to_tiers()
+        
+        # 3. Detect and archive stale entries
+        detect_and_archive_stale_entries()
+        
+        think("memory maintenance complete")
+    except Exception as e:
+        think(f"memory maintenance error: {str(e)[:40]}")
 
 
 def tail(content: str, n: int = 50) -> str:
@@ -277,7 +635,7 @@ def run_cursor(prompt: str) -> str:
             start_new_session=True,
         )
         processes.track(proc, label="agent:loop", cmd=cmd, own_process_group=True)
-        stdout, stderr = proc.communicate(timeout=600)
+        stdout, stderr = proc.communicate(timeout=86400)  # 24 hours
     except subprocess.TimeoutExpired:
         # Kill the whole process group (agent can spawn children).
         try:
@@ -304,7 +662,7 @@ def run_cursor(prompt: str) -> str:
                         proc.kill()
                 except Exception:
                     pass
-        return "Error: Agent timed out after 10 minutes"
+        return "Error: Agent timed out after 24 hours"
     except Exception as e:
         return f"Error: {str(e)}"
     finally:
@@ -557,10 +915,18 @@ def run_loop(stop_event=None):
                     # Read high-level memory
                     high_level_memory_content = read_file(MEMORY_FILE)
                     
+                    # Read tiered memory
+                    core_memory_content = read_file(CORE_MEMORY_FILE)
+                    mid_term_memory_content = read_file(MID_TERM_FILE)
+                    
                     # Read chat history
                     chat_history_content = get_chat_history()
                     # Show last 100 lines of chat history to keep prompt manageable
                     chat_history_tail = tail(chat_history_content, 100) if chat_history_content else "No chat history yet."
+                    
+                    # Read chat summary (hourly updated)
+                    chat_summary_content = read_file(CHAT_SUMMARY_FILE)
+                    chat_summary = chat_summary_content.strip() if chat_summary_content else "No summary available yet."
                     
                     # Read context files for injection
                     identity_content = read_file(IDENTITY_FILE)
@@ -573,6 +939,9 @@ def run_loop(stop_event=None):
                     prompt = PROMPT_TEMPLATE.format(
                         identity=identity_content.strip() if identity_content else "",
                         memory_rules=memory_system_content.strip() if memory_system_content else "",
+                        core_memory=tail(core_memory_content, 30) if core_memory_content.strip() else "No core memory yet.",
+                        mid_term_memory=tail(mid_term_memory_content, 20) if mid_term_memory_content.strip() else "No mid-term memory yet.",
+                        chat_summary=chat_summary,
                         chat_history=chat_history_tail,
                         tasks=tasks_text,
                         high_level_memory=tail(high_level_memory_content, 30),
