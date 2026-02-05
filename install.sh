@@ -49,6 +49,8 @@ if [ -t 1 ]; then
         HAS_UNICODE=true
     elif [ -n "$LC_CTYPE" ] && [[ "$LC_CTYPE" =~ [Uu][Tt][Ff]-?8 ]]; then
         HAS_UNICODE=true
+    elif [ -n "$LC_MESSAGES" ] && [[ "$LC_MESSAGES" =~ [Uu][Tt][Ff]-?8 ]]; then
+        HAS_UNICODE=true
     fi
 fi
 
@@ -82,6 +84,8 @@ QUIET=${TAU_QUIET:-0}
 FAST=${TAU_FAST:-0}
 DEBUG=${TAU_DEBUG:-0}
 REPO_URL="${TAU_REPO_URL:-https://github.com/unconst/tau.git}"
+SKIP_NET_CHECK=${TAU_SKIP_NET_CHECK:-0}
+ALLOW_RM_OUTSIDE_HOME=${TAU_ALLOW_RM_OUTSIDE_HOME:-0}
 
 # Force non-interactive if no TTY
 if [ "$HAS_TTY" = false ]; then
@@ -93,6 +97,8 @@ INSTANCE_ID=""
 RUNNING_FROM_REPO=false
 BOT_TOKEN=""
 CLEANUP_FILES=()  # Track files to clean up on failure
+LOCK_DIR=""
+LOCK_ACQUIRED=false
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Cleanup trap
@@ -102,6 +108,11 @@ cleanup() {
     local exit_code=$?
     # Restore cursor if hidden
     printf "\033[?25h" 2>/dev/null || true
+    # Release lock if acquired
+    if [ "$LOCK_ACQUIRED" = true ] && [ -n "$LOCK_DIR" ]; then
+        rm -f "$LOCK_DIR/pid" 2>/dev/null || true
+        rmdir "$LOCK_DIR" 2>/dev/null || true
+    fi
     # Remove temp files
     for f in "${CLEANUP_FILES[@]}"; do
         rm -f "$f" 2>/dev/null || true
@@ -185,13 +196,19 @@ spinner() {
     local i=0
     local interrupted=false
     
+    # Preserve existing traps so we can restore them
+    local prev_int_trap
+    local prev_term_trap
+    prev_int_trap=$(trap -p INT)
+    prev_term_trap=$(trap -p TERM)
+    
     # Signal handler to kill subprocess on Ctrl+C
     spinner_cleanup() {
         interrupted=true
         if kill -0 "$pid" 2>/dev/null; then
             kill -TERM "$pid" 2>/dev/null || true
             # Give it a moment to terminate gracefully
-            sleep 0.5
+            portable_sleep 0.5
             # Force kill if still running
             kill -9 "$pid" 2>/dev/null || true
         fi
@@ -228,8 +245,17 @@ spinner() {
     # Show cursor
     printf "\033[?25h" 2>/dev/null || true
     
-    # Restore default signal handling
-    trap - INT TERM
+    # Restore previous signal handling
+    if [ -n "$prev_int_trap" ]; then
+        eval "$prev_int_trap"
+    else
+        trap - INT
+    fi
+    if [ -n "$prev_term_trap" ]; then
+        eval "$prev_term_trap"
+    else
+        trap - TERM
+    fi
     
     # If interrupted, propagate the signal
     if [ "$interrupted" = true ]; then
@@ -301,6 +327,18 @@ safe_rm_dir() {
             ;;
     esac
     
+    # By default, refuse to remove anything outside HOME unless explicitly allowed
+    if [ "$ALLOW_RM_OUTSIDE_HOME" != "1" ]; then
+        case "$dir" in
+            "$HOME"/*) ;;
+            *)
+                err "safe_rm_dir: refusing to remove path outside HOME: $dir"
+                info "Set TAU_ALLOW_RM_OUTSIDE_HOME=1 to override"
+                return 1
+                ;;
+        esac
+    fi
+    
     # Ensure it's actually a directory
     if [ ! -d "$dir" ]; then
         debug "safe_rm_dir: not a directory or doesn't exist: $dir"
@@ -342,6 +380,11 @@ load_env_file() {
             ''|\#*) continue ;;
         esac
         
+        # Allow optional "export " prefix
+        if [[ "$line" == export\ * ]]; then
+            line="${line#export }"
+        fi
+        
         # Only process lines that look like KEY=VALUE
         # Key must be alphanumeric with underscores, starting with a letter
         if [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
@@ -349,10 +392,12 @@ load_env_file() {
             local key="${line%%=*}"
             local value="${line#*=}"
             
-            # Remove surrounding quotes if present
+            # Trim leading/trailing whitespace for unquoted values
+            # Keep quoted values as-is (strip surrounding quotes)
             case "$value" in
                 \"*\") value="${value:1:-1}" ;;
                 \'*\') value="${value:1:-1}" ;;
+                *) value="$(printf '%s' "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')" ;;
             esac
             
             # Export the variable
@@ -364,6 +409,45 @@ load_env_file() {
     done < "$env_file"
     
     return 0
+}
+
+# Acquire install lock to avoid concurrent installs
+acquire_lock() {
+    local lock_path="$1"
+    
+    if [ -z "$lock_path" ]; then
+        err "acquire_lock: empty lock path"
+        exit 1
+    fi
+    
+    if mkdir "$lock_path" 2>/dev/null; then
+        LOCK_DIR="$lock_path"
+        LOCK_ACQUIRED=true
+        echo "$$" > "$lock_path/pid" 2>/dev/null || true
+        debug "Lock acquired: $LOCK_DIR"
+        return 0
+    fi
+    
+    # Lock exists - check for stale lock
+    if [ -f "$lock_path/pid" ]; then
+        local old_pid
+        old_pid=$(cat "$lock_path/pid" 2>/dev/null)
+        if [ -n "$old_pid" ] && ! kill -0 "$old_pid" 2>/dev/null; then
+            warn "Stale lock detected, removing"
+            rmdir "$lock_path" 2>/dev/null || true
+            if mkdir "$lock_path" 2>/dev/null; then
+                LOCK_DIR="$lock_path"
+                LOCK_ACQUIRED=true
+                echo "$$" > "$lock_path/pid" 2>/dev/null || true
+                debug "Lock acquired after cleanup: $LOCK_DIR"
+                return 0
+            fi
+        fi
+    fi
+    
+    err "Another installation is already running"
+    info "If you're sure it's stale, remove: $lock_path"
+    exit 1
 }
 
 detect_os() {
@@ -406,6 +490,10 @@ detect_linux_distro() {
 # Check if we have network connectivity
 check_network() {
     debug "Checking network connectivity..."
+    if [ "$SKIP_NET_CHECK" = "1" ]; then
+        warn "Skipping network check (TAU_SKIP_NET_CHECK=1)"
+        return 0
+    fi
     # Try multiple endpoints in case one is blocked
     # Use retry for flaky connections
     if curl -sf --connect-timeout 5 --max-time 10 --retry 2 --retry-delay 1 "https://github.com" >/dev/null 2>&1; then
@@ -1643,6 +1731,7 @@ main() {
     done
     
     step_welcome
+    acquire_lock "$INSTALL_DIR/.install.lock"
     step_preflight
     step_dependencies
     step_clone

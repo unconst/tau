@@ -32,6 +32,15 @@ context/STORY.md
 tasks/memory.md
 tasks/*/memory.md
 
+# Agent instance context (runtime-generated)
+context/.chat_position
+context/CHAT_SUMMARY.md
+context/CONTEXT_MANAGEMENT_IMPROVEMENTS.md
+context/memory/
+context/plans/
+context/summaries/
+context/skills/*.md
+
 # Task-generated files (keep task.md, ignore everything else)
 tasks/*/*.md
 tasks/*/*.py
