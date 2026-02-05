@@ -420,6 +420,13 @@ acquire_lock() {
         exit 1
     fi
     
+    # Ensure parent directory exists before attempting lock
+    local lock_parent
+    lock_parent="$(dirname "$lock_path")"
+    if [ ! -d "$lock_parent" ]; then
+        mkdir -p "$lock_parent" 2>/dev/null || true
+    fi
+    
     if mkdir "$lock_path" 2>/dev/null; then
         LOCK_DIR="$lock_path"
         LOCK_ACQUIRED=true
@@ -434,7 +441,7 @@ acquire_lock() {
         old_pid=$(cat "$lock_path/pid" 2>/dev/null)
         if [ -n "$old_pid" ] && ! kill -0 "$old_pid" 2>/dev/null; then
             warn "Stale lock detected, removing"
-            rmdir "$lock_path" 2>/dev/null || true
+            rm -rf "$lock_path" 2>/dev/null || true
             if mkdir "$lock_path" 2>/dev/null; then
                 LOCK_DIR="$lock_path"
                 LOCK_ACQUIRED=true
@@ -442,6 +449,17 @@ acquire_lock() {
                 debug "Lock acquired after cleanup: $LOCK_DIR"
                 return 0
             fi
+        fi
+    else
+        # Lock dir exists but no pid file - stale lock from crash
+        warn "Stale lock detected (no pid file), removing"
+        rm -rf "$lock_path" 2>/dev/null || true
+        if mkdir "$lock_path" 2>/dev/null; then
+            LOCK_DIR="$lock_path"
+            LOCK_ACQUIRED=true
+            echo "$$" > "$lock_path/pid" 2>/dev/null || true
+            debug "Lock acquired after cleanup: $LOCK_DIR"
+            return 0
         fi
     fi
     
