@@ -7,17 +7,31 @@ import threading
 import tempfile
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from openai import OpenAI
 from .telegram import bot, save_chat_id, notify, WORKSPACE, append_chat_history, TelegramStreamingMessage
-from .agent import run_loop, TASKS_DIR, get_all_tasks, git_commit_changes, set_debug_mode
+from .agent import run_loop, TASKS_DIR, get_all_tasks, git_commit_changes, set_debug_mode, read_file, run_memory_maintenance
 from . import processes
 import re
 
 # Debug mode flag - controls verbose notifications
 DEBUG_MODE = False
+
+# Memory tier paths
+SUMMARY_VERSIONS_DIR = os.path.join(WORKSPACE, "context", "summaries")
+ARCHIVE_DIR = os.path.join(WORKSPACE, "context", "archive")
+CORE_MEMORY_FILE = os.path.join(WORKSPACE, "context", "memory", "CORE_MEMORY.md")
+MID_TERM_FILE = os.path.join(WORKSPACE, "context", "memory", "MID_TERM.md")
+LAST_CHAT_POSITION_FILE = os.path.join(WORKSPACE, "context", ".chat_position")
+
+# Memory configuration
+MAX_SUMMARY_VERSIONS = 5
+MAX_ACTIVE_MEMORY_ENTRIES = 50
+ARCHIVE_AGE_DAYS = 90
+SHORT_TERM_DAYS = 7
+MID_TERM_DAYS = 30
 
 # Storage for active cron jobs: list of {id, interval_seconds, prompt, next_run, chat_id}
 _cron_jobs = []
@@ -38,6 +52,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 MEMORY_FILE = os.path.join(WORKSPACE, "context", "tasks", "memory.md")
+CHAT_SUMMARY_FILE = os.path.join(WORKSPACE, "context", "CHAT_SUMMARY.md")
 
 # Event to signal agent loop to stop
 _stop_event = threading.Event()
@@ -121,6 +136,307 @@ def parse_interval(interval_str: str) -> int:
         return number * 60
 
 
+def save_summary_with_version(summary_content: str):
+    """Save summary with versioning for rollback capability."""
+    os.makedirs(SUMMARY_VERSIONS_DIR, exist_ok=True)
+    
+    # Save new version with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    version_file = os.path.join(SUMMARY_VERSIONS_DIR, f"summary_{timestamp}.md")
+    with open(version_file, "w") as f:
+        f.write(summary_content)
+    
+    # Update main summary file
+    with open(CHAT_SUMMARY_FILE, "w") as f:
+        f.write(summary_content)
+    
+    # Rotate old versions (keep only MAX_SUMMARY_VERSIONS)
+    versions = sorted(Path(SUMMARY_VERSIONS_DIR).glob("summary_*.md"))
+    for old_version in versions[:-MAX_SUMMARY_VERSIONS]:
+        old_version.unlink()
+    
+    logger.info(f"Summary version saved: {version_file}")
+
+
+def get_new_chat_since_last_summary() -> tuple[str, int]:
+    """Get chat history added since last summary generation.
+    
+    Returns:
+        Tuple of (new_chat_content, new_position)
+    """
+    from .telegram import CHAT_HISTORY_FILE
+    
+    last_pos = 0
+    if os.path.exists(LAST_CHAT_POSITION_FILE):
+        try:
+            with open(LAST_CHAT_POSITION_FILE) as f:
+                last_pos = int(f.read().strip())
+        except (ValueError, IOError):
+            pass
+    
+    if not os.path.exists(CHAT_HISTORY_FILE):
+        return "", 0
+    
+    with open(CHAT_HISTORY_FILE) as f:
+        full_chat = f.read()
+    
+    new_chat = full_chat[last_pos:]
+    return new_chat, len(full_chat)
+
+
+def save_chat_position(position: int):
+    """Save the current chat position for incremental updates."""
+    os.makedirs(os.path.dirname(LAST_CHAT_POSITION_FILE), exist_ok=True)
+    with open(LAST_CHAT_POSITION_FILE, "w") as f:
+        f.write(str(position))
+
+
+def generate_incremental_summary(old_summary: str, new_chat_delta: str) -> str:
+    """Generate summary incrementally, updating only changed parts."""
+    prompt = f"""Compare the existing summary with new chat history.
+Update the summary to incorporate new information.
+
+EXISTING SUMMARY:
+{old_summary}
+
+NEW CHAT HISTORY (since last update):
+{new_chat_delta}
+
+Rules:
+1. Preserve unchanged information
+2. Add new important information  
+3. Update information that has changed
+4. Remove outdated information
+5. Keep under 2000 characters
+6. Use bullet points for easy scanning
+
+Output ONLY the updated summary, no preamble or explanation."""
+
+    cmd = [
+        "agent",
+        "--force",
+        "--model",
+        "composer-1",
+        "--mode=ask",
+        "--output-format=text",
+        "--print",
+        prompt,
+    ]
+
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            cwd=WORKSPACE,
+            start_new_session=True,
+        )
+        processes.track(proc, label="agent:summary:incremental", cmd=cmd, own_process_group=True)
+        stdout, stderr = proc.communicate(timeout=300)
+        return stdout.strip() if stdout.strip() else stderr.strip()
+    except subprocess.TimeoutExpired:
+        try:
+            processes.terminate_all(label_prefix="agent:summary:incremental", timeout_seconds=1.0)
+        except Exception:
+            pass
+        return ""
+    finally:
+        if proc:
+            processes.untrack(proc)
+
+
+def run_summary_loop(stop_event=None):
+    """Background loop that summarizes chat history every hour.
+    
+    Uses incremental updates when possible to avoid full regeneration.
+    Saves versioned summaries for rollback capability.
+    """
+    SUMMARY_INTERVAL = 3600  # 1 hour
+    
+    while True:
+        if stop_event and stop_event.is_set():
+            break
+        
+        try:
+            # Get new chat since last summary
+            from .telegram import CHAT_HISTORY_FILE
+            if not os.path.exists(CHAT_HISTORY_FILE):
+                time.sleep(SUMMARY_INTERVAL)
+                continue
+            
+            new_chat, new_position = get_new_chat_since_last_summary()
+            
+            # Also get full chat for fallback
+            with open(CHAT_HISTORY_FILE) as f:
+                full_chat = f.read()
+            
+            if not full_chat.strip() or len(full_chat) < 500:
+                # Not enough history to summarize
+                time.sleep(SUMMARY_INTERVAL)
+                continue
+            
+            # Check if we have enough new content for incremental update
+            use_incremental = False
+            old_summary = ""
+            
+            if os.path.exists(CHAT_SUMMARY_FILE) and new_chat.strip() and len(new_chat) > 100:
+                # We have a previous summary and meaningful new content - use incremental
+                with open(CHAT_SUMMARY_FILE) as f:
+                    old_summary_file = f.read()
+                # Extract just the summary content (after "## Summary" header)
+                if "## Summary" in old_summary_file:
+                    old_summary = old_summary_file.split("## Summary", 1)[1].split("---")[0].strip()
+                    if old_summary:
+                        use_incremental = True
+                        logger.info(f"Using incremental summary update ({len(new_chat)} new chars)")
+            
+            if use_incremental:
+                # Incremental update
+                summary = generate_incremental_summary(old_summary, new_chat)
+            else:
+                # Full regeneration
+                logger.info("Running full chat summary regeneration...")
+                
+                summary_prompt = f"""You are Tau's memory system. Your job is to extract and summarize the important information from the conversation history below.
+
+FULL CHAT HISTORY:
+{full_chat}
+
+---
+
+Please create a concise summary that captures:
+1. Key topics discussed
+2. Important decisions made
+3. User preferences or requirements mentioned
+4. Ongoing tasks or projects
+5. Any commitments or promises made
+6. Technical context (e.g., what the user is working on)
+
+The summary should be:
+- Short enough to fit in an agent's context window (under 2000 characters)
+- Focused on actionable information that would help future interactions
+- Written in bullet points for easy scanning
+- Updated to reflect the current state (not historical play-by-play)
+
+Output ONLY the summary content, no preamble or explanation."""
+
+                cmd = [
+                    "agent",
+                    "--force",
+                    "--model",
+                    "composer-1",
+                    "--mode=ask",
+                    "--output-format=text",
+                    "--print",
+                    summary_prompt,
+                ]
+
+                proc = None
+                stdout = ""
+                stderr = ""
+                try:
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        stdin=subprocess.DEVNULL,
+                        cwd=WORKSPACE,
+                        start_new_session=True,
+                    )
+                    processes.track(
+                        proc,
+                        label="agent:summary",
+                        cmd=cmd,
+                        own_process_group=True,
+                    )
+                    stdout, stderr = proc.communicate(timeout=300)  # 5 minutes
+                except subprocess.TimeoutExpired:
+                    try:
+                        processes.terminate_all(label_prefix="agent:summary", timeout_seconds=1.0)
+                    except Exception:
+                        pass
+                    logger.error("Chat summary timed out")
+                    time.sleep(SUMMARY_INTERVAL)
+                    continue
+                finally:
+                    if proc:
+                        processes.untrack(proc)
+
+                if proc is not None and processes.pop_cancelled(proc.pid):
+                    logger.info("Chat summary cancelled")
+                    time.sleep(SUMMARY_INTERVAL)
+                    continue
+                
+                summary = stdout.strip() if stdout.strip() else stderr.strip()
+            
+            if summary and len(summary) > 50:
+                # Build and save summary with versioning
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+                summary_content = f"""# Chat Summary
+
+<!-- This file is automatically updated hourly by Tau to summarize the full conversation history. -->
+<!-- It provides context to all agent calls so they understand the conversation without reading the full history. -->
+
+## Summary
+
+{summary}
+
+---
+*Last updated: {timestamp}*
+"""
+                save_summary_with_version(summary_content)
+                save_chat_position(new_position)
+                logger.info(f"Chat summary updated ({len(summary)} chars)")
+            else:
+                logger.warning("Chat summary produced no useful output")
+
+        except Exception as e:
+            logger.error(f"Chat summary error: {e}")
+        
+        # Sleep for 1 hour
+        time.sleep(SUMMARY_INTERVAL)
+
+
+def run_memory_maintenance_loop(stop_event=None):
+    """Background loop for memory maintenance (runs daily).
+    
+    Handles:
+    - Compressing high-level memory (archiving old entries)
+    - Migrating summaries through tiers (short-term → mid-term → archive)
+    - Detecting and archiving stale entries
+    """
+    MAINTENANCE_INTERVAL = 86400  # 24 hours
+    
+    # Run maintenance once at startup
+    try:
+        logger.info("Running initial memory maintenance...")
+        run_memory_maintenance()
+        logger.info("Initial memory maintenance complete")
+    except Exception as e:
+        logger.error(f"Initial memory maintenance error: {e}")
+    
+    while True:
+        if stop_event and stop_event.is_set():
+            break
+        
+        # Sleep first, then run maintenance (since we ran at startup)
+        time.sleep(MAINTENANCE_INTERVAL)
+        
+        if stop_event and stop_event.is_set():
+            break
+        
+        try:
+            logger.info("Running daily memory maintenance...")
+            run_memory_maintenance()
+            logger.info("Memory maintenance complete")
+        except Exception as e:
+            logger.error(f"Memory maintenance error: {e}")
+
+
 def run_cron_loop(stop_event=None):
     """Background loop that runs cron jobs at their scheduled times."""
     import time
@@ -149,7 +465,16 @@ def run_cron_loop(stop_event=None):
                 # Get recent chat history (last 50 lines is enough for cron context)
                 chat_history = get_chat_history(max_lines=50)
                 
-                prompt_with_context = f"""TELEGRAM CHAT HISTORY:
+                # Get chat summary for broader context
+                chat_summary = ""
+                if os.path.exists(CHAT_SUMMARY_FILE):
+                    with open(CHAT_SUMMARY_FILE) as f:
+                        chat_summary = f.read().strip()
+                
+                prompt_with_context = f"""CONVERSATION SUMMARY (auto-updated hourly):
+{chat_summary if chat_summary else "No summary available yet."}
+
+TELEGRAM CHAT HISTORY (recent):
 {chat_history}
 
 CRON JOB PROMPT (runs every {job['interval_seconds']}s):
@@ -342,7 +667,7 @@ def remove_cron(message):
 def send_welcome(message):
     save_chat_id(message.chat.id)
     append_chat_history("user", f"/start")
-    response = "Hello! I'm Tau. Commands:\n/task <description> - Add a task\n/status - See recent activity\n/adapt <prompt> - Self-modify\n/cron <interval> <prompt> - Schedule recurring prompt\n/crons - List active crons\n/uncron <id> - Remove a cron\n/clear - Stop active agent processes\n/restart - Restart bot\n/kill - Stop the bot\n/debug - Toggle debug mode"
+    response = "Hello! I'm Tau. Commands:\n/task <description> - Add a task\n/plan <description> - Create an execution plan\n/status - See recent activity\n/adapt <prompt> - Self-modify\n/cron <interval> <prompt> - Schedule recurring prompt\n/crons - List active crons\n/uncron <id> - Remove a cron\n/clear - Stop active agent processes\n/restart - Restart bot\n/kill - Stop the bot\n/debug - Toggle debug mode"
     bot.reply_to(message, response)
     append_chat_history("assistant", response)
 
@@ -853,6 +1178,330 @@ def adapt_bot(message):
         append_chat_history("assistant", error_msg)
 
 
+PLANS_DIR = os.path.join(WORKSPACE, "context", "plans")
+
+
+def run_plan_generation(
+    task_description: str,
+    *,
+    chat_id: int,
+    reply_to_message_id: int | None = None,
+    timeout_seconds: int = 600,
+) -> tuple[str, str]:
+    """Generate a plan for a task using the agent.
+    
+    Returns:
+        Tuple of (plan_content, plan_filename)
+    """
+    stream = TelegramStreamingMessage(
+        chat_id,
+        reply_to_message_id=reply_to_message_id,
+        initial_text="📋 Creating plan...",
+        min_edit_interval_seconds=1.5,
+        min_chars_delta=15,
+    )
+
+    # Generate a filename-safe slug from the task description
+    import re as _re
+    slug = _re.sub(r'[^a-z0-9]+', '-', task_description.lower())[:50].strip('-')
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    plan_filename = f"plan-{timestamp}-{slug}.md"
+    
+    # Build the planning prompt
+    plan_prompt = f"""Create a detailed execution plan for the following task:
+
+TASK: {task_description}
+
+Generate a comprehensive plan that includes:
+1. **Goal**: Clear statement of what needs to be accomplished
+2. **Prerequisites**: What needs to be in place before starting
+3. **Steps**: Numbered action items with specific, actionable instructions
+4. **Success Criteria**: How to verify the task is complete
+5. **Potential Issues**: Risks or blockers to watch for
+
+Format the plan as a clean markdown document. Be specific and actionable.
+The plan should be self-contained so someone can follow it without additional context.
+
+Output ONLY the plan content, no preamble or meta-commentary."""
+
+    cmd = [
+        "agent",
+        "--force",
+        "--model",
+        "opus-4.5",
+        "--mode=ask",
+        "--output-format",
+        "stream-json",
+        "--stream-partial-output",
+        "--print",
+        plan_prompt,
+    ]
+
+    start_time = time.time()
+    thinking_updates: list[str] = []
+    thinking_text_buffer: str = ""
+    final_result_text: str | None = None
+    stderr_lines: list[str] = []
+    last_thinking_snippet: str = ""
+
+    planning_phases = [
+        "📋 Creating plan...",
+        "🎯 Defining goals...",
+        "📝 Outlining steps...",
+        "🔍 Adding details...",
+        "✨ Finalizing...",
+    ]
+
+    def build_display():
+        elapsed = time.time() - start_time
+        phase_idx = int(elapsed / 2) % len(planning_phases)
+        lines = [planning_phases[phase_idx] + "\n"]
+        
+        if thinking_text_buffer.strip():
+            cleaned = thinking_text_buffer.strip().replace("\n", " ")
+            display_thinking = last_thinking_snippet if last_thinking_snippet else cleaned
+            if len(display_thinking) > 150:
+                display_thinking = "..." + display_thinking[-147:]
+            lines.append(f"💭 {display_thinking}\n")
+        
+        if thinking_updates:
+            lines.append("")
+            lines.extend(thinking_updates[-6:])
+        
+        return "\n".join(lines)
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            cwd=WORKSPACE,
+            bufsize=1,
+            start_new_session=True,
+        )
+        processes.track(
+            proc,
+            label=f"agent:plan:{chat_id}",
+            cmd=cmd,
+            own_process_group=True,
+        )
+    except Exception as e:
+        err = f"Error: {str(e)}"
+        stream.set_text(err)
+        return err, ""
+
+    sentinel = object()
+    q: queue.Queue[object] = queue.Queue()
+
+    def _stdout_reader():
+        try:
+            if proc.stdout is None:
+                return
+            for line in proc.stdout:
+                q.put(line)
+        finally:
+            q.put(sentinel)
+
+    reader_thread = threading.Thread(
+        target=_stdout_reader,
+        daemon=True,
+        name="AgentPlanStreamReader",
+    )
+    reader_thread.start()
+
+    def _stderr_reader():
+        try:
+            if proc.stderr is None:
+                return
+            for line in proc.stderr:
+                stderr_lines.append(line)
+        except Exception:
+            pass
+
+    stderr_thread = threading.Thread(
+        target=_stderr_reader,
+        daemon=True,
+        name="AgentPlanStderrReader",
+    )
+    stderr_thread.start()
+
+    timed_out = False
+    last_display_update = start_time
+
+    try:
+        while True:
+            if time.time() - start_time > timeout_seconds:
+                timed_out = True
+                try:
+                    import signal as _signal
+                    os.killpg(proc.pid, _signal.SIGTERM)
+                except Exception:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        import signal as _signal
+                        os.killpg(proc.pid, _signal.SIGKILL)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                break
+
+            try:
+                item = q.get(timeout=0.25)
+            except queue.Empty:
+                item = None
+                now = time.time()
+                if now - last_display_update >= 1.5:
+                    stream.set_text(build_display())
+                    last_display_update = now
+
+            if item is sentinel:
+                break
+
+            if isinstance(item, str) and item:
+                line = item.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    continue
+
+                event_type = event.get("type")
+
+                if event_type == "assistant":
+                    msg = event.get("message") or {}
+                    content = msg.get("content") or []
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            text = part.get("text", "")
+                            if text:
+                                thinking_text_buffer += text
+                                
+                                cleaned = thinking_text_buffer.strip().replace("\n", " ")
+                                last_sentence_end = -1
+                                for i in range(len(cleaned) - 1, -1, -1):
+                                    if cleaned[i] in '.!?' and (i == len(cleaned) - 1 or cleaned[i + 1] in ' \n\t'):
+                                        last_sentence_end = i
+                                        break
+                                
+                                if last_sentence_end > 0:
+                                    complete_text = cleaned[:last_sentence_end + 1]
+                                    if len(complete_text) > 100:
+                                        snippet_start = len(complete_text) - 100
+                                        for i in range(snippet_start, len(complete_text)):
+                                            if complete_text[i] in '.!?' and i + 1 < len(complete_text):
+                                                snippet_start = i + 2
+                                                break
+                                        snippet = complete_text[snippet_start:].strip()
+                                    else:
+                                        snippet = complete_text
+                                    
+                                    if snippet and snippet != last_thinking_snippet:
+                                        last_thinking_snippet = snippet
+                                        stream.set_text(build_display())
+                                        last_display_update = time.time()
+                                
+                                if len(thinking_text_buffer) > 50:
+                                    final_result_text = thinking_text_buffer
+
+                elif event_type == "result":
+                    res = event.get("result")
+                    if isinstance(res, str):
+                        final_result_text = res
+
+            if proc.poll() is not None and q.empty():
+                continue
+    finally:
+        stream.finalize()
+        processes.untrack(proc)
+
+    if processes.pop_cancelled(proc.pid):
+        msg = "❌ Cancelled."
+        stream.set_text(msg)
+        return msg, ""
+
+    if timed_out:
+        msg = "⏰ Plan generation timed out."
+        stream.set_text(msg)
+        return msg, ""
+
+    # Get the plan content
+    plan_content = (final_result_text or thinking_text_buffer or "").strip()
+    
+    if not plan_content:
+        stderr_text = "".join(stderr_lines).strip()
+        msg = stderr_text if stderr_text else "Failed to generate plan."
+        stream.set_text(msg)
+        return msg, ""
+
+    # Save the plan to a file
+    os.makedirs(PLANS_DIR, exist_ok=True)
+    plan_path = os.path.join(PLANS_DIR, plan_filename)
+    
+    # Add header to the plan
+    full_plan = f"""# Plan: {task_description}
+
+*Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}*
+
+---
+
+{plan_content}
+"""
+    
+    with open(plan_path, "w") as f:
+        f.write(full_plan)
+    
+    # Show success message with plan preview
+    preview = plan_content[:500] + "..." if len(plan_content) > 500 else plan_content
+    success_msg = f"✅ Plan saved to `{plan_filename}`\n\n{preview}"
+    stream.set_text(success_msg)
+    
+    return full_plan, plan_filename
+
+
+@bot.message_handler(commands=['plan'])
+def create_plan(message):
+    """Create a plan for a task and save it to a file."""
+    save_chat_id(message.chat.id)
+    
+    task_text = message.text.replace('/plan', '', 1).strip()
+    append_chat_history("user", f"/plan {task_text}")
+    
+    if not task_text:
+        response = "Usage: /plan <task description>\n\nExample: /plan implement user authentication with OAuth2"
+        bot.reply_to(message, response)
+        append_chat_history("assistant", response)
+        return
+    
+    try:
+        plan_content, plan_filename = run_plan_generation(
+            task_text,
+            chat_id=message.chat.id,
+            reply_to_message_id=message.message_id,
+            timeout_seconds=600,
+        )
+        
+        if plan_filename:
+            append_chat_history("assistant", f"✅ Plan created: {plan_filename}")
+        else:
+            append_chat_history("assistant", f"Plan generation failed: {plan_content[:200]}")
+            
+    except Exception as e:
+        error_msg = f"Error creating plan: {str(e)}"
+        bot.reply_to(message, error_msg)
+        append_chat_history("assistant", error_msg)
+
+
 @bot.message_handler(commands=['task'])
 def add_task(message):
     """Add a task to its own directory."""
@@ -970,8 +1619,17 @@ def handle_voice_message(message):
         from .telegram import get_chat_history
         chat_history = get_chat_history()
         
+        # Get chat summary for broader context
+        chat_summary = ""
+        if os.path.exists(CHAT_SUMMARY_FILE):
+            with open(CHAT_SUMMARY_FILE) as f:
+                chat_summary = f.read().strip()
+        
         # Build prompt with chat history context
-        prompt_with_context = f"""TELEGRAM CHAT HISTORY:
+        prompt_with_context = f"""CONVERSATION SUMMARY (auto-updated hourly):
+{chat_summary if chat_summary else "No summary available yet."}
+
+TELEGRAM CHAT HISTORY (recent):
 {chat_history}
 
 CURRENT USER MESSAGE (transcribed from voice):
@@ -1623,6 +2281,7 @@ def handle_message(message):
     # Available Telegram commands (matches /start handler response)
     available_commands = """Available Telegram commands:
 /task <description> - Add a task
+/plan <description> - Create an execution plan
 /status - See recent activity
 /adapt <prompt> - Self-modify
 /cron <interval> <prompt> - Schedule recurring prompt
@@ -1776,6 +2435,24 @@ def main():
         name="CronLoop"
     )
     cron_thread.start()
+    
+    # Start chat summary loop in background thread
+    summary_thread = threading.Thread(
+        target=run_summary_loop,
+        args=(_stop_event,),
+        daemon=True,
+        name="SummaryLoop"
+    )
+    summary_thread.start()
+    
+    # Start memory maintenance loop in background thread (runs daily)
+    maintenance_thread = threading.Thread(
+        target=run_memory_maintenance_loop,
+        args=(_stop_event,),
+        daemon=True,
+        name="MemoryMaintenance"
+    )
+    maintenance_thread.start()
     
     # Run Telegram bot in main thread
     try:
