@@ -15,5 +15,6 @@ Before starting any task, you MUST:
    - "agent", "cursor", "cli" → load `context/skills/agent.md`
    - "basilica" → load `context/skills/basilica.md`
    - "targon" → load `context/skills/targon.md`
+   - "remind", "reminder", "schedule", "cron", "later", "task", "self-message", "follow-up", "checkpoint", "defer" → load `context/skills/self-scheduling.md`
 
 This is your first action in every session. If the user mentions a skill-related topic, you MUST load the corresponding skill file before answering.
