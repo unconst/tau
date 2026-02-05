@@ -1303,6 +1303,24 @@ step_cursor_agent() {
     
     if command_exists agent; then
         debug "Cursor agent already installed: $(command -v agent)"
+        # Check if already authenticated
+        if agent whoami >/dev/null 2>&1; then
+            debug "Cursor agent already authenticated"
+            return 0
+        fi
+        # Installed but not authenticated - prompt login
+        if [ "$HAS_TTY" = true ]; then
+            warn "Cursor agent not authenticated"
+            log ""
+            if agent login; then
+                ok "Authenticated"
+            else
+                warn "Authentication failed"
+                info "Run 'agent login' manually to authenticate"
+            fi
+        else
+            info "Run 'agent login' to authenticate"
+        fi
         return 0
     fi
     
