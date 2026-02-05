@@ -110,8 +110,7 @@ cleanup() {
     printf "\033[?25h" 2>/dev/null || true
     # Release lock if acquired
     if [ "$LOCK_ACQUIRED" = true ] && [ -n "$LOCK_DIR" ]; then
-        rm -f "$LOCK_DIR/pid" 2>/dev/null || true
-        rmdir "$LOCK_DIR" 2>/dev/null || true
+        rm -rf "$LOCK_DIR" 2>/dev/null || true
     fi
     # Remove temp files
     for f in "${CLEANUP_FILES[@]}"; do
@@ -1161,7 +1160,7 @@ step_clone() {
                 err "Cannot access $INSTALL_DIR"
                 exit 1
             }
-            git pull origin main >/dev/null 2>&1 &
+            git pull >/dev/null 2>&1 &
             spinner $! "Pulling" true || warn "Could not pull (continuing with existing code)"
         fi
         
@@ -1182,14 +1181,15 @@ step_clone() {
                     exit 1
                 fi
             else
-                cd "$INSTALL_DIR" || exit 1
-                return 0
+                err "Cannot continue with incomplete installation"
+                info "Remove $INSTALL_DIR manually and run the installer again"
+                exit 1
             fi
         else
             # Existing tau installation
             if prompt_yn "Pull latest"; then
                 cd "$INSTALL_DIR" || exit 1
-                git pull origin main >/dev/null 2>&1 &
+                git pull >/dev/null 2>&1 &
                 spinner $! "Pulling" true || warn "Could not pull"
             fi
             cd "$INSTALL_DIR" || exit 1
@@ -1242,7 +1242,7 @@ step_clone() {
 }
 
 step_python() {
-    cd "$INSTALL_DIR"
+    cd "$INSTALL_DIR" || { err "Cannot access $INSTALL_DIR"; exit 1; }
     debug "INSTALL_DIR=$INSTALL_DIR"
     debug "PATH=$PATH"
     
@@ -1405,13 +1405,11 @@ step_telegram() {
     
     # Write/update .env file
     if [ -f "$INSTALL_DIR/.env" ]; then
-        # Update existing file
-        if grep -q "TAU_BOT_TOKEN=" "$INSTALL_DIR/.env" 2>/dev/null; then
-            # Replace existing token using portable sed
-            sed_inplace "s|^TAU_BOT_TOKEN=.*|TAU_BOT_TOKEN=$BOT_TOKEN|" "$INSTALL_DIR/.env"
-        else
-            echo "TAU_BOT_TOKEN=$BOT_TOKEN" >> "$INSTALL_DIR/.env"
-        fi
+        # Remove existing token line (if any) and append new one
+        # Uses grep -v instead of sed to avoid delimiter injection issues
+        grep -v "^TAU_BOT_TOKEN=" "$INSTALL_DIR/.env" > "$INSTALL_DIR/.env.tmp" 2>/dev/null || true
+        mv "$INSTALL_DIR/.env.tmp" "$INSTALL_DIR/.env"
+        echo "TAU_BOT_TOKEN=$BOT_TOKEN" >> "$INSTALL_DIR/.env"
     else
         echo "TAU_BOT_TOKEN=$BOT_TOKEN" > "$INSTALL_DIR/.env"
     fi
@@ -1570,9 +1568,13 @@ RestartSec=10
 WantedBy=default.target
 EOF
     
-    systemctl --user daemon-reload
-    systemctl --user enable "$SERVICE_NAME" >/dev/null 2>&1
-    systemctl --user start "$SERVICE_NAME"
+    systemctl --user daemon-reload || { warn "Failed to reload systemd"; return 1; }
+    systemctl --user enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    if ! systemctl --user start "$SERVICE_NAME"; then
+        err "Failed to start systemd service: $SERVICE_NAME"
+        info "Check logs: journalctl --user -u $SERVICE_NAME"
+        return 1
+    fi
     loginctl enable-linger "$USER" 2>/dev/null || true
 }
 
@@ -1582,12 +1584,25 @@ step_launch() {
     local do_autostart=false
     local do_start=false
     
-    # Check if already running
+    # Check if already running (validate PID belongs to supervisord to avoid false positives from PID recycling)
     if [ -f "$INSTALL_DIR/.supervisord.pid" ]; then
         local pid=$(cat "$INSTALL_DIR/.supervisord.pid" 2>/dev/null)
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            print_final
-            return
+            local proc_name=""
+            # Check process name on Linux via /proc
+            if [ -f "/proc/$pid/cmdline" ]; then
+                proc_name=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+            fi
+            # Fallback to ps on macOS/other
+            if [ -z "$proc_name" ]; then
+                proc_name=$(ps -p "$pid" -o args= 2>/dev/null || true)
+            fi
+            if echo "$proc_name" | grep -q "supervisord" 2>/dev/null; then
+                print_final
+                return
+            else
+                debug "PID $pid exists but is not supervisord (got: $proc_name), ignoring stale pid file"
+            fi
         fi
     fi
     
@@ -1629,7 +1644,7 @@ step_launch() {
     fi
     
     if [ "$do_start" = true ]; then
-        cd "$INSTALL_DIR"
+        cd "$INSTALL_DIR" || { err "Cannot access $INSTALL_DIR"; exit 1; }
         
         # Load environment variables safely
         if [ -f .env ]; then
