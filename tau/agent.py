@@ -108,6 +108,20 @@ TOOLS:
   (Create a task for yourself to process later)
 - schedule_message: source .venv/bin/activate && python -m tau.tools.schedule_message --in "2h" "message"
   (Schedule a future message: --at "14:00", --in "2h", --cron "0 9 * * *")
+- commands: source .venv/bin/activate && python -m tau.tools.commands COMMAND [ARGS]
+  (Execute any tau bot command directly - for self-directed behavior)
+  Available commands:
+    - python -m tau.tools.commands task "description"       # Add a task
+    - python -m tau.tools.commands plan "description"       # Create an execution plan
+    - python -m tau.tools.commands status                   # See recent activity
+    - python -m tau.tools.commands adapt "prompt"           # Self-modify code (triggers restart!)
+    - python -m tau.tools.commands cron "5min" "prompt"     # Schedule recurring prompt
+    - python -m tau.tools.commands crons                    # List active crons
+    - python -m tau.tools.commands uncron 1                 # Remove cron #1
+    - python -m tau.tools.commands clear                    # Stop active agent processes
+    - python -m tau.tools.commands restart                  # Restart bot process
+    - python -m tau.tools.commands kill                     # Stop bot process
+    - python -m tau.tools.commands debug                    # Toggle debug mode
 """
 
 def read_file(path: str) -> str:

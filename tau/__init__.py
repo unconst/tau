@@ -59,10 +59,20 @@ def load_crons():
             with _cron_lock:
                 _cron_jobs = data.get('jobs', [])
                 _next_cron_id = data.get('next_id', 1)
+                # Filter out jobs with missing chat_id (invalid jobs)
+                valid_jobs = []
+                for job in _cron_jobs:
+                    if job.get('chat_id') is None:
+                        logger.warning(f"Skipping cron job #{job.get('id')} with missing chat_id")
+                        continue
+                    valid_jobs.append(job)
+                _cron_jobs = valid_jobs
                 # Reset next_run times to now + interval (so they don't all fire immediately)
                 now = time.time()
                 for job in _cron_jobs:
                     job['next_run'] = now + job['interval_seconds']
+                # Save updated state (with reset next_run and filtered invalid jobs)
+                save_crons()
             logger.info(f"Loaded {len(_cron_jobs)} cron job(s) from disk")
         except Exception as e:
             logger.error(f"Failed to load cron jobs: {e}")
