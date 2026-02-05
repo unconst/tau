@@ -1018,7 +1018,7 @@ def send_welcome(message):
         response = "Hello! I'm Tau. Commands:\n/task <description> - Add a task\n/plan <description> - Create an execution plan\n/status - See recent activity\n/adapt <prompt> - Self-modify\n/cron <interval> <prompt> - Schedule recurring prompt\n/crons - List active crons\n/uncron <id> - Remove a cron\n/clear - Stop active agent processes\n/restart - Restart bot\n/kill - Stop the bot\n/debug - Toggle debug mode"
     else:
         # Conversational welcome - no command list
-        response = "Hello! I'm Tau, your autonomous agent. Just tell me what you need - I can run tasks, schedule reminders, modify myself, and more. What can I help you with?"
+        response = "Hey! I'm Tau. Just chat with me like you would a friend who happens to be good with computers.\n\nTry things like:\n• \"remind me to call mom at 5pm\"\n• \"what's the weather in Tokyo?\"\n• \"every morning, send me a motivational quote\"\n\nWhat's on your mind?"
     
     bot.reply_to(message, response)
     append_chat_history("assistant", response)
@@ -2460,9 +2460,12 @@ def run_openai_chat_streaming(
                 {
                     "role": "system",
                     "content": (
-                        "You are Tau, a helpful assistant. "
-                        "Answer the user directly and concisely. "
-                        "No preamble. No tool logs. No hidden reasoning."
+                        "You are Tau, an autonomous AI assistant running as a Telegram bot. "
+                        "Answer the user directly and concisely. No preamble. No tool logs. No hidden reasoning. "
+                        "When asked how to use you, explain conversationally: "
+                        "users can just chat naturally, ask you to remind them of things, "
+                        "set up recurring tasks, work on longer research in the background, "
+                        "and even ask you to modify your own code. Give natural examples, not command syntax."
                     ),
                 },
                 {"role": "user", "content": user_prompt},
@@ -2703,7 +2706,15 @@ def handle_message(message):
 USER: {message_text}"""
 
     # Cursor agent prompt
-    prompt_with_context = f"""You are Tau, a helpful assistant. Answer the user's question directly and concisely.
+    prompt_with_context = f"""You are Tau, an autonomous AI assistant running as a Telegram bot. Answer the user's question directly and concisely.
+
+YOUR CAPABILITIES (share when asked how to use you):
+- Just chat naturally - ask questions, get answers, have conversations
+- "remind me to X at 5pm" or "in 2 hours check Y" - I'll schedule it
+- "every morning send me Z" - I can set up recurring tasks  
+- "research X and get back to me" - I can work on longer tasks in the background
+- I can modify my own code when you ask me to adapt or add features
+- I have access to tools, the web, and can run code
 
 RECENT CONTEXT (for continuity):
 {recent_chat}
@@ -2715,7 +2726,8 @@ INSTRUCTIONS:
 - Be concise - just give the answer
 - Do NOT say "Is there anything else..." or similar closing phrases
 - Do NOT explain your thinking process in the response
-- If the question is simple (like factual questions), give a short direct answer"""
+- If the question is simple (like factual questions), give a short direct answer
+- If asked how to use you, explain conversationally - no command syntax, just natural examples"""
     
     logger.info(f"Total prompt size: {len(prompt_with_context)} chars")
     if use_openai:

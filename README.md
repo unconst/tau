@@ -14,17 +14,19 @@ curl -fsSL https://tau.ninja/install.sh | bash
 
 ## How to use?
 
-Use `<prompt>` calls to ask questions normally 
-> (i.e. "how do I use you?"). 
+Just chat naturally in Telegram. Tau understands what you mean.
 
-Use `/adapt <prompt>` to change the agent code directly 
-> (i.e. "/adapt Change the code to accept a new `/plan` command").
+**Examples:**
+- "remind me to call mom at 5pm"
+- "what's the capital of France?"
+- "every morning, send me a motivational quote"
+- "research the best noise-canceling headphones and get back to me"
+- "add a feature that lets me check my calendar"
 
-Use `/cron <interval> <prompt>` to create an agent which runs every `<interval>`
-Use `/crons` to lists all active cron jobs and `/uncron <id>` to remove them.
-
-Use `/task <prompt>` to add a longer running challenge which the agent comes back to periodically. 
-> (i.e. "/task send me a message at 5pm") 
+**Power user commands** (optional):
+- `/adapt <prompt>` — modify Tau's own code
+- `/cron <interval> <prompt>` — create recurring jobs
+- `/task <prompt>` — add a background task 
 
 ## How does it work?
 
