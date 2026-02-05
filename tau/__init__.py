@@ -13,8 +13,312 @@ from pathlib import Path
 from openai import OpenAI
 from .telegram import bot, save_chat_id, notify, WORKSPACE, append_chat_history, TelegramStreamingMessage
 from .agent import run_loop, TASKS_DIR, get_all_tasks, git_commit_changes, set_debug_mode, read_file, run_memory_maintenance
+from .tools.commands import run_command
 from . import processes
 import re
+
+
+# Intent patterns for command routing
+# Each pattern maps to (command_name, arg_extractor_function_or_None)
+INTENT_PATTERNS = {
+    # Adapt/modify patterns
+    "adapt": [
+        r"(?:update|modify|change|edit|adapt|improve|fix|add|implement|create)\s+(?:your|the|my|tau'?s?)?\s*(?:code|yourself|bot|implementation)",
+        r"(?:add|implement|create)\s+(?:a\s+)?(?:new\s+)?(?:feature|functionality|capability)",
+        r"can you (?:update|modify|change|add|implement)",
+        r"i want (?:you )?to (?:update|modify|change|add|implement)",
+        r"(?:make|do) (?:a )?(?:change|modification|update) to",
+        r"self[- ]?modify",
+    ],
+    # Task patterns
+    "task": [
+        r"(?:add|create|make|new)\s+(?:a\s+)?task",
+        r"(?:add|put)\s+(?:this\s+)?(?:to|on)\s+(?:my\s+)?(?:todo|task)",
+        r"todo[:\s]+",
+        r"i need (?:you )?to (?:work on|do|complete)",
+        r"work on[:\s]",
+        r"remember to",
+    ],
+    # Plan patterns
+    "plan": [
+        r"(?:create|make|generate)\s+(?:a\s+)?(?:plan|roadmap|strategy)",
+        r"(?:how should (?:we|i|you) (?:approach|implement|do))",
+        r"(?:plan|outline) (?:for|how to)",
+        r"what(?:'s| is) the (?:plan|approach|strategy) for",
+    ],
+    # Status patterns
+    "status": [
+        r"(?:what(?:'s| is|'re| are) (?:you )?(?:working on|doing|up to))",
+        r"(?:show|get|check)\s+(?:me\s+)?(?:the\s+)?(?:my\s+)?(?:status|progress|tasks?)",
+        r"(?:what(?:'s| is)) (?:the\s+)?(?:my\s+)?(?:status|progress)",
+        r"(?:what|any) (?:tasks?|work|progress)",
+        r"recent activity",
+    ],
+    # Cron patterns
+    "cron": [
+        r"(?:remind me|set (?:a )?reminder|schedule)\s+(?:to\s+)?(?:in\s+)?(\d+\s*(?:min(?:ute)?s?|h(?:our)?s?|sec(?:ond)?s?))",
+        r"(?:every|each)\s+(\d+\s*(?:min(?:ute)?s?|h(?:our)?s?|sec(?:ond)?s?))\s+(?:run|do|check|send)",
+        r"(?:set up|create|add)\s+(?:a\s+)?(?:recurring|scheduled|cron)",
+        r"(?:in|after)\s+(\d+\s*(?:min(?:ute)?s?|h(?:our)?s?|sec(?:ond)?s?))\s+(?:remind|tell|notify|send)",
+    ],
+    # Crons list patterns
+    "crons": [
+        r"(?:list|show|what(?:'s| is|'re| are))\s+(?:my\s+)?(?:scheduled|recurring|cron|reminder)",
+        r"(?:active|current)\s+(?:cron|reminder|schedule)",
+        r"what(?:'s| is) scheduled",
+    ],
+    # Uncron patterns
+    "uncron": [
+        r"(?:remove|delete|cancel|stop)\s+(?:cron|reminder|schedule)\s*#?(\d+)",
+        r"(?:uncron|remove cron)\s*#?(\d+)",
+        r"stop (?:cron|reminder)\s*#?(\d+)",
+    ],
+    # Clear patterns
+    "clear": [
+        r"(?:stop|cancel|clear|kill)\s+(?:all\s+)?(?:active\s+)?(?:agent|process)",
+        r"(?:stop|cancel) what(?:'s| is| you(?:'re| are)) (?:running|doing)",
+    ],
+    # Restart patterns
+    "restart": [
+        r"(?:restart|reboot)\s+(?:yourself|the bot|tau)",
+        r"(?:can you )?restart",
+    ],
+    # Kill/stop patterns
+    "kill": [
+        r"(?:shutdown|stop|kill)\s+(?:yourself|the bot|tau|completely)",
+        r"turn (?:yourself )?off",
+    ],
+    # Debug patterns
+    "debug": [
+        r"(?:toggle|turn (?:on|off)|enable|disable)\s+debug",
+        r"debug mode",
+    ],
+}
+
+
+def classify_intent(message: str) -> dict | None:
+    """Classify user intent and return command info if applicable.
+    
+    Uses pattern matching for fast detection. Falls back to None for
+    ambiguous cases (let normal chat handle it).
+    
+    Args:
+        message: The user's message text
+        
+    Returns:
+        dict with 'command', 'args', 'confirmation_message', 'needs_confirmation'
+        or None if this should be handled as normal chat
+    """
+    message_lower = message.lower().strip()
+    
+    # Skip very short messages or questions about commands
+    if len(message_lower) < 5:
+        return None
+    
+    # Skip if it looks like a question about how things work (not a command)
+    question_words = ["what is", "what's", "how does", "how do", "can you explain", "tell me about"]
+    if any(message_lower.startswith(q) for q in question_words):
+        # Exception: "what's the status" should trigger status
+        if not any(p in message_lower for p in ["status", "working on", "scheduled"]):
+            return None
+    
+    # Check each command's patterns
+    for command, patterns in INTENT_PATTERNS.items():
+        for pattern in patterns:
+            match = re.search(pattern, message_lower, re.IGNORECASE)
+            if match:
+                return _build_intent_result(command, message, match)
+    
+    return None
+
+
+def _build_intent_result(command: str, original_message: str, match: re.Match) -> dict:
+    """Build the intent result dict with appropriate args and confirmations."""
+    
+    # Commands that need confirmation
+    needs_confirmation = command in ("adapt", "kill", "restart")
+    
+    # Extract arguments based on command type
+    args = []
+    confirmation_msg = ""
+    
+    if command == "adapt":
+        # The full message (minus pattern match prefix) is the adaptation prompt
+        args = [original_message]
+        confirmation_msg = f"I'll modify my code based on your request. This will restart the bot. Proceed? (yes/no)"
+        
+    elif command == "task":
+        # Extract the task description from the message
+        # Try to find everything after the trigger phrase
+        task_text = original_message
+        # Remove common prefixes
+        for prefix in ["add a task", "add task", "create a task", "create task", "new task", 
+                       "todo:", "todo ", "add to my todo", "work on", "i need you to", 
+                       "i need to", "remember to"]:
+            lower = task_text.lower()
+            if lower.startswith(prefix):
+                task_text = task_text[len(prefix):].strip()
+                break
+        # Remove leading punctuation/spaces
+        task_text = task_text.lstrip(":- ").strip()
+        if task_text:
+            args = [task_text]
+        confirmation_msg = f"Adding task: {task_text[:50]}..."
+        
+    elif command == "plan":
+        # Extract what to plan
+        plan_text = original_message
+        for prefix in ["create a plan for", "create plan for", "make a plan for", 
+                       "plan for", "plan:", "how should we approach", "how should i approach"]:
+            lower = plan_text.lower()
+            if lower.startswith(prefix):
+                plan_text = plan_text[len(prefix):].strip()
+                break
+        plan_text = plan_text.lstrip(":- ").strip()
+        if plan_text:
+            args = [plan_text]
+        confirmation_msg = f"Creating plan for: {plan_text[:50]}..."
+        
+    elif command == "cron":
+        # Try to extract interval and prompt
+        # Look for time patterns
+        time_match = re.search(r'(\d+)\s*(min(?:ute)?s?|h(?:our)?s?|sec(?:ond)?s?)', original_message.lower())
+        if time_match:
+            interval = f"{time_match.group(1)}{time_match.group(2)[0]}"  # e.g., "5m" or "1h"
+            # The prompt is everything else, cleaned up
+            prompt = original_message
+            # Remove time portion and common prefixes
+            for prefix in ["remind me", "set a reminder", "schedule", "every", "in", "after"]:
+                lower = prompt.lower()
+                idx = lower.find(prefix)
+                if idx != -1:
+                    prompt = prompt[idx + len(prefix):].strip()
+            # Remove the time expression
+            prompt = re.sub(r'\d+\s*(?:min(?:ute)?s?|h(?:our)?s?|sec(?:ond)?s?)', '', prompt, flags=re.IGNORECASE).strip()
+            prompt = prompt.lstrip(":,- ").strip()
+            if prompt:
+                args = [interval, prompt]
+            confirmation_msg = f"Scheduling reminder every {interval}: {prompt[:40]}..."
+        else:
+            return None  # Can't parse cron without interval
+            
+    elif command == "uncron":
+        # Extract cron ID
+        id_match = re.search(r'#?(\d+)', original_message)
+        if id_match:
+            args = [id_match.group(1)]
+            confirmation_msg = f"Removing cron #{id_match.group(1)}..."
+        else:
+            return None
+            
+    elif command == "status":
+        confirmation_msg = "Checking status..."
+        
+    elif command == "crons":
+        confirmation_msg = "Listing scheduled jobs..."
+        
+    elif command == "clear":
+        confirmation_msg = "Stopping active processes..."
+        
+    elif command == "restart":
+        confirmation_msg = "I'll restart now. This will briefly disconnect me."
+        needs_confirmation = True
+        
+    elif command == "kill":
+        confirmation_msg = "This will completely stop me. Are you sure? (yes/no)"
+        needs_confirmation = True
+        
+    elif command == "debug":
+        confirmation_msg = "Toggling debug mode..."
+    
+    return {
+        "command": command,
+        "args": args,
+        "confirmation_message": confirmation_msg,
+        "needs_confirmation": needs_confirmation,
+        "original_message": original_message,
+    }
+
+
+def execute_intent(intent: dict, chat_id: int, message_id: int) -> str:
+    """Execute a detected intent by calling the appropriate command.
+    
+    Args:
+        intent: The intent dict from classify_intent()
+        chat_id: Telegram chat ID
+        message_id: Message ID to reply to
+        
+    Returns:
+        Result message to send to user
+    """
+    command = intent["command"]
+    args = intent["args"]
+    
+    # For adapt, we need special handling with streaming
+    if command == "adapt" and args:
+        # Use the streaming adapt function
+        result = run_adapt_streaming(
+            args[0],
+            chat_id=chat_id,
+            reply_to_message_id=message_id,
+            timeout_seconds=3600,
+        )
+        # Commit changes and restart
+        git_commit_changes(args[0][:100] if args else "self-modification")
+        bot.stop_polling()
+        if restart_via_supervisor():
+            sys.exit(0)
+        else:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        return result
+        
+    elif command == "plan" and args:
+        # Use the streaming plan function
+        plan_content, plan_filename = run_plan_generation(
+            args[0],
+            chat_id=chat_id,
+            reply_to_message_id=message_id,
+            timeout_seconds=600,
+        )
+        return plan_content if plan_filename else "Failed to generate plan."
+        
+    elif command == "restart":
+        bot.send_message(chat_id, "Restarting...")
+        append_chat_history("assistant", "Restarting...")
+        bot.stop_polling()
+        if restart_via_supervisor():
+            sys.exit(0)
+        else:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        return "Restarting..."
+        
+    elif command == "kill":
+        bot.send_message(chat_id, "🛑 Shutting down...")
+        append_chat_history("assistant", "🛑 Shutting down...")
+        try:
+            processes.terminate_all(label_prefix="agent:", timeout_seconds=2.0)
+        except Exception:
+            pass
+        try:
+            _stop_event.set()
+        except Exception:
+            pass
+        try:
+            bot.stop_polling()
+        except Exception:
+            pass
+        if stop_via_supervisor():
+            os._exit(0)
+        os._exit(0)
+        
+    else:
+        # Use the commands module for other commands
+        result = run_command(command, *args)
+        return result
+
+
+# Track pending confirmations: chat_id -> intent dict
+_pending_confirmations: dict[int, dict] = {}
 
 # Debug mode flag - controls verbose notifications
 DEBUG_MODE = False
@@ -708,7 +1012,14 @@ def remove_cron(message):
 def send_welcome(message):
     save_chat_id(message.chat.id)
     append_chat_history("user", f"/start")
-    response = "Hello! I'm Tau. Commands:\n/task <description> - Add a task\n/plan <description> - Create an execution plan\n/status - See recent activity\n/adapt <prompt> - Self-modify\n/cron <interval> <prompt> - Schedule recurring prompt\n/crons - List active crons\n/uncron <id> - Remove a cron\n/clear - Stop active agent processes\n/restart - Restart bot\n/kill - Stop the bot\n/debug - Toggle debug mode"
+    
+    if DEBUG_MODE:
+        # In debug mode, show the full command list for testing
+        response = "Hello! I'm Tau. Commands:\n/task <description> - Add a task\n/plan <description> - Create an execution plan\n/status - See recent activity\n/adapt <prompt> - Self-modify\n/cron <interval> <prompt> - Schedule recurring prompt\n/crons - List active crons\n/uncron <id> - Remove a cron\n/clear - Stop active agent processes\n/restart - Restart bot\n/kill - Stop the bot\n/debug - Toggle debug mode"
+    else:
+        # Conversational welcome - no command list
+        response = "Hello! I'm Tau, your autonomous agent. Just tell me what you need - I can run tasks, schedule reminders, modify myself, and more. What can I help you with?"
+    
     bot.reply_to(message, response)
     append_chat_history("assistant", response)
 
@@ -2278,7 +2589,12 @@ def _extract_final_answer(output: str) -> str:
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
-    """Handle all non-command text messages by calling the agent."""
+    """Handle all non-command text messages.
+    
+    This now includes intelligent intent detection to route natural language
+    requests to the appropriate internal commands (task, adapt, cron, etc.)
+    without users needing to know explicit command syntax.
+    """
     logger.info(f"=== MESSAGE RECEIVED: '{message.text[:50]}...' ===" if len(message.text or '') > 50 else f"=== MESSAGE RECEIVED: '{message.text}' ===")
     save_chat_id(message.chat.id)
     
@@ -2288,28 +2604,89 @@ def handle_message(message):
         bot.reply_to(message, "📨 Received your message.")
         return
     
+    message_text = message.text.strip()
+    message_lower = message_text.lower()
+    
+    # Check for pending confirmation responses
+    if message.chat.id in _pending_confirmations:
+        pending = _pending_confirmations.pop(message.chat.id)
+        append_chat_history("user", message_text)
+        
+        if message_lower in ("yes", "y", "ok", "okay", "proceed", "do it", "confirm"):
+            logger.info(f"Confirmation received for {pending['command']}")
+            try:
+                result = execute_intent(pending, message.chat.id, message.message_id)
+                append_chat_history("assistant", result)
+            except Exception as e:
+                error_msg = f"Error executing {pending['command']}: {str(e)}"
+                bot.reply_to(message, error_msg)
+                append_chat_history("assistant", error_msg)
+        else:
+            response = "Cancelled."
+            bot.reply_to(message, response)
+            append_chat_history("assistant", response)
+        return
+    
+    # Try to detect intent from natural language
+    intent = classify_intent(message_text)
+    
+    if intent:
+        logger.info(f"Intent detected: {intent['command']} (args={intent.get('args', [])})")
+        
+        # Show intent detection in debug mode
+        if DEBUG_MODE:
+            debug_msg = f"🔍 Intent: {intent['command']}"
+            if intent.get('args'):
+                debug_msg += f" | Args: {intent['args']}"
+            bot.send_message(message.chat.id, debug_msg)
+        
+        append_chat_history("user", message_text)
+        
+        # Check if confirmation is needed
+        if intent.get("needs_confirmation"):
+            _pending_confirmations[message.chat.id] = intent
+            confirm_msg = intent.get("confirmation_message", f"Execute {intent['command']}? (yes/no)")
+            bot.reply_to(message, confirm_msg)
+            append_chat_history("assistant", confirm_msg)
+            return
+        
+        # Execute the intent directly
+        try:
+            # Show what we're doing
+            if intent.get("confirmation_message"):
+                bot.send_message(message.chat.id, intent["confirmation_message"])
+            
+            result = execute_intent(intent, message.chat.id, message.message_id)
+            
+            # For commands that don't stream their own output, send the result
+            if intent["command"] not in ("adapt", "plan"):
+                if result:
+                    bot.send_message(message.chat.id, result)
+                    append_chat_history("assistant", result)
+            else:
+                append_chat_history("assistant", result[:500] if result else "Done")
+                
+        except Exception as e:
+            error_msg = f"Error: {str(e)}"
+            bot.reply_to(message, error_msg)
+            append_chat_history("assistant", error_msg)
+        return
+    
+    # No intent detected - handle as normal chat
+    logger.info("No intent detected, handling as normal chat")
+    
     # Get chat history BEFORE appending current message (so current message only appears once)
     from .telegram import get_chat_history
     chat_history = get_chat_history()
     logger.info(f"Chat history loaded: {len(chat_history)} chars")
     
     # Now append the user message
-    append_chat_history("user", message.text)
+    append_chat_history("user", message_text)
     
     # Build prompt with minimal context for simple questions
     # Only include last 20 lines of chat for continuity, not the full history
     chat_lines = chat_history.strip().split('\n')
     recent_chat = '\n'.join(chat_lines[-20:]) if len(chat_lines) > 20 else chat_history
-    
-    # Check if user is asking about commands
-    # Detect questions about available Telegram commands
-    message_lower = message.text.lower()
-    # Simple detection: if message mentions "command" or "commands" and is a question
-    is_command_question = ('command' in message_lower or 'commands' in message_lower) and (
-        'what' in message_lower or 'which' in message_lower or 'tell' in message_lower or 
-        'help' in message_lower or 'list' in message_lower or 'available' in message_lower or
-        'can i' in message_lower or 'how do' in message_lower
-    )
     
     # Backend + model selection:
     # - default is "cursor": use Cursor agent (composer) for normal chat
@@ -2319,61 +2696,19 @@ def handle_message(message):
     cursor_model = os.getenv("TAU_CURSOR_CHAT_MODEL", "composer-1")
     use_openai = backend in ("openai", "oa") or (backend == "auto" and openai_client is not None)
 
-    # Available Telegram commands (matches /start handler response)
-    available_commands = """Available Telegram commands:
-/task <description> - Add a task
-/plan <description> - Create an execution plan
-/status - See recent activity
-/adapt <prompt> - Self-modify
-/cron <interval> <prompt> - Schedule recurring prompt
-/crons - List active crons
-/uncron <id> - Remove a cron
-/clear - Stop active agent processes
-/restart - Restart bot
-/kill - Stop the bot
-/debug - Toggle debug mode"""
-
     # OpenAI prompt: keep it small for speed
-    # Include commands only when user asks about them
-    if is_command_question:
-        openai_prompt = f"""{available_commands}
-
-RECENT CONTEXT (for continuity):
+    openai_prompt = f"""RECENT CONTEXT (for continuity):
 {recent_chat}
 
-USER: {message.text}"""
-    else:
-        openai_prompt = f"""RECENT CONTEXT (for continuity):
-{recent_chat}
-
-USER: {message.text}"""
+USER: {message_text}"""
 
     # Cursor agent prompt
-    # Include commands only when user asks about them
-    if is_command_question:
-        prompt_with_context = f"""You are Tau, a helpful assistant. Answer the user's question directly and concisely.
-
-{available_commands}
+    prompt_with_context = f"""You are Tau, a helpful assistant. Answer the user's question directly and concisely.
 
 RECENT CONTEXT (for continuity):
 {recent_chat}
 
-USER: {message.text}
-
-INSTRUCTIONS:
-- Answer directly without preamble
-- Be concise - just give the answer
-- Do NOT say "Is there anything else..." or similar closing phrases
-- Do NOT explain your thinking process in the response
-- If the question is simple (like factual questions), give a short direct answer
-- When asked about commands, list the actual commands shown above"""
-    else:
-        prompt_with_context = f"""You are Tau, a helpful assistant. Answer the user's question directly and concisely.
-
-RECENT CONTEXT (for continuity):
-{recent_chat}
-
-USER: {message.text}
+USER: {message_text}
 
 INSTRUCTIONS:
 - Answer directly without preamble
