@@ -70,6 +70,9 @@ def cmd_task(description: str) -> str:
 def cmd_plan(description: str) -> str:
     """Create an execution plan for a task.
     
+    Uses the Cursor agent to generate a comprehensive plan based on 
+    the task description and workspace context.
+    
     Args:
         description: What to create a plan for
         
@@ -86,22 +89,51 @@ def cmd_plan(description: str) -> str:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     plan_filename = f"plan-{timestamp}-{slug}.md"
     
-    # Build the planning prompt
-    plan_prompt = f"""Create a detailed execution plan for the following task:
+    # Read context files to provide to the agent
+    context_dir = WORKSPACE / "context"
+    identity_content = ""
+    memory_system_content = ""
+    
+    identity_file = context_dir / "IDENTITY.md"
+    if identity_file.exists():
+        identity_content = identity_file.read_text()
+    
+    memory_system_file = context_dir / "MEMORY-SYSTEM.md"
+    if memory_system_file.exists():
+        memory_system_content = memory_system_file.read_text()
+    
+    # Build context section
+    context_section = ""
+    if identity_content:
+        context_section += f"\n## Agent Identity\n{identity_content}\n"
+    if memory_system_content:
+        context_section += f"\n## Memory System\n{memory_system_content}\n"
+    
+    # Build the planning prompt with workspace context
+    plan_prompt = f"""You are Tau, creating an execution plan for a task.
+
+WORKSPACE: {WORKSPACE}
+{context_section}
+---
 
 TASK: {description}
 
-Generate a comprehensive plan that includes:
+Generate a comprehensive execution plan that includes:
+
 1. **Goal**: Clear statement of what needs to be accomplished
-2. **Prerequisites**: What needs to be in place before starting
-3. **Steps**: Numbered action items with specific, actionable instructions
-4. **Success Criteria**: How to verify the task is complete
-5. **Potential Issues**: Risks or blockers to watch for
+2. **Current State**: What exists now (check relevant files/directories)
+3. **Prerequisites**: What needs to be in place before starting
+4. **Steps**: Numbered action items with specific shell commands or file operations
+   - Each step should be atomic and verifiable
+   - Include exact file paths relative to workspace
+   - Include exact commands to run (with `source .venv/bin/activate` where needed)
+5. **Success Criteria**: How to verify the task is complete
+6. **Potential Issues**: Risks or blockers to watch for
 
-Format the plan as a clean markdown document. Be specific and actionable.
-The plan should be self-contained so someone can follow it without additional context.
+Format as clean markdown. Be specific and actionable.
+Use the workspace context above to inform your plan.
 
-Output ONLY the plan content, no preamble or meta-commentary."""
+Output ONLY the plan content, no preamble."""
 
     cmd = [
         "agent",
