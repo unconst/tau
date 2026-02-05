@@ -23,6 +23,35 @@ DEBUG_MODE = False
 _cron_jobs = []
 _cron_lock = threading.Lock()
 _next_cron_id = 1
+CRON_FILE = os.path.join(WORKSPACE, "cron_jobs.json")
+
+
+def save_crons():
+    """Persist cron jobs to disk. Must be called with _cron_lock held."""
+    try:
+        with open(CRON_FILE, 'w', encoding='utf-8') as f:
+            json.dump({'jobs': _cron_jobs, 'next_id': _next_cron_id}, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save cron jobs: {e}")
+
+
+def load_crons():
+    """Load cron jobs from disk at startup."""
+    global _cron_jobs, _next_cron_id
+    if os.path.exists(CRON_FILE):
+        try:
+            with open(CRON_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            with _cron_lock:
+                _cron_jobs = data.get('jobs', [])
+                _next_cron_id = data.get('next_id', 1)
+                # Reset next_run times to now + interval (so they don't all fire immediately)
+                now = time.time()
+                for job in _cron_jobs:
+                    job['next_run'] = now + job['interval_seconds']
+            logger.info(f"Loaded {len(_cron_jobs)} cron job(s) from disk")
+        except Exception as e:
+            logger.error(f"Failed to load cron jobs: {e}")
 
 # Configure logging
 LOG_FILE = os.path.join(WORKSPACE, "context", "logs", "tau.log")
@@ -262,6 +291,7 @@ def add_cron(message):
             'chat_id': message.chat.id
         }
         _cron_jobs.append(job)
+        save_crons()
     
     # Format interval for display
     if interval_seconds < 60:
@@ -328,6 +358,7 @@ def remove_cron(message):
         for i, job in enumerate(_cron_jobs):
             if job['id'] == cron_id:
                 _cron_jobs.pop(i)
+                save_crons()
                 response = f"✅ Cron #{cron_id} removed."
                 bot.reply_to(message, response)
                 append_chat_history("assistant", response)
@@ -1746,6 +1777,9 @@ def main():
     logger.info("=" * 50)
     logger.info("TAU STARTING")
     logger.info("=" * 50)
+    
+    # Load persisted cron jobs
+    load_crons()
     
     from .telegram import get_chat_id
     
