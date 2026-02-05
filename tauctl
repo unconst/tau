@@ -61,7 +61,10 @@ start_supervisord() {
     
     echo "${CYAN}→${NC} Starting supervisord..."
     load_env
-    "$TAU_DIR/.venv/bin/supervisord" -c "$SUPERVISOR_CONF"
+    
+    # Capture any startup errors
+    local error_output
+    error_output=$("$TAU_DIR/.venv/bin/supervisord" -c "$SUPERVISOR_CONF" 2>&1) || true
     
     # Wait for socket to be ready
     local retries=10
@@ -74,6 +77,18 @@ start_supervisord() {
         echo "${GREEN}✓${NC} Supervisord started"
     else
         echo "${RED}✗${NC} Failed to start supervisord"
+        if [ -n "$error_output" ]; then
+            echo "  Error: $error_output"
+        fi
+        if [ -f "$LOG_DIR/supervisord.log" ]; then
+            echo ""
+            echo "  Recent log:"
+            tail -5 "$LOG_DIR/supervisord.log" 2>/dev/null | sed 's/^/    /'
+        fi
+        echo ""
+        echo "  Try running directly to see full error:"
+        echo "    cd $TAU_DIR && source .venv/bin/activate && source .env"
+        echo "    supervisord -n -c supervisord.conf"
         return 1
     fi
 }
@@ -212,6 +227,15 @@ case "${1:-}" in
         fi
         ;;
     
+    run)
+        # Direct run mode - for Docker/containers
+        # Runs tau in foreground without supervisord
+        echo "${CYAN}→${NC} Running tau directly (Ctrl+C to stop)..."
+        load_env
+        cd "$TAU_DIR"
+        exec "$TAU_DIR/.venv/bin/python" -m tau
+        ;;
+    
     supervisor)
         case "${2:-}" in
             start)
@@ -273,6 +297,7 @@ case "${1:-}" in
         echo "  status            Check tau status"
         echo "  logs              View last 100 lines of tau logs"
         echo "  logs -f           Follow tau logs"
+        echo "  run               Run tau directly (for Docker/containers)"
         echo "  supervisor start  Start supervisord daemon"
         echo "  supervisor stop   Stop supervisord daemon"
         echo "  supervisor status Check supervisord status"

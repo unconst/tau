@@ -516,10 +516,22 @@ EOF
     launchctl load "$PLIST_FILE"
 }
 
+systemd_user_available() {
+    # Check if systemd user services are available
+    # This fails in containers without D-Bus or systemd
+    systemctl --user status >/dev/null 2>&1
+}
+
 setup_systemd() {
     local SERVICE_DIR="$HOME/.config/systemd/user"
     local SERVICE_NAME="tau-$INSTANCE_ID"
     local SERVICE_FILE="$SERVICE_DIR/$SERVICE_NAME.service"
+    
+    if ! systemd_user_available; then
+        warn "systemd user services not available (container?)"
+        info "Skipping auto-start, will start manually"
+        return 1
+    fi
     
     mkdir -p "$SERVICE_DIR"
     
@@ -570,8 +582,11 @@ step_launch() {
     
     if [ "$do_autostart" = true ]; then
         local OS=$(detect_os)
+        local autostart_ok=false
+        
         if [ "$OS" = "macos" ]; then
             setup_launchd
+            autostart_ok=true
             # launchd already started supervisord, wait for it
             if [ "$do_start" = true ]; then
                 wait_for_ready &
@@ -580,26 +595,40 @@ step_launch() {
                 return
             fi
         elif [ "$OS" = "linux" ]; then
-            setup_systemd
-            # systemd already started supervisord, wait for it
-            if [ "$do_start" = true ]; then
-                wait_for_ready &
-                spinner $! "Starting" true
-                print_final
-                return
+            if setup_systemd; then
+                autostart_ok=true
+                # systemd already started supervisord, wait for it
+                if [ "$do_start" = true ]; then
+                    wait_for_ready &
+                    spinner $! "Starting" true
+                    print_final
+                    return
+                fi
             fi
+            # If systemd setup failed, fall through to manual start
         fi
     fi
     
     if [ "$do_start" = true ]; then
         cd "$INSTALL_DIR"
         set -a; source .env; set +a
-        "$INSTALL_DIR/tauctl" start >/dev/null 2>&1 &
-        spinner $! "Starting" true
-        print_final
+        
+        # Try supervisord first, fall back to direct run for containers
+        if "$INSTALL_DIR/tauctl" start >/dev/null 2>&1; then
+            print_final
+        else
+            # Supervisord failed - likely a container, run directly
+            warn "Supervisord failed, starting directly..."
+            log ""
+            info "Running in foreground (Ctrl+C to stop)"
+            info "For background: nohup ./tauctl run &"
+            log ""
+            exec "$INSTALL_DIR/tauctl" run
+        fi
     else
         log ""
         info "Run ./tauctl start when ready"
+        info "In Docker: ./tauctl run"
         log ""
     fi
 }
