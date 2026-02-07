@@ -8,6 +8,7 @@ Available tools:
 - send_voice: Send a voice message (TTS) to the user via Telegram
 - search_skills: Search for creative AI skills/tools (Eve/Eden.art ecosystem)
 - lium: Manage GPU pods on the Lium network (create, delete, SSH, exec)
+- commands: Execute tau bot commands (task, plan, status, adapt, cron, etc.)
 """
 
 # Tool registry for programmatic access
@@ -51,6 +52,21 @@ TOOLS = {
             "python -m tau.tools.lium ssh my-pod                  # SSH into pod",
             "python -m tau.tools.lium scp my-pod ./file.py        # Copy file to pod",
             "python -m tau.tools.lium templates                   # List available templates",
+        ],
+    },
+    "commands": {
+        "command": "python -m tau.tools.commands",
+        "description": "Execute tau bot commands programmatically (self-directed behavior)",
+        "usage": "python -m tau.tools.commands COMMAND [ARGS]",
+        "examples": [
+            'python -m tau.tools.commands task "Research X"       # Create a task for yourself',
+            'python -m tau.tools.commands plan "Build feature Y"  # Create an execution plan',
+            'python -m tau.tools.commands status                  # Check task/memory status',
+            'python -m tau.tools.commands adapt "Add feature Z"   # Self-modify code (triggers restart)',
+            'python -m tau.tools.commands cron 1h "Check status"  # Schedule recurring prompt',
+            'python -m tau.tools.commands crons                   # List active cron jobs',
+            'python -m tau.tools.commands uncron 1                # Remove cron job #1',
+            'python -m tau.tools.commands clear                   # Stop active agent processes',
         ],
     },
 }
