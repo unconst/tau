@@ -11,7 +11,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from openai import OpenAI
-from .telegram import bot, save_chat_id, notify, WORKSPACE, append_chat_history, TelegramStreamingMessage
+from .telegram import (
+    bot, save_chat_id, notify, WORKSPACE, append_chat_history,
+    TelegramStreamingMessage, authorize, is_owner, is_private_chat,
+    is_group_chat, save_chat_metadata, list_chats, get_chat_history_for,
+    send_to_chat,
+)
 from .agent import run_loop, TASKS_DIR, get_all_tasks, git_commit_changes, set_debug_mode, read_file, run_memory_maintenance
 from . import processes
 import re
@@ -561,7 +566,7 @@ Please execute this scheduled task. Provide a fresh update based on the current 
                     # Send result to user
                     try:
                         bot.send_message(job['chat_id'], f"⏰ Cron #{job['id']}:\n{response[:4000]}")
-                        append_chat_history("assistant", f"[cron #{job['id']}]: {response}")
+                        append_chat_history("assistant", f"[cron #{job['id']}]: {response}", chat_id=job['chat_id'])
                     except Exception as e:
                         logger.error(f"Failed to send cron result: {e}")
                         
@@ -579,16 +584,19 @@ def add_cron(message):
     """Add a cron job that runs a prompt at specified intervals."""
     global _next_cron_id
     
+    save_chat_metadata(message)
+    if not authorize(message):
+        return
     save_chat_id(message.chat.id)
     
     # Parse: /cron <interval> <prompt>
     text = message.text.replace('/cron', '', 1).strip()
-    append_chat_history("user", f"/cron {text}")
+    append_chat_history("user", f"/cron {text}", chat_id=message.chat.id)
     
     if not text:
         response = "Usage: /cron <interval> <prompt>\nExamples:\n  /cron 5min check the weather\n  /cron 30sec ping\n  /cron 1h summarize news"
         bot.reply_to(message, response)
-        append_chat_history("assistant", response)
+        append_chat_history("assistant", response, chat_id=message.chat.id)
         return
     
     # Split into interval and prompt
@@ -596,7 +604,7 @@ def add_cron(message):
     if len(parts) < 2:
         response = "Usage: /cron <interval> <prompt>\nNeed both an interval and a prompt."
         bot.reply_to(message, response)
-        append_chat_history("assistant", response)
+        append_chat_history("assistant", response, chat_id=message.chat.id)
         return
     
     interval_str, prompt = parts
@@ -628,14 +636,17 @@ def add_cron(message):
     
     response = f"✅ Cron #{cron_id} created: every {interval_display}\nPrompt: {prompt[:100]}"
     bot.reply_to(message, response)
-    append_chat_history("assistant", response)
+    append_chat_history("assistant", response, chat_id=message.chat.id)
 
 
 @bot.message_handler(commands=['crons'])
 def list_crons(message):
     """List all active cron jobs."""
+    save_chat_metadata(message)
+    if not authorize(message):
+        return
     save_chat_id(message.chat.id)
-    append_chat_history("user", "/crons")
+    append_chat_history("user", "/crons", chat_id=message.chat.id)
     
     with _cron_lock:
         if not _cron_jobs:
@@ -654,21 +665,24 @@ def list_crons(message):
             response = "\n".join(lines)
     
     bot.reply_to(message, response)
-    append_chat_history("assistant", response)
+    append_chat_history("assistant", response, chat_id=message.chat.id)
 
 
 @bot.message_handler(commands=['uncron'])
 def remove_cron(message):
     """Remove a cron job by ID."""
+    save_chat_metadata(message)
+    if not authorize(message):
+        return
     save_chat_id(message.chat.id)
     
     text = message.text.replace('/uncron', '', 1).strip()
-    append_chat_history("user", f"/uncron {text}")
+    append_chat_history("user", f"/uncron {text}", chat_id=message.chat.id)
     
     if not text:
         response = "Usage: /uncron <id>\nUse /crons to see active jobs."
         bot.reply_to(message, response)
-        append_chat_history("assistant", response)
+        append_chat_history("assistant", response, chat_id=message.chat.id)
         return
     
     try:
@@ -676,7 +690,7 @@ def remove_cron(message):
     except ValueError:
         response = "Invalid cron ID. Use /crons to see active jobs."
         bot.reply_to(message, response)
-        append_chat_history("assistant", response)
+        append_chat_history("assistant", response, chat_id=message.chat.id)
         return
     
     with _cron_lock:
@@ -686,29 +700,35 @@ def remove_cron(message):
                 save_crons()
                 response = f"✅ Cron #{cron_id} removed."
                 bot.reply_to(message, response)
-                append_chat_history("assistant", response)
+                append_chat_history("assistant", response, chat_id=message.chat.id)
                 return
     
     response = f"Cron #{cron_id} not found. Use /crons to see active jobs."
     bot.reply_to(message, response)
-    append_chat_history("assistant", response)
+    append_chat_history("assistant", response, chat_id=message.chat.id)
 
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
+    save_chat_metadata(message)
+    if not authorize(message):
+        return
     save_chat_id(message.chat.id)
-    append_chat_history("user", f"/start")
+    append_chat_history("user", f"/start", chat_id=message.chat.id)
     response = "Hello! I'm Tau. Commands:\n/task <description> - Add a task\n/plan <description> - Create an execution plan\n/status - See recent activity\n/adapt <prompt> - Self-modify\n/cron <interval> <prompt> - Schedule recurring prompt\n/crons - List active crons\n/uncron <id> - Remove a cron\n/clear - Stop active agent processes\n/restart - Restart bot\n/kill - Stop the bot\n/debug - Toggle debug mode"
     bot.reply_to(message, response)
-    append_chat_history("assistant", response)
+    append_chat_history("assistant", response, chat_id=message.chat.id)
 
 
 @bot.message_handler(commands=['debug'])
 def toggle_debug(message):
     """Toggle debug mode on/off."""
     global DEBUG_MODE
+    save_chat_metadata(message)
+    if not authorize(message):
+        return
     save_chat_id(message.chat.id)
-    append_chat_history("user", "/debug")
+    append_chat_history("user", "/debug", chat_id=message.chat.id)
     
     DEBUG_MODE = not DEBUG_MODE
     set_debug_mode(DEBUG_MODE)
@@ -716,7 +736,7 @@ def toggle_debug(message):
     status = "on" if DEBUG_MODE else "off"
     response = f"Debug mode: {status}"
     bot.reply_to(message, response)
-    append_chat_history("assistant", response)
+    append_chat_history("assistant", response, chat_id=message.chat.id)
 
 def restart_via_supervisor():
     """Restart tau via supervisorctl. Returns True if supervisor handled it."""
@@ -758,8 +778,11 @@ def stop_via_supervisor():
 @bot.message_handler(commands=['clear'])
 def clear_active_agent_processes(message):
     """Stop any in-flight agent subprocesses (e.g. stuck /ask, cron, agent loop)."""
+    save_chat_metadata(message)
+    if not authorize(message):
+        return
     save_chat_id(message.chat.id)
-    append_chat_history("user", "/clear")
+    append_chat_history("user", "/clear", chat_id=message.chat.id)
 
     stopped = processes.terminate_all(label_prefix="agent:", timeout_seconds=2.0)
     if stopped:
@@ -768,18 +791,21 @@ def clear_active_agent_processes(message):
         response = "No active agent processes."
 
     bot.reply_to(message, response)
-    append_chat_history("assistant", response)
+    append_chat_history("assistant", response, chat_id=message.chat.id)
 
 
 @bot.message_handler(commands=['kill'])
 def kill_bot(message):
     """Fully stop the bot process (and attempt to stop supervisord-managed service)."""
+    save_chat_metadata(message)
+    if not authorize(message):
+        return
     save_chat_id(message.chat.id)
-    append_chat_history("user", "/kill")
+    append_chat_history("user", "/kill", chat_id=message.chat.id)
 
     response = "🛑 Killing bot..."
     bot.reply_to(message, response)
-    append_chat_history("assistant", response)
+    append_chat_history("assistant", response, chat_id=message.chat.id)
 
     # Stop any in-flight agent subprocesses first.
     try:
@@ -808,10 +834,13 @@ def kill_bot(message):
 @bot.message_handler(commands=['restart'])
 def restart_bot(message):
     """Restart the bot process via supervisor."""
-    append_chat_history("user", f"/restart")
+    save_chat_metadata(message)
+    if not authorize(message):
+        return
+    append_chat_history("user", f"/restart", chat_id=message.chat.id)
     response = "Restarting..."
     bot.reply_to(message, response)
-    append_chat_history("assistant", response)
+    append_chat_history("assistant", response, chat_id=message.chat.id)
     bot.stop_polling()
     
     # Try supervisor restart first
@@ -1169,16 +1198,19 @@ def run_adapt_streaming(
 @bot.message_handler(commands=['adapt'])
 def adapt_bot(message):
     """Self-modify the bot using cursor agent, then restart."""
+    save_chat_metadata(message)
+    if not authorize(message):
+        return
     # Extract prompt after /adapt
     prompt = message.text.replace('/adapt', '', 1).strip()
     if not prompt:
         response = "Usage: /adapt <prompt>"
         bot.reply_to(message, response)
-        append_chat_history("user", f"/adapt")
-        append_chat_history("assistant", response)
+        append_chat_history("user", f"/adapt", chat_id=message.chat.id)
+        append_chat_history("assistant", response, chat_id=message.chat.id)
         return
     
-    append_chat_history("user", f"/adapt {prompt}")
+    append_chat_history("user", f"/adapt {prompt}", chat_id=message.chat.id)
     save_chat_id(message.chat.id)
     
     try:
@@ -1190,7 +1222,7 @@ def adapt_bot(message):
             timeout_seconds=3600,  # 1 hour timeout
         )
         
-        append_chat_history("assistant", f"✅ Adaptation complete: {result[:200]}")
+        append_chat_history("assistant", f"✅ Adaptation complete: {result[:200]}", chat_id=message.chat.id)
         
         # Commit any changes made by the agent
         git_commit_changes(prompt)
@@ -1206,7 +1238,7 @@ def adapt_bot(message):
     except Exception as e:
         error_msg = f"Adaptation error: {str(e)}"
         bot.reply_to(message, error_msg)
-        append_chat_history("assistant", error_msg)
+        append_chat_history("assistant", error_msg, chat_id=message.chat.id)
 
 
 PLANS_DIR = os.path.join(WORKSPACE, "context", "plans")
@@ -1503,15 +1535,18 @@ Output ONLY the plan content, no preamble or meta-commentary."""
 @bot.message_handler(commands=['plan'])
 def create_plan(message):
     """Create a plan for a task and save it to a file."""
+    save_chat_metadata(message)
+    if not authorize(message):
+        return
     save_chat_id(message.chat.id)
     
     task_text = message.text.replace('/plan', '', 1).strip()
-    append_chat_history("user", f"/plan {task_text}")
+    append_chat_history("user", f"/plan {task_text}", chat_id=message.chat.id)
     
     if not task_text:
         response = "Usage: /plan <task description>\n\nExample: /plan implement user authentication with OAuth2"
         bot.reply_to(message, response)
-        append_chat_history("assistant", response)
+        append_chat_history("assistant", response, chat_id=message.chat.id)
         return
     
     try:
@@ -1523,28 +1558,31 @@ def create_plan(message):
         )
         
         if plan_filename:
-            append_chat_history("assistant", f"✅ Plan created: {plan_filename}")
+            append_chat_history("assistant", f"✅ Plan created: {plan_filename}", chat_id=message.chat.id)
         else:
-            append_chat_history("assistant", f"Plan generation failed: {plan_content[:200]}")
+            append_chat_history("assistant", f"Plan generation failed: {plan_content[:200]}", chat_id=message.chat.id)
             
     except Exception as e:
         error_msg = f"Error creating plan: {str(e)}"
         bot.reply_to(message, error_msg)
-        append_chat_history("assistant", error_msg)
+        append_chat_history("assistant", error_msg, chat_id=message.chat.id)
 
 
 @bot.message_handler(commands=['task'])
 def add_task(message):
     """Add a task to its own directory."""
+    save_chat_metadata(message)
+    if not authorize(message):
+        return
     save_chat_id(message.chat.id)
     
     task_text = message.text.replace('/task', '', 1).strip()
-    append_chat_history("user", f"/task {task_text}")
+    append_chat_history("user", f"/task {task_text}", chat_id=message.chat.id)
     
     if not task_text:
         response = "Usage: /task <description>"
         bot.reply_to(message, response)
-        append_chat_history("assistant", response)
+        append_chat_history("assistant", response, chat_id=message.chat.id)
         return
     
     # Ensure tasks directory exists
@@ -1572,14 +1610,17 @@ def add_task(message):
     
     response = f"✅ Task added ({task_id}): {task_text}"
     bot.reply_to(message, response)
-    append_chat_history("assistant", response)
+    append_chat_history("assistant", response, chat_id=message.chat.id)
 
 
 @bot.message_handler(commands=['status'])
 def get_status(message):
     """Show recent high-level memory and task status."""
+    save_chat_metadata(message)
+    if not authorize(message):
+        return
     save_chat_id(message.chat.id)
-    append_chat_history("user", "/status")
+    append_chat_history("user", "/status", chat_id=message.chat.id)
     
     # Get high-level memory
     high_level = ""
@@ -1610,16 +1651,19 @@ def get_status(message):
     if not status_msg.strip() or status_msg == "📊 Status\n\n":
         response = "No tasks or memory yet."
         bot.reply_to(message, response)
-        append_chat_history("assistant", response)
+        append_chat_history("assistant", response, chat_id=message.chat.id)
     else:
         response = status_msg[:4000]
         bot.reply_to(message, response)
-        append_chat_history("assistant", response)
+        append_chat_history("assistant", response, chat_id=message.chat.id)
 
 
 @bot.message_handler(content_types=['voice'])
 def handle_voice_message(message):
     """Handle voice messages by transcribing and processing as text."""
+    save_chat_metadata(message)
+    if not authorize(message):
+        return
     save_chat_id(message.chat.id)
     
     # Notify user that we're processing the voice message (we'll edit this message with the answer)
@@ -1639,12 +1683,12 @@ def handle_voice_message(message):
                 bot.edit_message_text(response, message.chat.id, processing_msg.message_id)
             except Exception:
                 bot.reply_to(message, response)
-            append_chat_history("user", "[voice message - transcription failed]")
-            append_chat_history("assistant", response)
+            append_chat_history("user", "[voice message - transcription failed]", chat_id=message.chat.id)
+            append_chat_history("assistant", response, chat_id=message.chat.id)
             return
         
         # Append transcribed text to chat history with voice indicator
-        append_chat_history("user", f"[voice]: {transcribed_text}")
+        append_chat_history("user", f"[voice]: {transcribed_text}", chat_id=message.chat.id)
         
         # Get chat history BEFORE processing (so current message only appears once)
         from .telegram import get_chat_history
@@ -1703,7 +1747,7 @@ Please respond to the user's message above, considering the full context of our 
                     model=cursor_model,
                     timeout_seconds=600,
                 )
-            append_chat_history("assistant", response)
+            append_chat_history("assistant", response, chat_id=message.chat.id)
         finally:
             # Stop typing indicator
             typing_stop.set()
@@ -1714,7 +1758,7 @@ Please respond to the user's message above, considering the full context of our 
             bot.edit_message_text(error_msg, message.chat.id, processing_msg.message_id)
         except Exception:
             bot.reply_to(message, error_msg)
-        append_chat_history("assistant", error_msg)
+        append_chat_history("assistant", error_msg, chat_id=message.chat.id)
     finally:
         # Clean up temporary voice file
         if voice_path and os.path.exists(voice_path):
@@ -1727,14 +1771,17 @@ Please respond to the user's message above, considering the full context of our 
 @bot.message_handler(content_types=['photo', 'document', 'sticker', 'video', 'audio', 'animation', 'video_note', 'contact', 'location', 'venue', 'poll'])
 def handle_other_content(message):
     """Handle non-text content types with a confirmation."""
+    save_chat_metadata(message)
+    if not authorize(message):
+        return
     save_chat_id(message.chat.id)
     
     # Determine content type for the confirmation message
     content_type = message.content_type
     response = f"📨 Received {content_type}. I can process text and voice messages."
     bot.reply_to(message, response)
-    append_chat_history("user", f"[{content_type}]")
-    append_chat_history("assistant", response)
+    append_chat_history("user", f"[{content_type}]", chat_id=message.chat.id)
+    append_chat_history("assistant", response, chat_id=message.chat.id)
 
 
 def send_typing_action(chat_id, stop_event):
@@ -2268,23 +2315,49 @@ def _extract_final_answer(output: str) -> str:
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
-    """Handle all non-command text messages by calling the agent."""
+    """Handle all non-command text messages.
+
+    Security model:
+    - Always log the message to per-chat history (group observer).
+    - Only generate a response and invoke the agent for the owner.
+    - Non-owner messages in groups are silently observed.
+    - Non-owner private messages are silently ignored.
+    """
     logger.info(f"=== MESSAGE RECEIVED: '{message.text[:50]}...' ===" if len(message.text or '') > 50 else f"=== MESSAGE RECEIVED: '{message.text}' ===")
-    save_chat_id(message.chat.id)
-    
+
+    # Always persist metadata for the chat
+    save_chat_metadata(message)
+
+    # Determine sender display name for logging
+    sender_username = None
+    if message.from_user:
+        sender_username = message.from_user.username or message.from_user.first_name
+
     # Skip if message has no text
     if not message.text:
         logger.info("No text in message, skipping")
-        bot.reply_to(message, "📨 Received your message.")
+        # Only respond to owner
+        if authorize(message):
+            bot.reply_to(message, "📨 Received your message.")
         return
-    
+
+    # --- Group observer: always log the message regardless of sender ---
+    append_chat_history("user", message.text, chat_id=message.chat.id, username=sender_username)
+
+    # --- Authorization gate ---
+    if not authorize(message):
+        # Non-owner: message was logged above, but we don't respond or process.
+        logger.info(f"Non-owner message from user {message.from_user.id} in chat {message.chat.id} — logged only")
+        return
+
+    # Owner is speaking — save their private chat id for notifications
+    if is_private_chat(message):
+        save_chat_id(message.chat.id)
+
     # Get chat history BEFORE appending current message (so current message only appears once)
     from .telegram import get_chat_history
-    chat_history = get_chat_history()
+    chat_history = get_chat_history(chat_id=message.chat.id)
     logger.info(f"Chat history loaded: {len(chat_history)} chars")
-    
-    # Now append the user message
-    append_chat_history("user", message.text)
     
     # Build prompt with minimal context for simple questions
     # Only include last 20 lines of chat for continuity, not the full history
@@ -2412,7 +2485,7 @@ INSTRUCTIONS:
             )
         elapsed = (datetime.now() - start_time).total_seconds()
         logger.info(f"Response completed in {elapsed:.1f}s (streamed)")
-        append_chat_history("assistant", response)
+        append_chat_history("assistant", response, chat_id=message.chat.id)
         logger.info("Response streamed to Telegram")
         
     except subprocess.TimeoutExpired:
@@ -2420,13 +2493,13 @@ INSTRUCTIONS:
         logger.error(f"Response TIMEOUT after {elapsed:.1f}s")
         error_msg = "Request timed out."
         bot.reply_to(message, error_msg)
-        append_chat_history("assistant", error_msg)
+        append_chat_history("assistant", error_msg, chat_id=message.chat.id)
     except Exception as e:
         elapsed = (datetime.now() - start_time).total_seconds()
         logger.error(f"Response ERROR after {elapsed:.1f}s: {str(e)}")
         error_msg = f"Error: {str(e)}"
         bot.reply_to(message, error_msg)
-        append_chat_history("assistant", error_msg)
+        append_chat_history("assistant", error_msg, chat_id=message.chat.id)
     finally:
         typing_stop.set()
         logger.info("=== MESSAGE HANDLING COMPLETE ===")

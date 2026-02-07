@@ -8,7 +8,21 @@ Read this file first to determine which context to load.
 
 ## Conversation Context (Auto-loaded)
 - `context/CHAT_SUMMARY.md` - Hourly summary of full conversation (always included in agent calls)
-- `context/CHAT.md` (full conversation history - only load if deep history needed)
+
+## Multi-Chat Storage
+Chat history is stored per-chat under `context/chats/<chat_id>/`:
+- `context/chats/<chat_id>/CHAT.md` - Conversation history for that chat
+- `context/chats/<chat_id>/meta.json` - Chat metadata (title, type, username, updated_at)
+
+The owner's 1:1 private chat is the primary conversation.
+Group chats the bot is added to are observed and logged (all messages from all users).
+Only the owner can issue commands or get responses — other users' messages are logged silently.
+
+**Programmatic access (from Python):**
+- `list_chats()` — returns a list of dicts with metadata for every known chat
+- `get_chat_history_for(chat_id, max_lines=100)` — returns recent history for a specific chat
+- `send_to_chat(chat_id, text)` — sends a message to any chat the bot is a member of
+These are importable from `tau.telegram`.
 
 ## Task-Specific Context
 Load only for the active task (e.g. if the user asks about a specific task ID):

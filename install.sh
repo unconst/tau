@@ -96,6 +96,7 @@ INSTALL_DIR=""
 INSTANCE_ID=""
 RUNNING_FROM_REPO=false
 BOT_TOKEN=""
+BOT_NAME=""
 CLEANUP_FILES=()  # Track files to clean up on failure
 LOCK_DIR=""
 LOCK_ACQUIRED=false
@@ -669,6 +670,68 @@ generate_instance_id() {
     echo "$base"
 }
 
+resolve_bot_name() {
+    local token="$1"
+    local response
+    response=$(curl -sf --connect-timeout 10 --max-time 15 \
+        "https://api.telegram.org/bot${token}/getMe" 2>/dev/null) || return 1
+    
+    # Extract username from JSON: {"ok":true,"result":{..."username":"bot_name"...}}
+    local username
+    username=$(printf '%s' "$response" | grep -o '"username":"[^"]*"' | head -1 | cut -d'"' -f4)
+    
+    if [ -n "$username" ]; then
+        printf '%s' "$username" | tr '[:upper:]' '[:lower:]'
+        return 0
+    fi
+    return 1
+}
+
+collect_bot_token() {
+    # Already have a token
+    if [ -n "$BOT_TOKEN" ]; then
+        return 0
+    fi
+    
+    # Check environment variable
+    if [ -n "$TAU_BOT_TOKEN" ]; then
+        BOT_TOKEN="$TAU_BOT_TOKEN"
+        info "Using provided token"
+        return 0
+    fi
+    
+    # Interactive prompt
+    if [ "$HAS_TTY" = true ] && [ "$FAST" != "1" ]; then
+        info "Create a bot via @BotFather ${SYM_ARROW} /newbot"
+        log ""
+        printf "  ${DIM}Bot token:${NC} "
+        read -r BOT_TOKEN </dev/tty 2>/dev/null || BOT_TOKEN=""
+        
+        if [ -z "$BOT_TOKEN" ]; then
+            err "Token required"
+            exit 1
+        fi
+    elif [ "$FAST" = "1" ]; then
+        err "Telegram bot token required in non-interactive mode"
+        info "Set TAU_BOT_TOKEN environment variable"
+        exit 1
+    else
+        err "Telegram bot token required"
+        info "Set TAU_BOT_TOKEN environment variable and run again"
+        exit 1
+    fi
+    
+    # Validate token format (basic check)
+    if [[ ! "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
+        warn "Token format looks unusual (expected: 123456:ABC-DEF...)"
+        if [ "$HAS_TTY" = true ]; then
+            if ! prompt_yn "Continue anyway"; then
+                exit 1
+            fi
+        fi
+    fi
+}
+
 detect_install_context() {
     local script_dir=""
     
@@ -716,21 +779,31 @@ step_welcome() {
         info "Proceeding, but some features may not work"
     fi
     
-    if [ -z "$INSTALL_DIR" ]; then
-        if [ "$FAST" != "1" ] && [ "$HAS_TTY" = true ]; then
-            printf "Install path ${DIM}(default: ~/tau)${NC}: "
-            read -r INSTALL_PATH </dev/tty 2>/dev/null || INSTALL_PATH=""
+    # Always collect bot token first to determine install directory
+    section "Telegram"
+    log ""
+    collect_bot_token
+    
+    # Resolve bot name from token for directory name
+    if [ -n "$BOT_TOKEN" ]; then
+        BOT_NAME=$(resolve_bot_name "$BOT_TOKEN" 2>/dev/null) || true
+        if [ -n "$BOT_NAME" ]; then
+            ok "Bot: @$BOT_NAME"
         else
-            INSTALL_PATH=""
+            warn "Could not resolve bot name from token"
         fi
-        
-        if [ -z "$INSTALL_PATH" ]; then
-            INSTALL_DIR="$HOME/tau"
-        else
-            INSTALL_DIR="${INSTALL_PATH/#\~/$HOME}"
-        fi
-        printf "\n"
     fi
+    
+    local default_dir="${BOT_NAME:-tau}"
+    local new_dir="$HOME/$default_dir"
+    
+    # Update install dir and running-from-repo flag
+    if [ "$RUNNING_FROM_REPO" = true ] && [ "$new_dir" != "$INSTALL_DIR" ]; then
+        # Target differs from repo dir — will clone fresh
+        RUNNING_FROM_REPO=false
+    fi
+    INSTALL_DIR="$new_dir"
+    printf "\n"
     
     INSTANCE_ID=$(generate_instance_id "$INSTALL_DIR")
     
@@ -739,15 +812,6 @@ step_welcome() {
     fi
     
     info "Installing to $INSTALL_DIR"
-    
-    if [ "$FAST" != "1" ] && [ "$HAS_TTY" = true ]; then
-        printf "\n  ${SYM_ARROW} Begin [Y/n]: "
-        read -r -n 1 REPLY </dev/tty 2>/dev/null || REPLY=""
-        printf "\n"
-        if [[ $REPLY =~ ^[Nn]$ ]]; then
-            exit 0
-        fi
-    fi
 }
 
 # Pre-flight checks before starting installation
@@ -798,8 +862,6 @@ step_preflight() {
         err "Pre-flight checks failed ($errors errors)"
         exit 1
     fi
-    
-    pause
 }
 
 step_dependencies() {
@@ -909,8 +971,6 @@ step_dependencies() {
         
         ok "All dependencies satisfied"
     fi
-    
-    pause
 }
 
 install_macos_deps() {
@@ -1172,8 +1232,16 @@ step_clone() {
     fi
     
     if [ -d "$INSTALL_DIR" ]; then
-        if [ ! -f "$INSTALL_DIR/tauctl" ]; then
-            # Directory exists but isn't a tau install - might be a failed clone
+        # Check if directory is effectively empty (only .install.lock from acquire_lock)
+        local dir_contents
+        dir_contents=$(ls -A "$INSTALL_DIR" 2>/dev/null | grep -v '^\.install\.lock$' || true)
+        
+        if [ -z "$dir_contents" ]; then
+            # Directory only has our lock (or is empty) — remove so git clone can use it
+            debug "Directory exists but only contains install lock, removing for fresh clone"
+            rm -rf "$INSTALL_DIR"
+        elif [ ! -f "$INSTALL_DIR/tauctl" ]; then
+            # Directory exists with real content but isn't a tau install
             warn "Directory exists but appears incomplete"
             if prompt_yn "Remove and re-clone"; then
                 if ! safe_rm_dir "$INSTALL_DIR"; then
@@ -1234,6 +1302,12 @@ step_clone() {
         exit 1
     fi
     rm -f "$tmplog"
+    
+    # Re-acquire lock inside cloned directory (lock was removed for clean clone)
+    if [ "$LOCK_ACQUIRED" = false ] || [ ! -d "$INSTALL_DIR/.install.lock" ]; then
+        LOCK_ACQUIRED=false
+        acquire_lock "$INSTALL_DIR/.install.lock"
+    fi
     
     cd "$INSTALL_DIR" || {
         err "Clone succeeded but cannot access $INSTALL_DIR"
@@ -1378,62 +1452,24 @@ step_cursor_agent() {
 }
 
 step_telegram() {
-    section "Telegram"
-    log ""
-    
-    if [ -n "$TAU_BOT_TOKEN" ]; then
-        info "Using provided token"
-        BOT_TOKEN="$TAU_BOT_TOKEN"
-    elif [ -f "$INSTALL_DIR/.env" ] && grep -q "TAU_BOT_TOKEN=" "$INSTALL_DIR/.env" 2>/dev/null; then
-        # Token already exists in .env
-        info "Using existing token from .env"
-        BOT_TOKEN=$(grep "TAU_BOT_TOKEN=" "$INSTALL_DIR/.env" | cut -d'=' -f2-)
-    elif [ "$HAS_TTY" = true ]; then
-        info "Create a bot via @BotFather ${SYM_ARROW} /newbot"
+    # Token should already be collected in step_welcome.
+    # If somehow missing, prompt for it.
+    if [ -z "$BOT_TOKEN" ]; then
+        section "Telegram"
         log ""
-        printf "  ${DIM}Token:${NC} "
-        read -r BOT_TOKEN </dev/tty 2>/dev/null || BOT_TOKEN=""
-        
-        if [ -z "$BOT_TOKEN" ]; then
-            err "Token required"
-            if prompt_yn "Retry"; then
-                step_telegram
-                return
-            fi
-            exit 1
-        fi
-    else
-        # Non-interactive mode without token
-        err "Telegram bot token required"
-        info "Set TAU_BOT_TOKEN environment variable and run again"
-        info "Example: TAU_BOT_TOKEN=your_token ./install.sh"
-        exit 1
-    fi
-    
-    # Validate token format (basic check)
-    if [[ ! "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
-        warn "Token format looks unusual (expected: 123456:ABC-DEF...)"
-        if [ "$HAS_TTY" = true ]; then
-            if ! prompt_yn "Continue anyway"; then
-                step_telegram
-                return
-            fi
-        fi
+        collect_bot_token
+        ok "Telegram configured"
     fi
     
     # Write/update .env file
     if [ -f "$INSTALL_DIR/.env" ]; then
         # Remove existing token line (if any) and append new one
-        # Uses grep -v instead of sed to avoid delimiter injection issues
         grep -v "^TAU_BOT_TOKEN=" "$INSTALL_DIR/.env" > "$INSTALL_DIR/.env.tmp" 2>/dev/null || true
         mv "$INSTALL_DIR/.env.tmp" "$INSTALL_DIR/.env"
         echo "TAU_BOT_TOKEN=$BOT_TOKEN" >> "$INSTALL_DIR/.env"
     else
         echo "TAU_BOT_TOKEN=$BOT_TOKEN" > "$INSTALL_DIR/.env"
     fi
-    
-    ok "Telegram configured"
-    pause
 }
 
 step_openai() {
@@ -1624,13 +1660,8 @@ step_launch() {
         fi
     fi
     
-    if prompt_yn "Auto-start on boot"; then
-        do_autostart=true
-    fi
-    
-    if prompt_yn "Start now"; then
-        do_start=true
-    fi
+    do_autostart=true
+    do_start=true
     
     if [ "$do_autostart" = true ]; then
         local OS=$(detect_os)

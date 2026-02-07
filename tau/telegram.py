@@ -1,7 +1,9 @@
 """Shared Telegram bot for Tau agent."""
 
 import os
+import json
 import time
+import logging
 from pathlib import Path
 
 # Load .env file before accessing any environment variables
@@ -12,13 +14,86 @@ load_dotenv(os.path.join(WORKSPACE, ".env"))
 import telebot
 from datetime import datetime
 
+logger = logging.getLogger(__name__)
+
 BOT_TOKEN = os.getenv("TAU_BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("TAU_BOT_TOKEN environment variable is required. Create a .env file with TAU_BOT_TOKEN=your_token")
 CHAT_ID_FILE = os.path.join(WORKSPACE, "chat_id.txt")
 CHAT_HISTORY_FILE = os.path.join(WORKSPACE, "context", "CHAT.md")
+CHATS_DIR = os.path.join(WORKSPACE, "context", "chats")
 
 bot = telebot.TeleBot(BOT_TOKEN)
+
+# ---------------------------------------------------------------------------
+# Owner authentication
+# ---------------------------------------------------------------------------
+OWNER_ID: str | None = os.getenv("OWNER_ID")
+
+
+def is_owner(message) -> bool:
+    """Check if the message sender is the bot owner."""
+    if OWNER_ID is None:
+        return False
+    return str(message.from_user.id) == str(OWNER_ID)
+
+
+def is_private_chat(message) -> bool:
+    """Check if the message is from a private (1:1) chat."""
+    return message.chat.type == "private"
+
+
+def is_group_chat(message) -> bool:
+    """Check if the message is from a group or supergroup chat."""
+    return message.chat.type in ("group", "supergroup")
+
+
+def bootstrap_owner(message) -> bool:
+    """Register the first user who DMs the bot as the owner.
+
+    Returns True if bootstrap occurred (caller should proceed), False if
+    the message should be ignored (e.g. a group message with no owner set).
+    """
+    global OWNER_ID
+    if OWNER_ID is not None:
+        return False  # already bootstrapped
+
+    # Only bootstrap from a private chat
+    if not is_private_chat(message):
+        return False
+
+    OWNER_ID = str(message.from_user.id)
+
+    # Persist to .env so it survives restarts
+    env_path = os.path.join(WORKSPACE, ".env")
+    with open(env_path, "a") as f:
+        f.write(f"\nOWNER_ID={OWNER_ID}\n")
+
+    logger.info(f"Owner bootstrapped: user_id={OWNER_ID}")
+    return True
+
+
+def authorize(message, *, require_owner: bool = True) -> bool:
+    """Central authorization check for every handler.
+
+    Returns True if the handler should proceed, False to silently skip.
+
+    Behavior:
+    - If no OWNER_ID: bootstrap from a private DM, ignore everything else.
+    - Private chat from non-owner: silently ignore.
+    - Group chat from non-owner: silently ignore (logging happens separately).
+    - Owner: always allowed.
+    """
+    # Bootstrap mode: no owner registered yet
+    if OWNER_ID is None:
+        if bootstrap_owner(message):
+            return True  # first DM user is now the owner, proceed
+        return False  # ignore until owner is set
+
+    if not require_owner:
+        return True
+
+    return is_owner(message)
 
 
 def think(msg: str):
@@ -274,48 +349,158 @@ def save_chat_id(chat_id: int):
     open(CHAT_ID_FILE, "w").write(str(chat_id))
 
 
-def append_chat_history(role: str, content: str):
-    """Append a message to context/CHAT.md history file.
-    
+def _chat_dir_for(chat_id: int) -> str:
+    """Return the directory path for a specific chat's storage."""
+    return os.path.join(CHATS_DIR, str(chat_id))
+
+
+def _chat_file_for(chat_id: int) -> str:
+    """Return the CHAT.md path for a specific chat."""
+    return os.path.join(_chat_dir_for(chat_id), "CHAT.md")
+
+
+def save_chat_metadata(message):
+    """Persist chat metadata (title, type, etc.) to meta.json.
+
+    Called once per chat on first encounter and updated on subsequent messages.
+    """
+    chat = message.chat
+    chat_dir = _chat_dir_for(chat.id)
+    os.makedirs(chat_dir, exist_ok=True)
+    meta_path = os.path.join(chat_dir, "meta.json")
+
+    meta = {}
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+        except Exception:
+            meta = {}
+
+    meta.update({
+        "chat_id": chat.id,
+        "type": chat.type,
+        "title": chat.title or getattr(chat, "first_name", None) or str(chat.id),
+        "username": getattr(chat, "username", None),
+        "updated_at": datetime.now().isoformat(),
+    })
+
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+
+def append_chat_history(role: str, content: str, chat_id: int | None = None, username: str | None = None):
+    """Append a message to the per-chat history file.
+
     Args:
         role: Either 'user' or 'assistant'
         content: The message content
+        chat_id: Telegram chat ID. If None, falls back to the owner's saved chat ID.
+        username: Optional display name for the sender (useful in groups).
     """
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
+
+    # Determine which chat file to write to
+    if chat_id is not None:
+        chat_file = _chat_file_for(chat_id)
+    else:
+        # Fallback: try the owner's stored chat id, or the legacy file
+        owner_chat = get_chat_id()
+        if owner_chat:
+            chat_file = _chat_file_for(owner_chat)
+        else:
+            chat_file = CHAT_HISTORY_FILE
+
+    os.makedirs(os.path.dirname(chat_file), exist_ok=True)
+
     # Ensure file exists with header
-    if not os.path.exists(CHAT_HISTORY_FILE):
-        with open(CHAT_HISTORY_FILE, "w") as f:
+    if not os.path.exists(chat_file):
+        with open(chat_file, "w") as f:
             f.write("# Telegram Chat History\n\n")
-            f.write("This file contains the complete history of all Telegram conversations.\n")
+            f.write("This file contains the conversation history for this chat.\n")
             f.write("It is automatically updated as new messages are sent and received.\n\n")
             f.write("---\n\n")
-    
+
+    # Build the header — include username when available (group chats)
+    sender = role.upper()
+    if username and role.lower() == "user":
+        sender = f"{role.upper()} ({username})"
+
     # Append new message
-    with open(CHAT_HISTORY_FILE, "a") as f:
-        f.write(f"## {role.upper()} - {timestamp}\n\n")
+    with open(chat_file, "a") as f:
+        f.write(f"## {sender} - {timestamp}\n\n")
         f.write(f"{content}\n\n")
         f.write("---\n\n")
 
 
-def get_chat_history(max_lines: int = 100) -> str:
-    """Get recent chat history from context/CHAT.md.
-    
+def get_chat_history(max_lines: int = 100, chat_id: int | None = None) -> str:
+    """Get recent chat history for a specific chat.
+
     Args:
         max_lines: Maximum number of lines to return (default 100)
-    
+        chat_id: Telegram chat ID. If None, uses the owner's saved chat.
+
     Returns:
         Recent chat history, truncated to max_lines
     """
-    if os.path.exists(CHAT_HISTORY_FILE):
-        with open(CHAT_HISTORY_FILE) as f:
+    if chat_id is not None:
+        target_file = _chat_file_for(chat_id)
+    else:
+        owner_chat = get_chat_id()
+        if owner_chat:
+            target_file = _chat_file_for(owner_chat)
+        else:
+            target_file = CHAT_HISTORY_FILE
+
+    if os.path.exists(target_file):
+        with open(target_file) as f:
             lines = f.readlines()
-        
+
         if len(lines) <= max_lines:
             return "".join(lines)
-        
-        # Return header (first 10 lines + last (max_lines - 10) lines
+
+        # Return header (first 10 lines) + last (max_lines - 10) lines
         header = lines[:10]
         recent = lines[-(max_lines - 10):]
         return "".join(header) + "\n[... earlier messages truncated ...]\n\n" + "".join(recent)
     return ""
+
+
+# ---------------------------------------------------------------------------
+# Multi-chat utilities (for agent use)
+# ---------------------------------------------------------------------------
+
+def list_chats() -> list[dict]:
+    """List all known chats with their metadata.
+
+    Returns a list of dicts with keys: chat_id, type, title, username, updated_at.
+    """
+    chats = []
+    if not os.path.isdir(CHATS_DIR):
+        return chats
+
+    for entry in os.listdir(CHATS_DIR):
+        meta_path = os.path.join(CHATS_DIR, entry, "meta.json")
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, "r") as f:
+                    meta = json.load(f)
+                chats.append(meta)
+            except Exception:
+                continue
+    return chats
+
+
+def get_chat_history_for(chat_id: int, max_lines: int = 100) -> str:
+    """Get chat history for an arbitrary chat by ID."""
+    return get_chat_history(max_lines=max_lines, chat_id=chat_id)
+
+
+def send_to_chat(chat_id: int, text: str):
+    """Send a message to a specific Telegram chat (group or private).
+
+    The bot must be a member of the target chat.
+    """
+    chunks = split_message(text)
+    for chunk in chunks:
+        bot.send_message(chat_id, chunk)

@@ -29,6 +29,7 @@ context/logs/*.log*
 context/CHAT.md
 context/FACTS.md
 context/STORY.md
+context/chats/
 tasks/memory.md
 tasks/*/memory.md
 
