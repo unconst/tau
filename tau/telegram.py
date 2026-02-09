@@ -73,16 +73,25 @@ def bootstrap_owner(message) -> bool:
     return True
 
 
-def authorize(message, *, require_owner: bool = True, require_private: bool = True) -> bool:
+def is_main_chat(message) -> bool:
+    """Check if the message is from the owner's main chat (the one used for /start)."""
+    main_chat_id = get_chat_id()
+    if main_chat_id is None:
+        # No main chat saved yet — allow private chats so /start can bootstrap
+        return is_private_chat(message)
+    return message.chat.id == main_chat_id
+
+
+def authorize(message, *, require_owner: bool = True, require_main_chat: bool = True) -> bool:
     """Central authorization check for every handler.
 
     Returns True if the handler should proceed, False to silently skip.
 
     Behavior:
     - If no OWNER_ID: bootstrap from a private DM, ignore everything else.
-    - Private chat from non-owner: silently ignore.
-    - Group chat: silently ignore (logging happens separately in handle_message).
-    - Owner in private chat: allowed.
+    - Non-owner: silently ignore.
+    - Owner outside main chat: silently ignore (logging happens separately).
+    - Owner in main chat: allowed.
     """
     # Bootstrap mode: no owner registered yet
     if OWNER_ID is None:
@@ -96,8 +105,8 @@ def authorize(message, *, require_owner: bool = True, require_private: bool = Tr
     if not is_owner(message):
         return False
 
-    # Commands and responses only in the owner's private (1:1) chat
-    if require_private and not is_private_chat(message):
+    # Commands and responses only in the owner's main chat
+    if require_main_chat and not is_main_chat(message):
         return False
 
     return True

@@ -1705,6 +1705,24 @@ step_launch() {
             print_final
         else
             # Supervisord failed - likely a container, run directly
+            # IMPORTANT: Kill any partially-started supervisord and tau processes
+            # to avoid two instances polling the same Telegram token (409 conflict)
+            if [ -f "$INSTALL_DIR/.supervisord.pid" ]; then
+                local spid
+                spid=$(cat "$INSTALL_DIR/.supervisord.pid" 2>/dev/null)
+                if [ -n "$spid" ] && kill -0 "$spid" 2>/dev/null; then
+                    debug "Killing partially-started supervisord (pid $spid)"
+                    kill "$spid" 2>/dev/null || true
+                    portable_sleep 2
+                    kill -9 "$spid" 2>/dev/null || true
+                fi
+                rm -f "$INSTALL_DIR/.supervisord.pid"
+            fi
+            rm -f "$INSTALL_DIR/.supervisor.sock"
+            # Also kill any orphaned tau processes from the failed supervisord start
+            pkill -f "python.*-m tau.*$INSTALL_DIR" 2>/dev/null || true
+            portable_sleep 1
+
             warn "Supervisord failed, starting directly..."
             log ""
             info "Running in foreground (Ctrl+C to stop)"

@@ -2700,7 +2700,7 @@ def handle_message(message):
     openai_prompt = f"""RECENT CONTEXT (for continuity):
 {recent_chat}
 
-USER: {message_text}"""
+USER: {message.text}"""
 
     # Cursor agent prompt
     prompt_with_context = f"""You are Tau, an autonomous AI assistant running as a Telegram bot. Answer the user's question directly and concisely.
@@ -2718,7 +2718,7 @@ Just talk to me like you would a friend. I understand natural language, so you d
 RECENT CONTEXT (for continuity):
 {recent_chat}
 
-USER: {message_text}
+USER: {message.text}
 
 INSTRUCTIONS:
 - Answer directly without preamble
@@ -2849,6 +2849,11 @@ def main():
         backoff_s = 1
         while not _stop_event.is_set():
             try:
+                # Clean up any stale webhook/polling state before starting
+                try:
+                    bot.remove_webhook()
+                except Exception:
+                    pass
                 bot.polling()
                 backoff_s = 1  # reset on clean return
             except KeyboardInterrupt:
@@ -2858,12 +2863,22 @@ def main():
                 # Telebot may raise on startup if Telegram is unreachable (e.g. DNS issues).
                 # Don't crash-loop under supervisord; keep running and retry with backoff.
                 logger.error(f"Telegram polling crashed: {e}", exc_info=True)
+                # Stop any lingering polling threads before retrying to avoid
+                # two concurrent getUpdates requests (409 Conflict).
+                try:
+                    bot.stop_polling()
+                except Exception:
+                    pass
                 sleep_s = min(backoff_s, 60)
                 logger.info(f"Retrying Telegram polling in {sleep_s}s...")
                 time.sleep(sleep_s)
                 backoff_s = min(backoff_s * 2, 60)
     finally:
         _stop_event.set()
+        try:
+            bot.stop_polling()
+        except Exception:
+            pass
         if DEBUG_MODE:
             notify("🛑 Tau stopped")
 

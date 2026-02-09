@@ -138,7 +138,31 @@ case "${1:-}" in
     start)
         start_supervisord
         echo ""
-        supervisorctl_cmd start tau 2>/dev/null || supervisorctl_cmd status tau
+        # tau has autostart=true, so it may already be starting.
+        # Try explicit start (fails harmlessly if already started), then
+        # wait for RUNNING state so the caller gets a reliable exit code.
+        supervisorctl_cmd start tau 2>/dev/null || true
+        
+        # Wait up to 15s for tau to reach RUNNING state (startsecs=5 + buffer)
+        local retries=30
+        while [ $retries -gt 0 ]; do
+            local status_line
+            status_line=$("$TAU_DIR/.venv/bin/supervisorctl" -c "$SUPERVISOR_CONF" status tau 2>/dev/null || true)
+            case "$status_line" in
+                *RUNNING*)
+                    echo "${GREEN}✓${NC} Tau is running"
+                    exit 0
+                    ;;
+                *FATAL*|*BACKOFF*|*STOPPED*|*EXITED*)
+                    echo "${RED}✗${NC} Tau failed to start: $status_line"
+                    exit 1
+                    ;;
+            esac
+            sleep 0.5
+            retries=$((retries - 1))
+        done
+        # Timed out waiting
+        supervisorctl_cmd status tau
         ;;
     
     stop)
