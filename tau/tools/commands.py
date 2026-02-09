@@ -70,7 +70,7 @@ def cmd_task(description: str) -> str:
 def cmd_plan(description: str) -> str:
     """Create an execution plan for a task.
     
-    Uses the Cursor agent to generate a comprehensive plan based on 
+    Uses the Codex agent to generate a comprehensive plan based on 
     the task description and workspace context.
     
     Args:
@@ -135,15 +135,8 @@ Use the workspace context above to inform your plan.
 
 Output ONLY the plan content, no preamble."""
 
-    cmd = [
-        "agent",
-        "--force",
-        "--model", "opus-4.5",
-        "--mode=ask",
-        "--output-format=text",
-        "--print",
-        plan_prompt,
-    ]
+    from tau.codex import build_cmd as _build_codex_cmd, CHAT_MODEL
+    cmd = _build_codex_cmd(plan_prompt, model=CHAT_MODEL, readonly=True)
     
     try:
         result = subprocess.run(
@@ -153,7 +146,8 @@ Output ONLY the plan content, no preamble."""
             cwd=str(WORKSPACE),
             timeout=600,
         )
-        plan_content = result.stdout.strip() or result.stderr.strip()
+        from tau.codex import strip_think_tags
+        plan_content = strip_think_tags(result.stdout.strip() or result.stderr.strip())
         
         if not plan_content:
             return "Error: Failed to generate plan content"
@@ -236,7 +230,7 @@ def cmd_status() -> str:
 
 
 def cmd_adapt(prompt: str) -> str:
-    """Self-modify the bot using cursor agent.
+    """Self-modify the bot using Codex agent.
     
     WARNING: This modifies the bot's own code and triggers a restart.
     Use carefully.
@@ -250,14 +244,8 @@ def cmd_adapt(prompt: str) -> str:
     if not prompt:
         return "Error: Adaptation prompt is required"
     
-    cmd = [
-        "agent",
-        "--force",
-        "--model", "opus-4.5",
-        "--output-format=text",
-        "--print",
-        prompt,
-    ]
+    from tau.codex import build_cmd as _build_codex_cmd, AGENT_MODEL
+    cmd = _build_codex_cmd(prompt, model=AGENT_MODEL)
     
     try:
         result = subprocess.run(
@@ -267,7 +255,8 @@ def cmd_adapt(prompt: str) -> str:
             cwd=str(WORKSPACE),
             timeout=3600,
         )
-        output = result.stdout.strip() or result.stderr.strip()
+        from tau.codex import strip_think_tags
+        output = strip_think_tags(result.stdout.strip() or result.stderr.strip())
         
         # Commit changes
         try:

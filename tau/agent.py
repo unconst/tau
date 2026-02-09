@@ -1,4 +1,7 @@
-"""Minimal two-buffer agent loop with task-specific memory."""
+"""Minimal two-buffer agent loop with task-specific memory.
+
+Uses Codex CLI (``codex exec``) as the underlying LLM backend.
+"""
 
 import os
 import re
@@ -290,16 +293,8 @@ Original:
 
 Output ONLY the compressed summary, no preamble."""
 
-    cmd = [
-        "agent",
-        "--force",
-        "--model",
-        "composer-1",
-        "--mode=ask",
-        "--output-format=text",
-        "--print",
-        compress_prompt,
-    ]
+    from .codex import build_cmd, CHAT_MODEL
+    cmd = build_cmd(compress_prompt, model=CHAT_MODEL, readonly=True)
 
     try:
         from . import processes
@@ -315,7 +310,8 @@ Output ONLY the compressed summary, no preamble."""
         processes.track(proc, label="agent:compress", cmd=cmd, own_process_group=True)
         stdout, stderr = proc.communicate(timeout=120)
         processes.untrack(proc)
-        result = stdout.strip() if stdout.strip() else stderr.strip()
+        from .codex import strip_think_tags
+        result = strip_think_tags(stdout.strip() if stdout.strip() else stderr.strip())
         return result[:target_chars + 100]  # Allow slight overage
     except Exception:
         return content[:target_chars]  # Fallback to truncation
@@ -335,16 +331,8 @@ Summary:
 Return a bullet list of core facts (each starting with "- "), or "NONE" if no new core facts.
 Be very selective - only truly persistent information that would be useful months later."""
 
-    cmd = [
-        "agent",
-        "--force",
-        "--model",
-        "composer-1",
-        "--mode=ask",
-        "--output-format=text",
-        "--print",
-        extract_prompt,
-    ]
+    from .codex import build_cmd, CHAT_MODEL
+    cmd = build_cmd(extract_prompt, model=CHAT_MODEL, readonly=True)
 
     try:
         from . import processes
@@ -361,7 +349,8 @@ Be very selective - only truly persistent information that would be useful month
         stdout, stderr = proc.communicate(timeout=120)
         processes.untrack(proc)
         
-        facts = stdout.strip() if stdout.strip() else stderr.strip()
+        from .codex import strip_think_tags
+        facts = strip_think_tags(stdout.strip() if stdout.strip() else stderr.strip())
         if "NONE" in facts.upper() or not facts:
             return []
         
@@ -623,17 +612,10 @@ def create_high_level_summary(detailed_content: str, task_title: str) -> str:
     return summary
 
 
-def run_cursor(prompt: str) -> str:
-    """Run Cursor agent with prompt, return output."""
-    cmd = [
-        "agent",
-        "--force",
-        "--model",
-        "composer-1",
-        "--output-format=text",
-        "--print",
-        prompt,
-    ]
+def run_codex(prompt: str) -> str:
+    """Run Codex agent with prompt, return output."""
+    from .codex import build_cmd, AGENT_MODEL
+    cmd = build_cmd(prompt, model=AGENT_MODEL)
 
     proc = None
     stdout = ""
@@ -685,8 +667,9 @@ def run_cursor(prompt: str) -> str:
     if proc is not None and processes.pop_cancelled(proc.pid):
         return "Cancelled."
 
+    from .codex import strip_think_tags
     out = stdout.strip() if stdout and stdout.strip() else (stderr or "").strip()
-    return out
+    return strip_think_tags(out)
 
 
 def git_commit_changes(description: str):
@@ -964,7 +947,7 @@ def run_loop(stop_event=None):
                     
                     # Run agent
                     think("executing...")
-                    output = run_cursor(prompt)
+                    output = run_codex(prompt)
                     
                     # Commit any changes made by the agent
                     # Use task title + first part of output as commit description

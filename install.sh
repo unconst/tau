@@ -914,11 +914,11 @@ step_dependencies() {
         check_pending "uv"
     fi
     
-    # Check cursor agent
-    if command_exists agent; then
-        check_ok "cursor agent"
+    # Check codex CLI
+    if command_exists codex; then
+        check_ok "codex cli"
     else
-        check_pending "cursor agent"
+        check_pending "codex cli"
     fi
     
     # Handle missing dependencies
@@ -1371,83 +1371,131 @@ step_python() {
     mkdir -p "$INSTALL_DIR/context/logs"
 }
 
-step_cursor_agent() {
-    # Update PATH to include Cursor locations
-    export PATH="$HOME/.cursor/bin:$HOME/.local/bin:$PATH"
+step_codex() {
+    # Update PATH to include common install locations
+    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
     
-    if command_exists agent; then
-        debug "Cursor agent already installed: $(command -v agent)"
-        # Check if already authenticated
-        if agent whoami >/dev/null 2>&1; then
-            debug "Cursor agent already authenticated"
-            return 0
-        fi
-        # Installed but not authenticated - prompt login
-        if [ "$HAS_TTY" = true ]; then
-            warn "Cursor agent not authenticated"
-            log ""
-            if agent login; then
-                ok "Authenticated"
-            else
-                warn "Authentication failed"
-                info "Run 'agent login' manually to authenticate"
-            fi
-        else
-            info "Run 'agent login' to authenticate"
-        fi
+    if command_exists codex; then
+        debug "Codex CLI already installed: $(command -v codex)"
         return 0
     fi
     
     log ""
-    info "Cursor agent CLI enables autonomous operation"
+    info "Codex CLI enables autonomous agent operation"
     
-    if prompt_yn "Install Cursor CLI"; then
+    if prompt_yn "Install Codex CLI"; then
         local tmplog
         tmplog=$(mktemp)
         CLEANUP_FILES+=("$tmplog")
         
-        info "Downloading Cursor CLI..."
-        if curl -fsSL --retry 3 --retry-delay 2 https://cursor.com/install -o "$tmplog.sh" 2>"$tmplog"; then
-            CLEANUP_FILES+=("$tmplog.sh")
-            chmod +x "$tmplog.sh"
-            
-            if bash "$tmplog.sh" >"$tmplog" 2>&1; then
-                export PATH="$HOME/.cursor/bin:$HOME/.local/bin:$PATH"
-                
-                if command_exists agent; then
-                    ok "Cursor CLI installed"
-                    
-                    # Only attempt login if we have a TTY
-                    if [ "$HAS_TTY" = true ]; then
-                        info "Opening browser for authentication..."
-                        log ""
-                        if agent login 2>/dev/null; then
-                            ok "Authenticated"
-                        else
-                            warn "Authentication may have failed"
-                            info "Run 'agent login' manually to authenticate"
-                        fi
+        # --- Check for system build tools (C compiler + linker) ---
+        local has_build_tools=true
+        if ! command_exists cc && ! command_exists gcc; then
+            has_build_tools=false
+            if [ "$(uname)" = "Darwin" ]; then
+                info "C compiler not found — installing Xcode command-line tools..."
+                if xcode-select --install 2>/dev/null; then
+                    # Wait for install to finish (up to 5 minutes)
+                    local waited=0 max_wait=300
+                    while ! command_exists cc && [ $waited -lt $max_wait ]; do
+                        sleep 5
+                        waited=$((waited + 5))
+                    done
+                    if command_exists cc; then
+                        has_build_tools=true
+                        ok "Xcode command-line tools installed"
                     else
-                        info "Run 'agent login' to authenticate after installation"
+                        warn "Xcode tools install may still be running."
+                        info "Re-run this script after it finishes, or run: xcode-select --install"
                     fi
                 else
-                    warn "Installed but not found in PATH"
-                    info "Restart terminal, then run: agent login"
+                    warn "Could not trigger Xcode tools install."
+                    info "Run manually: xcode-select --install"
                 fi
             else
-                warn "Cursor CLI installation failed"
-                if [ -s "$tmplog" ]; then
-                    debug "Error: $(tail -5 "$tmplog")"
+                warn "No C compiler (cc/gcc) found. Install build-essential (Debian/Ubuntu)"
+                info "  or gcc (Fedora/RHEL) before building Codex from source."
+            fi
+        fi
+
+        # --- Strategy 1: build from bundled source (codex/ in repo) ---
+        local codex_src="$INSTALL_DIR/codex/codex-rs"
+        if [ -d "$codex_src" ] && [ "$has_build_tools" = true ]; then
+            # Ensure Rust toolchain is available
+            if ! command_exists cargo; then
+                info "Installing Rust toolchain (required to build Codex)..."
+                if curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y >"$tmplog" 2>&1; then
+                    export PATH="$HOME/.cargo/bin:$PATH"
+                    ok "Rust toolchain installed"
+                else
+                    warn "Rust installation failed"
+                    if [ -s "$tmplog" ]; then
+                        debug "Error: $(tail -5 "$tmplog")"
+                    fi
                 fi
             fi
-        else
-            warn "Failed to download Cursor CLI installer"
+            
+            if command_exists cargo; then
+                info "Building Codex CLI from source (this may take a few minutes)..."
+                if cargo build --release --manifest-path "$codex_src/Cargo.toml" >"$tmplog" 2>&1; then
+                    local binary="$codex_src/target/release/codex"
+                    if [ -f "$binary" ]; then
+                        mkdir -p "$HOME/.local/bin"
+                        cp "$binary" "$HOME/.local/bin/codex"
+                        chmod +x "$HOME/.local/bin/codex"
+                        export PATH="$HOME/.local/bin:$PATH"
+                        
+                        if command_exists codex; then
+                            ok "Codex CLI installed"
+                        else
+                            warn "Built but not found in PATH"
+                            info "Add ~/.local/bin to your PATH, then restart terminal"
+                        fi
+                    else
+                        warn "Build succeeded but binary not found"
+                    fi
+                else
+                    warn "Codex CLI build failed"
+                    if [ -s "$tmplog" ]; then
+                        debug "Error: $(tail -5 "$tmplog")"
+                    fi
+                fi
+            fi
+        elif [ -d "$codex_src" ] && [ "$has_build_tools" = false ]; then
+            warn "Skipping source build — no C compiler available"
         fi
         
-        rm -f "$tmplog" "$tmplog.sh"
+        if ! command_exists codex; then
+            warn "Could not install Codex CLI automatically"
+            info "Build manually from the bundled source:"
+            info "  cd $INSTALL_DIR/codex/codex-rs && cargo build --release"
+            info "  cp target/release/codex ~/.local/bin/"
+        fi
+        
+        rm -f "$tmplog"
     else
         info "Tau will work without it (limited functionality)"
-        info "Install later: curl https://cursor.com/install -fsSL | bash"
+        info "Build later:  cd codex/codex-rs && cargo build --release && cp target/release/codex ~/.local/bin/"
+    fi
+    
+    # --- Ensure the Tau workspace is trusted by codex ---
+    if command_exists codex; then
+        local codex_config="$HOME/.codex/config.toml"
+        mkdir -p "$HOME/.codex"
+        if [ -f "$codex_config" ]; then
+            if ! grep -q "projects.\"$INSTALL_DIR\"" "$codex_config" 2>/dev/null; then
+                printf '\n[projects."%s"]\ntrust_level = "trusted"\n' "$INSTALL_DIR" >> "$codex_config"
+                debug "Added Tau workspace trust to codex config"
+            fi
+        else
+            # Create a minimal config with the trust entry
+            cat > "$codex_config" << TOMLEOF
+
+[projects."$INSTALL_DIR"]
+trust_level = "trusted"
+TOMLEOF
+            debug "Created codex config with Tau workspace trust"
+        fi
     fi
 }
 
@@ -1469,6 +1517,42 @@ step_telegram() {
         echo "TAU_BOT_TOKEN=$BOT_TOKEN" >> "$INSTALL_DIR/.env"
     else
         echo "TAU_BOT_TOKEN=$BOT_TOKEN" > "$INSTALL_DIR/.env"
+    fi
+}
+
+step_chutes() {
+    local ENV_FILE="$INSTALL_DIR/.env"
+    
+    # Check if already set in environment
+    if [ -n "$CHUTES_API_TOKEN" ]; then
+        if ! grep -q "CHUTES_API_TOKEN" "$ENV_FILE" 2>/dev/null; then
+            echo "CHUTES_API_TOKEN=$CHUTES_API_TOKEN" >> "$ENV_FILE"
+            debug "Added Chutes token from environment"
+        fi
+        return 0
+    fi
+    
+    # Check if already in .env
+    if grep -q "CHUTES_API_TOKEN=" "$ENV_FILE" 2>/dev/null; then
+        debug "Chutes token already in .env"
+        return 0
+    fi
+    
+    # Skip in non-interactive mode
+    [ "$FAST" = "1" ] && return 0
+    [ "$HAS_TTY" = false ] && return 0
+    
+    log ""
+    info "Chutes API token is required for the Codex agent (get one at chutes.ai)"
+    printf "  ${DIM}Chutes API token (Enter to skip):${NC} "
+    read -r CHUTES_KEY </dev/tty 2>/dev/null || CHUTES_KEY=""
+    
+    if [ -n "$CHUTES_KEY" ]; then
+        echo "CHUTES_API_TOKEN=$CHUTES_KEY" >> "$ENV_FILE"
+        ok "Chutes token configured"
+    else
+        warn "Skipped - Codex agent will not work without CHUTES_API_TOKEN in .env"
+        info "Get a token at https://chutes.ai and add CHUTES_API_TOKEN=... to .env"
     fi
 }
 
@@ -1559,7 +1643,7 @@ setup_launchd() {
         <key>HOME</key>
         <string>$HOME</string>
         <key>PATH</key>
-        <string>$INSTALL_DIR/.venv/bin:$HOME/.local/bin:$HOME/.cursor/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>$INSTALL_DIR/.venv/bin:$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     </dict>
     <key>ProcessType</key>
     <string>Background</string>
@@ -1614,6 +1698,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=$INSTALL_DIR
+Environment="HOME=$HOME" "PATH=$INSTALL_DIR/.venv/bin:$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
 ExecStart=$INSTALL_DIR/.venv/bin/supervisord -n -c $INSTALL_DIR/supervisord.conf
 Restart=on-failure
 RestartSec=10
@@ -1836,7 +1921,8 @@ main() {
     step_dependencies
     step_clone
     step_python
-    step_cursor_agent
+    step_codex
+    step_chutes
     step_telegram
     step_openai
     step_launch

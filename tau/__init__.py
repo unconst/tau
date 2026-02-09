@@ -560,16 +560,8 @@ Rules:
 
 Output ONLY the updated summary, no preamble or explanation."""
 
-    cmd = [
-        "agent",
-        "--force",
-        "--model",
-        "composer-1",
-        "--mode=ask",
-        "--output-format=text",
-        "--print",
-        prompt,
-    ]
+    from .codex import build_cmd, CHAT_MODEL
+    cmd = build_cmd(prompt, model=CHAT_MODEL, readonly=True)
 
     proc = None
     try:
@@ -584,7 +576,9 @@ Output ONLY the updated summary, no preamble or explanation."""
         )
         processes.track(proc, label="agent:summary:incremental", cmd=cmd, own_process_group=True)
         stdout, stderr = proc.communicate(timeout=300)
-        return stdout.strip() if stdout.strip() else stderr.strip()
+        from .codex import strip_think_tags
+        raw = stdout.strip() if stdout.strip() else stderr.strip()
+        return strip_think_tags(raw)
     except subprocess.TimeoutExpired:
         try:
             processes.terminate_all(label_prefix="agent:summary:incremental", timeout_seconds=1.0)
@@ -671,16 +665,8 @@ The summary should be:
 
 Output ONLY the summary content, no preamble or explanation."""
 
-                cmd = [
-                    "agent",
-                    "--force",
-                    "--model",
-                    "composer-1",
-                    "--mode=ask",
-                    "--output-format=text",
-                    "--print",
-                    summary_prompt,
-                ]
+                from .codex import build_cmd, CHAT_MODEL
+                cmd = build_cmd(summary_prompt, model=CHAT_MODEL, readonly=True)
 
                 proc = None
                 stdout = ""
@@ -719,7 +705,8 @@ Output ONLY the summary content, no preamble or explanation."""
                     time.sleep(SUMMARY_INTERVAL)
                     continue
                 
-                summary = stdout.strip() if stdout.strip() else stderr.strip()
+                from .codex import strip_think_tags
+                summary = strip_think_tags(stdout.strip() if stdout.strip() else stderr.strip())
             
             if summary and len(summary) > 50:
                 # Build and save summary with versioning
@@ -830,16 +817,8 @@ CRON JOB PROMPT (runs every {job['interval_seconds']}s):
 
 Please execute this scheduled task. Provide a fresh update based on the current state or by using your tools. Do not simply repeat previous messages."""
 
-                cmd = [
-                    "agent",
-                    "--force",
-                    "--model",
-                    "opus-4.5",
-                    "--mode=ask",
-                    "--output-format=text",
-                    "--print",
-                    prompt_with_context,
-                ]
+                from .codex import build_cmd, AGENT_MODEL
+                cmd = build_cmd(prompt_with_context, model=AGENT_MODEL)
 
                 proc = None
                 stdout = ""
@@ -875,7 +854,8 @@ Please execute this scheduled task. Provide a fresh update based on the current 
                     logger.info(f"Cron job {job['id']} cancelled")
                     continue
 
-                response = stdout.strip() if stdout.strip() else stderr.strip()
+                from .codex import strip_think_tags
+                response = strip_think_tags(stdout.strip() if stdout.strip() else stderr.strip())
                 if response:
                     # Send result to user
                     try:
@@ -1191,17 +1171,8 @@ def run_adapt_streaming(
         min_chars_delta=15,  # More responsive updates
     )
 
-    cmd = [
-        "agent",
-        "--force",
-        "--model",
-        "opus-4.5",
-        "--output-format",
-        "stream-json",
-        "--stream-partial-output",
-        "--print",
-        prompt,
-    ]
+    from .codex import build_cmd, parse_event, format_tool_update, AGENT_MODEL
+    cmd = build_cmd(prompt, model=AGENT_MODEL, json_mode=True)
 
     start_time = time.time()
     thinking_updates: list[str] = []
@@ -1365,109 +1336,78 @@ def run_adapt_streaming(
                 except Exception:
                     continue
                 
-                event_type = event.get("type")
-                
-                # Handle tool use events - show what the agent is doing
-                if event_type == "tool_use":
-                    tool_name = event.get("name", "tool")
-                    tool_input = event.get("input", {})
-                    current_tool = tool_name
-                    
-                    # Create a brief description of what's happening
-                    if tool_name == "Read":
-                        path = tool_input.get("path", "")
-                        filename = os.path.basename(path) if path else "file"
-                        update = f"📖 Reading {filename}..."
-                    elif tool_name == "Write":
-                        path = tool_input.get("path", "")
-                        filename = os.path.basename(path) if path else "file"
-                        update = f"✍️ Writing {filename}..."
-                    elif tool_name == "StrReplace":
-                        path = tool_input.get("path", "")
-                        filename = os.path.basename(path) if path else "file"
-                        update = f"🔧 Editing {filename}..."
-                    elif tool_name == "Shell":
-                        cmd_str = tool_input.get("command", "")[:40]
-                        update = f"💻 {cmd_str}..."
-                    elif tool_name == "Grep":
-                        pattern = tool_input.get("pattern", "")[:25]
-                        update = f"🔍 Searching: {pattern}..."
-                    elif tool_name == "Glob":
-                        pattern = tool_input.get("glob_pattern", "")[:25]
-                        update = f"📁 Finding: {pattern}..."
-                    elif tool_name == "SemanticSearch":
-                        query = tool_input.get("query", "")[:40]
-                        update = f"🧠 {query}..."
-                    elif tool_name == "WebFetch":
-                        url = tool_input.get("url", "")[:40]
-                        update = f"🌐 Fetching: {url}..."
-                    else:
-                        update = f"🔧 {tool_name}..."
-                    
-                    thinking_updates.append(update)
-                    stream.set_text(build_display())
-                    last_display_update = time.time()
-                
-                # Handle tool result events
-                elif event_type == "tool_result":
+                parsed = parse_event(event)
+                if parsed is None:
+                    continue
+
+                kind = parsed["kind"]
+
+                # Handle tool start events - show what the agent is doing
+                if kind == "tool_start":
+                    current_tool = parsed.get("tool_name")
+                    update = format_tool_update(parsed)
+                    if update:
+                        thinking_updates.append(update)
+                        stream.set_text(build_display())
+                        last_display_update = time.time()
+
+                # Handle tool done events
+                elif kind == "tool_done":
                     if current_tool:
-                        # Mark the tool as done
                         if thinking_updates:
                             thinking_updates[-1] = thinking_updates[-1].replace("...", " ✓")
                             stream.set_text(build_display())
                             last_display_update = time.time()
                         current_tool = None
-                
-                # Handle assistant text output (thinking/explanation)
-                elif event_type == "assistant":
-                    msg = event.get("message") or {}
-                    content = msg.get("content") or []
-                    for part in content:
-                        if isinstance(part, dict) and part.get("type") == "text":
-                            text = part.get("text", "")
-                            if text:
-                                thinking_text_buffer += text
-                                
-                                # Extract a meaningful snippet - only update at sentence boundaries
-                                # This makes streaming more natural by waiting for complete thoughts
-                                cleaned = thinking_text_buffer.strip().replace("\n", " ")
-                                
-                                # Find the last complete sentence (ends with . ! or ?)
-                                last_sentence_end = -1
-                                for i in range(len(cleaned) - 1, -1, -1):
-                                    if cleaned[i] in '.!?' and (i == len(cleaned) - 1 or cleaned[i + 1] in ' \n\t'):
-                                        last_sentence_end = i
+
+                # Handle message text (agent reasoning / response)
+                elif kind in ("message", "message_done"):
+                    text = parsed.get("text", "")
+                    if text:
+                        # For message_done, text is the full message; replace buffer
+                        if kind == "message_done":
+                            thinking_text_buffer = text
+                        else:
+                            # For incremental updates, only append if text is longer
+                            if len(text) > len(thinking_text_buffer):
+                                thinking_text_buffer = text
+
+                        cleaned = thinking_text_buffer.strip().replace("\n", " ")
+
+                        last_sentence_end = -1
+                        for i in range(len(cleaned) - 1, -1, -1):
+                            if cleaned[i] in '.!?' and (i == len(cleaned) - 1 or cleaned[i + 1] in ' \n\t'):
+                                last_sentence_end = i
+                                break
+
+                        if last_sentence_end > 0:
+                            complete_text = cleaned[:last_sentence_end + 1]
+                            if len(complete_text) > 100:
+                                snippet_start = len(complete_text) - 100
+                                for i in range(snippet_start, len(complete_text)):
+                                    if complete_text[i] in '.!?' and i + 1 < len(complete_text):
+                                        snippet_start = i + 2
                                         break
-                                
-                                if last_sentence_end > 0:
-                                    # Get the last complete sentence(s) for display
-                                    complete_text = cleaned[:last_sentence_end + 1]
-                                    # Take the last ~100 chars of complete sentences
-                                    if len(complete_text) > 100:
-                                        # Find a sentence boundary within the last 100 chars
-                                        snippet_start = len(complete_text) - 100
-                                        for i in range(snippet_start, len(complete_text)):
-                                            if complete_text[i] in '.!?' and i + 1 < len(complete_text):
-                                                snippet_start = i + 2
-                                                break
-                                        snippet = complete_text[snippet_start:].strip()
-                                    else:
-                                        snippet = complete_text
-                                    
-                                    # Only update if this is a meaningful change
-                                    if snippet and snippet != last_thinking_snippet:
-                                        last_thinking_snippet = snippet
-                                        stream.set_text(build_display())
-                                        last_display_update = time.time()
-                                
-                                # Keep track of full text for final summary
-                                if len(thinking_text_buffer) > 50:
-                                    final_result_text = thinking_text_buffer
-                
-                elif event_type == "result":
-                    res = event.get("result")
-                    if isinstance(res, str):
-                        final_result_text = res
+                                snippet = complete_text[snippet_start:].strip()
+                            else:
+                                snippet = complete_text
+
+                            if snippet and snippet != last_thinking_snippet:
+                                last_thinking_snippet = snippet
+                                stream.set_text(build_display())
+                                last_display_update = time.time()
+
+                        if len(thinking_text_buffer) > 50:
+                            final_result_text = thinking_text_buffer
+
+                elif kind == "turn_done":
+                    # Turn finished — final_result_text should already be set
+                    pass
+
+                elif kind == "error":
+                    err_text = parsed.get("text", "Agent error")
+                    if not final_result_text:
+                        final_result_text = f"Error: {err_text}"
 
             if proc.poll() is not None and q.empty():
                 continue
@@ -1518,7 +1458,7 @@ def run_adapt_streaming(
 
 @bot.message_handler(commands=['adapt'])
 def adapt_bot(message):
-    """Self-modify the bot using cursor agent, then restart."""
+    """Self-modify the bot using Codex agent, then restart."""
     save_chat_metadata(message)
     if not authorize(message):
         return
@@ -1608,18 +1548,8 @@ The plan should be self-contained so someone can follow it without additional co
 
 Output ONLY the plan content, no preamble or meta-commentary."""
 
-    cmd = [
-        "agent",
-        "--force",
-        "--model",
-        "opus-4.5",
-        "--mode=ask",
-        "--output-format",
-        "stream-json",
-        "--stream-partial-output",
-        "--print",
-        plan_prompt,
-    ]
+    from .codex import build_cmd, parse_event, CHAT_MODEL
+    cmd = build_cmd(plan_prompt, model=CHAT_MODEL, readonly=True, json_mode=True)
 
     start_time = time.time()
     thinking_updates: list[str] = []
@@ -1760,48 +1690,51 @@ Output ONLY the plan content, no preamble or meta-commentary."""
                 except Exception:
                     continue
 
-                event_type = event.get("type")
+                parsed = parse_event(event)
+                if parsed is None:
+                    continue
 
-                if event_type == "assistant":
-                    msg = event.get("message") or {}
-                    content = msg.get("content") or []
-                    for part in content:
-                        if isinstance(part, dict) and part.get("type") == "text":
-                            text = part.get("text", "")
-                            if text:
-                                thinking_text_buffer += text
-                                
-                                cleaned = thinking_text_buffer.strip().replace("\n", " ")
-                                last_sentence_end = -1
-                                for i in range(len(cleaned) - 1, -1, -1):
-                                    if cleaned[i] in '.!?' and (i == len(cleaned) - 1 or cleaned[i + 1] in ' \n\t'):
-                                        last_sentence_end = i
+                kind = parsed["kind"]
+
+                if kind in ("message", "message_done"):
+                    text = parsed.get("text", "")
+                    if text:
+                        if kind == "message_done":
+                            thinking_text_buffer = text
+                        elif len(text) > len(thinking_text_buffer):
+                            thinking_text_buffer = text
+
+                        cleaned = thinking_text_buffer.strip().replace("\n", " ")
+                        last_sentence_end = -1
+                        for i in range(len(cleaned) - 1, -1, -1):
+                            if cleaned[i] in '.!?' and (i == len(cleaned) - 1 or cleaned[i + 1] in ' \n\t'):
+                                last_sentence_end = i
+                                break
+
+                        if last_sentence_end > 0:
+                            complete_text = cleaned[:last_sentence_end + 1]
+                            if len(complete_text) > 100:
+                                snippet_start = len(complete_text) - 100
+                                for i in range(snippet_start, len(complete_text)):
+                                    if complete_text[i] in '.!?' and i + 1 < len(complete_text):
+                                        snippet_start = i + 2
                                         break
-                                
-                                if last_sentence_end > 0:
-                                    complete_text = cleaned[:last_sentence_end + 1]
-                                    if len(complete_text) > 100:
-                                        snippet_start = len(complete_text) - 100
-                                        for i in range(snippet_start, len(complete_text)):
-                                            if complete_text[i] in '.!?' and i + 1 < len(complete_text):
-                                                snippet_start = i + 2
-                                                break
-                                        snippet = complete_text[snippet_start:].strip()
-                                    else:
-                                        snippet = complete_text
-                                    
-                                    if snippet and snippet != last_thinking_snippet:
-                                        last_thinking_snippet = snippet
-                                        stream.set_text(build_display())
-                                        last_display_update = time.time()
-                                
-                                if len(thinking_text_buffer) > 50:
-                                    final_result_text = thinking_text_buffer
+                                snippet = complete_text[snippet_start:].strip()
+                            else:
+                                snippet = complete_text
 
-                elif event_type == "result":
-                    res = event.get("result")
-                    if isinstance(res, str):
-                        final_result_text = res
+                            if snippet and snippet != last_thinking_snippet:
+                                last_thinking_snippet = snippet
+                                stream.set_text(build_display())
+                                last_display_update = time.time()
+
+                        if len(thinking_text_buffer) > 50:
+                            final_result_text = thinking_text_buffer
+
+                elif kind == "error":
+                    err_text = parsed.get("text", "Plan generation error")
+                    if not final_result_text:
+                        final_result_text = f"Error: {err_text}"
 
             if proc.poll() is not None and q.empty():
                 continue
@@ -2044,9 +1977,10 @@ Please respond to the user's message above, considering the full context of our 
         
         # Process transcribed text as normal message
         try:
-            backend = (os.getenv("TAU_CHAT_BACKEND") or "cursor").strip().lower()
+            from .codex import CHAT_MODEL
+            backend = (os.getenv("TAU_CHAT_BACKEND") or "codex").strip().lower()
             openai_model = os.getenv("TAU_OPENAI_CHAT_MODEL", "gpt-4o-mini")
-            cursor_model = os.getenv("TAU_CURSOR_CHAT_MODEL", "composer-1")
+            codex_model = os.getenv("TAU_CODEX_CHAT_MODEL", CHAT_MODEL)
             use_openai = backend in ("openai", "oa") or (backend == "auto" and openai_client is not None)
 
             if use_openai:
@@ -2065,7 +1999,7 @@ Please respond to the user's message above, considering the full context of our 
                     chat_id=message.chat.id,
                     existing_message_id=processing_msg.message_id,
                     initial_text="🎤 Thinking...",
-                    model=cursor_model,
+                    model=codex_model,
                     timeout_seconds=600,
                 )
             append_chat_history("assistant", response, chat_id=message.chat.id)
@@ -2123,16 +2057,19 @@ def run_agent_ask_streaming(
     reply_to_message_id: int | None = None,
     existing_message_id: int | None = None,
     initial_text: str = "🤔 Thinking...",
-    model: str = "gemini-3-flash",
+    model: str | None = None,
     timeout_seconds: int = 600,
 ) -> str:
-    """Run the agent CLI in ask mode and stream output by editing one Telegram message.
+    """Run the Codex CLI and stream JSONL output by editing one Telegram message.
     
     Shows thinking process and tool operations with the same structure as /adapt:
     - Start with thinking emoji
     - Stream thought bubble with thinking
     - End with just the final answer
     """
+    if model is None:
+        from .codex import CHAT_MODEL
+        model = CHAT_MODEL
     stream = TelegramStreamingMessage(
         chat_id,
         reply_to_message_id=reply_to_message_id,
@@ -2142,18 +2079,8 @@ def run_agent_ask_streaming(
         min_chars_delta=15,  # More responsive updates
     )
 
-    cmd = [
-        "agent",
-        "--force",
-        "--model",
-        model,
-        "--mode=ask",
-        "--output-format",
-        "stream-json",
-        "--stream-partial-output",
-        "--print",
-        prompt_with_context,
-    ]
+    from .codex import build_cmd, parse_event, format_tool_update
+    cmd = build_cmd(prompt_with_context, model=model, readonly=True, json_mode=True)
 
     start_time = time.time()
     raw_output = ""
@@ -2326,92 +2253,48 @@ def run_agent_ask_streaming(
                     # Ignore non-JSON noise on stdout.
                     continue
                 
-                event_type = event.get("type")
-                
-                # Handle tool use events - show what the agent is doing
-                if event_type == "tool_use":
-                    tool_name = event.get("name", "tool")
-                    tool_input = event.get("input", {})
-                    current_tool = tool_name
-                    
-                    # Create a brief description of what's happening
-                    if tool_name == "Read":
-                        path = tool_input.get("path", "")
-                        filename = os.path.basename(path) if path else "file"
-                        update = f"📖 Reading {filename}..."
-                    elif tool_name == "Write":
-                        path = tool_input.get("path", "")
-                        filename = os.path.basename(path) if path else "file"
-                        update = f"✍️ Writing {filename}..."
-                    elif tool_name == "StrReplace":
-                        path = tool_input.get("path", "")
-                        filename = os.path.basename(path) if path else "file"
-                        update = f"🔧 Editing {filename}..."
-                    elif tool_name == "Shell":
-                        cmd_str = tool_input.get("command", "")[:40]
-                        update = f"💻 {cmd_str}..."
-                    elif tool_name == "Grep":
-                        pattern = tool_input.get("pattern", "")[:25]
-                        update = f"🔍 Searching: {pattern}..."
-                    elif tool_name == "Glob":
-                        pattern = tool_input.get("glob_pattern", "")[:25]
-                        update = f"📁 Finding: {pattern}..."
-                    elif tool_name == "SemanticSearch":
-                        query = tool_input.get("query", "")[:40]
-                        update = f"🧠 {query}..."
-                    elif tool_name == "WebFetch":
-                        url = tool_input.get("url", "")[:40]
-                        update = f"🌐 Fetching: {url}..."
-                    else:
-                        update = f"🔧 {tool_name}..."
-                    
-                    thinking_updates.append(update)
-                    stream.set_text(build_display())
-                    last_display_update = time.time()
-                
-                # Handle tool result events
-                elif event_type == "tool_result":
+                parsed = parse_event(event)
+                if parsed is None:
+                    continue
+
+                kind = parsed["kind"]
+
+                # Handle tool start events - show what the agent is doing
+                if kind == "tool_start":
+                    current_tool = parsed.get("tool_name")
+                    update = format_tool_update(parsed)
+                    if update:
+                        thinking_updates.append(update)
+                        stream.set_text(build_display())
+                        last_display_update = time.time()
+
+                # Handle tool done events
+                elif kind == "tool_done":
                     if current_tool:
-                        # Mark the tool as done
                         if thinking_updates:
                             thinking_updates[-1] = thinking_updates[-1].replace("...", " ✓")
                             stream.set_text(build_display())
                             last_display_update = time.time()
                         current_tool = None
-                
-                # Handle assistant text output (thinking/explanation)
-                elif event_type == "assistant":
-                    msg = event.get("message") or {}
-                    content = msg.get("content") or []
-                    parts: list[str] = []
-                    for part in content:
-                        if isinstance(part, dict) and part.get("type") == "text":
-                            text = part.get("text", "")
-                            if text:
-                                parts.append(text)
-                                thinking_text_buffer += text
-                    
-                    candidate = "".join(parts)
-                    if candidate:
-                        # With --stream-partial-output this is typically a delta,
-                        # but handle both delta and "full so far" outputs safely.
-                        delta = candidate
-                        if candidate.startswith(raw_output):
-                            delta = candidate[len(raw_output):]
-                        if delta:
-                            raw_output += delta
-                        
-                        # Extract a meaningful snippet for thinking display
-                        # Only update at sentence boundaries for natural streaming
+
+                # Handle message text (agent reasoning / response)
+                elif kind in ("message", "message_done"):
+                    text = parsed.get("text", "")
+                    if text:
+                        if kind == "message_done":
+                            thinking_text_buffer = text
+                        elif len(text) > len(thinking_text_buffer):
+                            thinking_text_buffer = text
+                        raw_output = thinking_text_buffer
+
                         cleaned = thinking_text_buffer.strip().replace("\n", " ")
-                        
-                        # Find the last complete sentence
+
                         last_sentence_end = -1
                         for i in range(len(cleaned) - 1, -1, -1):
                             if cleaned[i] in '.!?' and (i == len(cleaned) - 1 or cleaned[i + 1] in ' \n\t'):
                                 last_sentence_end = i
                                 break
-                        
+
                         if last_sentence_end > 0:
                             complete_text = cleaned[:last_sentence_end + 1]
                             if len(complete_text) > 100:
@@ -2423,17 +2306,21 @@ def run_agent_ask_streaming(
                                 snippet = complete_text[snippet_start:].strip()
                             else:
                                 snippet = complete_text
-                            
+
                             if snippet and snippet != last_thinking_snippet:
                                 last_thinking_snippet = snippet
-                        
+
                         stream.set_text(build_display())
                         last_display_update = time.time()
-                
-                elif event_type == "result":
-                    res = event.get("result")
-                    if isinstance(res, str):
-                        final_result_text = res
+
+                elif kind == "turn_done":
+                    if thinking_text_buffer:
+                        final_result_text = thinking_text_buffer
+
+                elif kind == "error":
+                    err_text = parsed.get("text", "Agent error")
+                    if not final_result_text:
+                        final_result_text = f"Error: {err_text}"
 
             # If process exited, loop briefly to drain remaining output.
             if proc.poll() is not None and q.empty():
@@ -2689,11 +2576,13 @@ def handle_message(message):
     recent_chat = '\n'.join(chat_lines[-20:]) if len(chat_lines) > 20 else chat_history
     
     # Backend + model selection:
-    # - default is "cursor": use Cursor agent (composer) for normal chat
+    # - default is "codex": use Codex CLI for normal chat
+    # - set TAU_CHAT_BACKEND=openai to use OpenAI directly
     # - set TAU_CHAT_BACKEND=auto to use OpenAI when OPENAI_API_KEY is available
-    backend = (os.getenv("TAU_CHAT_BACKEND") or "cursor").strip().lower()
+    from .codex import CHAT_MODEL
+    backend = (os.getenv("TAU_CHAT_BACKEND") or "codex").strip().lower()
     openai_model = os.getenv("TAU_OPENAI_CHAT_MODEL", "gpt-4o-mini")
-    cursor_model = os.getenv("TAU_CURSOR_CHAT_MODEL", "composer-1")
+    codex_model = os.getenv("TAU_CODEX_CHAT_MODEL", CHAT_MODEL)
     use_openai = backend in ("openai", "oa") or (backend == "auto" and openai_client is not None)
 
     # OpenAI prompt: keep it small for speed
@@ -2702,7 +2591,7 @@ def handle_message(message):
 
 USER: {message.text}"""
 
-    # Cursor agent prompt
+    # Codex agent prompt
     prompt_with_context = f"""You are Tau, an autonomous AI assistant running as a Telegram bot. Answer the user's question directly and concisely.
 
 YOUR CAPABILITIES (share when asked how to use you):
@@ -2732,7 +2621,7 @@ INSTRUCTIONS:
     if use_openai:
         logger.info(f"Using OpenAI fast chat model={openai_model}")
     else:
-        logger.info(f"Using Cursor agent model={cursor_model}")
+        logger.info(f"Using Codex agent model={codex_model}")
     
     # Start typing indicator in background
     typing_stop = threading.Event()
@@ -2763,7 +2652,7 @@ INSTRUCTIONS:
                 chat_id=message.chat.id,
                 reply_to_message_id=message.message_id,
                 initial_text="🤔 Thinking...",
-                model=cursor_model,
+                model=codex_model,
                 timeout_seconds=300,
             )
         elapsed = (datetime.now() - start_time).total_seconds()
