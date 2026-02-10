@@ -9,10 +9,71 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Generator, List, Optional
+from typing import Any, Callable, Dict, Generator, List, Optional, Set
 
 import httpx
+
+
+# ---------------------------------------------------------------------------
+# Model validation — fetch & cache available models from the API
+# ---------------------------------------------------------------------------
+
+_valid_models_lock = threading.Lock()
+_valid_models: Set[str] = set()
+_valid_models_fetched_at: float = 0.0
+_VALID_MODELS_TTL = 300.0  # re-fetch every 5 minutes
+
+# Known-good fallback model if the requested one isn't available
+_FALLBACK_MODEL = "zai-org/GLM-4.7-TEE"
+
+
+def _fetch_available_models(base_url: str, api_key: str) -> Set[str]:
+    """Fetch the list of available model IDs from the API."""
+    try:
+        resp = httpx.get(
+            f"{base_url}/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10.0,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return {m["id"] for m in data.get("data", []) if "id" in m}
+    except Exception:
+        pass
+    return set()
+
+
+def validate_model(model: str, base_url: str, api_key: str) -> str:
+    """Validate that *model* is available on the API.
+
+    Returns the model name if valid, otherwise returns a known-good
+    fallback and prints a warning.  The available-models list is cached
+    for ``_VALID_MODELS_TTL`` seconds to avoid hammering the API.
+    """
+    global _valid_models, _valid_models_fetched_at
+
+    with _valid_models_lock:
+        now = time.time()
+        if not _valid_models or (now - _valid_models_fetched_at) > _VALID_MODELS_TTL:
+            fetched = _fetch_available_models(base_url, api_key)
+            if fetched:
+                _valid_models = fetched
+                _valid_models_fetched_at = now
+
+    # If we have a model list and the requested model isn't in it, fallback
+    if _valid_models and model not in _valid_models:
+        import sys
+        print(
+            f"[LLMClient] WARNING: model '{model}' not found in available models. "
+            f"Falling back to '{_FALLBACK_MODEL}'.",
+            file=sys.stderr,
+        )
+        return _FALLBACK_MODEL
+
+    return model
 
 
 class CostLimitExceeded(Exception):
@@ -113,7 +174,6 @@ class LLMClient:
         api_key: Optional[str] = None,
         timeout: float = 120.0,
     ):
-        self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.cost_limit = cost_limit or float(os.environ.get("LLM_COST_LIMIT", "10.0"))
@@ -131,6 +191,9 @@ class LLMClient:
             raise ValueError(
                 f"API key required. Set CHUTES_API_TOKEN environment variable or pass api_key parameter."
             )
+
+        # Validate model against available models (auto-fallback on 404-prone names)
+        self.model = validate_model(model, self.base_url, self._api_key)
 
         self._total_cost = 0.0
         self._total_tokens = 0
@@ -193,9 +256,14 @@ class LLMClient:
                 limit=self.cost_limit,
             )
 
+        # Validate per-call model override against available models
+        effective_model = model or self.model
+        if model:
+            effective_model = validate_model(model, self.base_url, self._api_key)
+
         # Build request payload
         payload: Dict[str, Any] = {
-            "model": model or self.model,
+            "model": effective_model,
             "messages": self._prepare_messages(messages),
             "max_tokens": max_tokens or self.max_tokens,
         }
@@ -347,8 +415,13 @@ class LLMClient:
                 limit=self.cost_limit,
             )
 
+        # Validate per-call model override against available models
+        effective_model = model or self.model
+        if model:
+            effective_model = validate_model(model, self.base_url, self._api_key)
+
         payload: Dict[str, Any] = {
-            "model": model or self.model,
+            "model": effective_model,
             "messages": self._prepare_messages(messages),
             "max_tokens": max_tokens or self.max_tokens,
             "stream": True,

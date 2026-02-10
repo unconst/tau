@@ -1070,8 +1070,8 @@ def run_adapt_streaming(
         chat_id,
         reply_to_message_id=reply_to_message_id,
         initial_text="🫡 Starting...",
-        min_edit_interval_seconds=1.5,  # Faster updates to show thinking
-        min_chars_delta=15,  # More responsive updates
+        min_edit_interval_seconds=0.9,  # Fast updates for responsive feel
+        min_chars_delta=10,  # Lower threshold to show progress sooner
     )
 
     from .llm import run_baseagent_streaming, parse_event, format_tool_update
@@ -1332,8 +1332,8 @@ def run_plan_generation(
         chat_id,
         reply_to_message_id=reply_to_message_id,
         initial_text="📋 Creating plan...",
-        min_edit_interval_seconds=1.5,
-        min_chars_delta=15,
+        min_edit_interval_seconds=0.9,
+        min_chars_delta=10,
     )
 
     # Generate a filename-safe slug from the task description
@@ -1806,8 +1806,8 @@ def run_agent_ask_streaming(
         reply_to_message_id=reply_to_message_id,
         existing_message_id=existing_message_id,
         initial_text=initial_text,
-        min_edit_interval_seconds=1.5,  # Faster updates for thinking
-        min_chars_delta=15,  # More responsive updates
+        min_edit_interval_seconds=0.9,  # Fast updates for responsive feel
+        min_chars_delta=10,  # Lower threshold to show progress sooner
     )
 
     from .llm import run_baseagent_streaming, parse_event, format_tool_update
@@ -2196,11 +2196,29 @@ def handle_message(message):
     # - default: use agent in-process for normal chat
     # - set TAU_CHAT_BACKEND=openai to use OpenAI directly
     # - set TAU_CHAT_BACKEND=auto to use OpenAI when OPENAI_API_KEY is available
+    # - "smart" routing: short/simple messages auto-route to fast OpenAI path
     from .llm import CHAT_MODEL, build_tau_system_prompt
     backend = (os.getenv("TAU_CHAT_BACKEND") or "baseagent").strip().lower()
     openai_model = os.getenv("TAU_OPENAI_CHAT_MODEL", "gpt-4o-mini")
     agent_model = os.getenv("TAU_CHAT_MODEL", CHAT_MODEL)
     use_openai = backend in ("openai", "oa") or (backend == "auto" and openai_client is not None)
+
+    # Smart routing: if OpenAI is available and the message looks simple,
+    # use the fast OpenAI path instead of the full agent loop.
+    if not use_openai and openai_client is not None:
+        msg_lower = (message.text or "").lower().strip()
+        is_simple = (
+            len(msg_lower) < 200
+            and not any(kw in msg_lower for kw in [
+                "adapt", "modify", "change your", "update your", "edit your",
+                "create a task", "add task", "remind", "schedule", "cron",
+                "search skill", "generate", "make me", "build",
+                "/", "run ", "execute", "shell", "code",
+            ])
+        )
+        if is_simple:
+            use_openai = True
+            logger.info("Smart routing: simple message → fast OpenAI path")
 
     if use_openai:
         # OpenAI path: keep prompt small for speed (no system prompt override)

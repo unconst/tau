@@ -449,6 +449,40 @@ def append_chat_history(role: str, content: str, chat_id: int | None = None, use
         f.write("---\n\n")
 
 
+def _tail_lines(filepath: str, n: int) -> list[str]:
+    """Read the last *n* lines of a file efficiently using seek from the end.
+
+    For small files this just reads the whole file.  For large files it reads
+    backward in chunks until enough newlines are found, avoiding a full load.
+    """
+    CHUNK = 8192
+    try:
+        with open(filepath, "rb") as f:
+            f.seek(0, 2)  # seek to end
+            size = f.tell()
+            if size <= CHUNK:
+                # Small file — just read it all
+                f.seek(0)
+                return f.read().decode("utf-8", errors="replace").splitlines(keepends=True)
+
+            # Large file — read backward in chunks
+            data = b""
+            pos = size
+            lines_found = 0
+            while pos > 0 and lines_found <= n:
+                read_size = min(CHUNK, pos)
+                pos -= read_size
+                f.seek(pos)
+                chunk = f.read(read_size)
+                data = chunk + data
+                lines_found = data.count(b"\n")
+
+            all_lines = data.decode("utf-8", errors="replace").splitlines(keepends=True)
+            return all_lines[-n:] if len(all_lines) > n else all_lines
+    except Exception:
+        return []
+
+
 def get_chat_history(max_lines: int = 100, chat_id: int | None = None) -> str:
     """Get recent chat history for a specific chat.
 
@@ -457,7 +491,8 @@ def get_chat_history(max_lines: int = 100, chat_id: int | None = None) -> str:
         chat_id: Telegram chat ID. If None, uses the owner's saved chat.
 
     Returns:
-        Recent chat history, truncated to max_lines
+        Recent chat history, truncated to max_lines.
+        Uses an efficient tail-read to avoid loading the entire file.
     """
     if chat_id is not None:
         target_file = _chat_file_for(chat_id)
@@ -468,18 +503,14 @@ def get_chat_history(max_lines: int = 100, chat_id: int | None = None) -> str:
         else:
             target_file = CHAT_HISTORY_FILE
 
-    if os.path.exists(target_file):
-        with open(target_file) as f:
-            lines = f.readlines()
+    if not os.path.exists(target_file):
+        return ""
 
-        if len(lines) <= max_lines:
-            return "".join(lines)
+    recent = _tail_lines(target_file, max_lines)
+    if not recent:
+        return ""
 
-        # Return header (first 10 lines) + last (max_lines - 10) lines
-        header = lines[:10]
-        recent = lines[-(max_lines - 10):]
-        return "".join(header) + "\n[... earlier messages truncated ...]\n\n" + "".join(recent)
-    return ""
+    return "".join(recent)
 
 
 # ---------------------------------------------------------------------------

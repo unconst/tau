@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List
 
 from src.core.compaction import (
     manage_context,
+    _TokenBudget,
 )
 from src.llm.client import CostLimitExceeded, LLMError
 from src.llm.router import ModelRouter
@@ -225,9 +226,13 @@ def run_agent_loop(
     max_iterations = config.get("max_iterations", 200)
     cache_enabled = config.get("cache_enabled", True)
     use_streaming = config.get("streaming", True)
+    skip_verification = config.get("skip_verification", False)
 
     # Model router for dynamic model selection
     router = ModelRouter()
+
+    # Incremental token budget — avoids O(n) recount every iteration
+    token_budget = _TokenBudget()
 
     # 6. Main loop
     iteration = 0
@@ -244,6 +249,7 @@ def run_agent_loop(
                 messages=messages,
                 system_prompt=system_prompt,
                 llm=llm,
+                _token_budget=token_budget,
             )
 
             # If compaction happened, update our messages reference
@@ -385,6 +391,11 @@ def run_agent_loop(
         if not has_function_calls:
             # No tool calls - agent thinks it's done
             _log("No tool calls in response")
+
+            # In chat mode, skip verification — just complete immediately
+            if skip_verification:
+                _log("Skipping self-verification (chat mode)")
+                break
 
             # Always do verification before completing (self-questioning)
             if pending_completion:

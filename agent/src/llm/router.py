@@ -50,7 +50,7 @@ class RouterConfig:
         max_tokens=16384,
     ))
     strong: ModelTier = field(default_factory=lambda: ModelTier(
-        model=os.environ.get("TAU_STRONG_MODEL", os.environ.get("LLM_MODEL", "anthropic/claude-opus-4-20250514")),
+        model=os.environ.get("TAU_STRONG_MODEL", os.environ.get("LLM_MODEL", "deepseek-ai/DeepSeek-R1-0528-TEE")),
         max_tokens=16384,
         reasoning_effort="high",
     ))

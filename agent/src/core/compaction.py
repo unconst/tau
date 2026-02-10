@@ -457,6 +457,7 @@ def manage_context(
     system_prompt: str,
     llm: "LLMClient",
     force_compaction: bool = False,
+    _token_budget: Optional["_TokenBudget"] = None,
 ) -> List[Dict[str, Any]]:
     """
     Main context management function.
@@ -464,7 +465,7 @@ def manage_context(
     Called before each LLM request to ensure context fits.
 
     Strategy:
-    1. Estimate current token usage
+    1. Estimate current token usage (incrementally if budget provided)
     2. If under threshold, return as-is
     3. Try smart pruning + compression first
     4. If still over threshold, run AI compaction
@@ -474,11 +475,16 @@ def manage_context(
         system_prompt: Original system prompt (preserved through compaction)
         llm: LLM client (for compaction)
         force_compaction: Force compaction even if under threshold
+        _token_budget: Optional incremental token tracker (avoids re-counting)
 
     Returns:
         Managed message list (possibly compacted)
     """
-    total_tokens = estimate_total_tokens(messages)
+    if _token_budget is not None:
+        total_tokens = _token_budget.update(messages)
+    else:
+        total_tokens = estimate_total_tokens(messages)
+
     usable = get_usable_context()
     usage_pct = (total_tokens / usable) * 100
 
@@ -495,6 +501,9 @@ def manage_context(
 
     if not is_overflow(pruned_tokens) and not force_compaction:
         _log(f"Pruning sufficient: {total_tokens} -> {pruned_tokens} tokens")
+        # Reset budget after compaction
+        if _token_budget is not None:
+            _token_budget.reset(pruned)
         return pruned
 
     # Step 2: Run AI compaction
@@ -504,4 +513,38 @@ def manage_context(
 
     _log(f"Compaction result: {total_tokens} -> {compacted_tokens} tokens")
 
+    # Reset budget after compaction
+    if _token_budget is not None:
+        _token_budget.reset(compacted)
+
     return compacted
+
+
+class _TokenBudget:
+    """Incremental token counter — avoids re-estimating the entire history.
+
+    Tracks how many messages have already been counted and only estimates
+    tokens for newly appended messages.
+    """
+
+    def __init__(self) -> None:
+        self._counted: int = 0  # number of messages already counted
+        self._total: int = 0    # running token total
+
+    def update(self, messages: List[Dict[str, Any]]) -> int:
+        """Return total tokens, only counting new messages since last call."""
+        n = len(messages)
+        if n < self._counted:
+            # Messages were removed (compaction) — full recount
+            self.reset(messages)
+            return self._total
+        # Estimate only the new messages
+        for msg in messages[self._counted:]:
+            self._total += estimate_message_tokens(msg)
+        self._counted = n
+        return self._total
+
+    def reset(self, messages: List[Dict[str, Any]]) -> None:
+        """Force a full recount (after compaction / pruning)."""
+        self._total = estimate_total_tokens(messages)
+        self._counted = len(messages)

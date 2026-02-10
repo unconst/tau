@@ -36,7 +36,7 @@ CONFIG: Dict[str, Any] = {
     # ==========================================================================
     # Context Management
     # ==========================================================================
-    # Model context window (Claude Opus 4.5 = 200K)
+    # Model context window (200K for most large models)
     "model_context_limit": 200_000,
     # Reserved tokens for output
     "output_token_max": 32_000,

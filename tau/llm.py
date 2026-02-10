@@ -17,8 +17,6 @@ import json
 import os
 import queue
 import re as _re
-import shlex
-import subprocess
 import sys
 import threading
 import time
@@ -79,6 +77,47 @@ def _make_llm_client(model: str, timeout: float = 300.0):
     )
 
 
+# ---------------------------------------------------------------------------
+# Cached singletons — reuse httpx connection pool across requests
+# ---------------------------------------------------------------------------
+import threading as _threading
+
+_llm_client_lock = _threading.Lock()
+_llm_client_cache: Dict[str, Any] = {}  # model -> LLMClient
+
+_tool_registry_lock = _threading.Lock()
+_tool_registry_cache: Dict[str, Any] = {}  # key -> ToolRegistry
+
+
+def _get_cached_llm_client(model: str, timeout: float = 300.0):
+    """Return a cached LLMClient, creating one if needed.
+
+    Reuses the underlying httpx connection pool to avoid
+    ~100-300 ms TCP/TLS setup on every request.
+    """
+    with _llm_client_lock:
+        if model in _llm_client_cache:
+            return _llm_client_cache[model]
+        client = _make_llm_client(model, timeout=timeout)
+        _llm_client_cache[model] = client
+        return client
+
+
+def _get_cached_tool_registry(cwd: str, *, register_tau: bool = False):
+    """Return a cached ToolRegistry, creating one if needed."""
+    cache_key = f"{cwd}:{register_tau}"
+    with _tool_registry_lock:
+        if cache_key in _tool_registry_cache:
+            return _tool_registry_cache[cache_key]
+        _ensure_agent_on_path()
+        from src.tools.registry import ToolRegistry  # type: ignore[import-untyped]
+        tools = ToolRegistry(cwd=Path(cwd))
+        if register_tau:
+            _register_tau_tools(tools)
+        _tool_registry_cache[cache_key] = tools
+        return tools
+
+
 def _make_config(readonly: bool = False, chat_mode: bool = False) -> Dict[str, Any]:
     """Build the config dict consumed by ``run_agent_loop``.
 
@@ -102,6 +141,7 @@ def _make_config(readonly: bool = False, chat_mode: bool = False) -> Dict[str, A
             "shell_timeout": 60,
             "cache_enabled": True,
             "skip_initial_state": True,
+            "skip_verification": True,
             "streaming": True,
         }
     return {
@@ -173,14 +213,35 @@ def _load_skills_for_message(message: str) -> str:
     for filename in sorted(matched_files):
         filepath = os.path.join(skills_dir, filename)
         if os.path.isfile(filepath):
-            try:
-                content = Path(filepath).read_text(encoding="utf-8").strip()
-                if content:
-                    parts.append(f"## Skill: {filename}\n\n{content}")
-            except Exception:
-                pass
+            content = _read_file_cached(filepath, ttl=120.0)  # skills change rarely
+            if content:
+                parts.append(f"## Skill: {filename}\n\n{content}")
 
     return "\n\n---\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# TTL file cache — avoids re-reading unchanged context files on every message
+# ---------------------------------------------------------------------------
+
+_file_cache: Dict[str, tuple[float, str]] = {}  # filepath -> (timestamp, content)
+_FILE_CACHE_TTL = 30.0  # seconds; identity/skills rarely change
+
+
+def _read_file_cached(filepath: str, ttl: float = _FILE_CACHE_TTL) -> str:
+    """Read a file with in-memory caching.  Returns '' on error."""
+    now = time.time()
+    cached = _file_cache.get(filepath)
+    if cached is not None:
+        ts, content = cached
+        if now - ts < ttl:
+            return content
+    try:
+        content = Path(filepath).read_text(encoding="utf-8").strip()
+    except Exception:
+        content = ""
+    _file_cache[filepath] = (now, content)
+    return content
 
 
 # ---------------------------------------------------------------------------
@@ -190,14 +251,11 @@ def _load_skills_for_message(message: str) -> str:
 def _read_context_file(relative_path: str, max_lines: int | None = None) -> str:
     """Read a file relative to the workspace root, returning '' on error."""
     filepath = os.path.join(WORKSPACE, relative_path)
-    try:
-        text = Path(filepath).read_text(encoding="utf-8").strip()
-        if max_lines is not None:
-            lines = text.split("\n")
-            text = "\n".join(lines[-max_lines:])
-        return text
-    except Exception:
-        return ""
+    text = _read_file_cached(filepath)
+    if max_lines is not None and text:
+        lines = text.split("\n")
+        text = "\n".join(lines[-max_lines:])
+    return text
 
 
 def build_tau_system_prompt(
@@ -306,31 +364,27 @@ You have the following tools:
 # ---------------------------------------------------------------------------
 
 def _register_tau_tools(tools) -> None:
-    """Register Tau-specific tools on *tools* (a ``ToolRegistry``)."""
+    """Register Tau-specific tools on *tools* (a ``ToolRegistry``).
+
+    Tools are called **in-process** via direct Python function calls,
+    avoiding the ~300-800 ms overhead of spawning a subprocess per tool.
+    """
     _ensure_agent_on_path()
     from src.tools.base import ToolResult  # type: ignore[import-untyped]
 
-    venv_prefix = f"source {WORKSPACE}/.venv/bin/activate && "
-
-    def _run_tau_tool(module: str, args_str: str = "") -> ToolResult:
-        """Helper – run a tau tool module as a subprocess."""
-        cmd = f"{venv_prefix}python -m tau.tools.{module} {args_str}"
+    # ------------------------------------------------------------------
+    # send_message  (in-process: tau.telegram.notify)
+    # ------------------------------------------------------------------
+    def _handle_send_message(args: dict) -> ToolResult:
         try:
-            result = subprocess.run(
-                ["sh", "-c", cmd],
-                capture_output=True,
-                text=True,
-                timeout=120,
-                cwd=WORKSPACE,
-            )
-            output = (result.stdout + "\n" + result.stderr).strip()
-            return ToolResult(success=result.returncode == 0, output=output)
-        except subprocess.TimeoutExpired:
-            return ToolResult.fail("Tool timed out")
+            from tau.telegram import notify
+            message = args.get("message", "")
+            notify(message)
+            label = f"{message[:50]}..." if len(message) > 50 else message
+            return ToolResult(success=True, output=f"Message sent: {label}")
         except Exception as e:
-            return ToolResult.fail(str(e))
+            return ToolResult(success=False, output=str(e))
 
-    # send_message
     tools.register_tool(
         "send_message",
         {
@@ -344,10 +398,25 @@ def _register_tau_tools(tools) -> None:
                 "required": ["message"],
             },
         },
-        lambda args: _run_tau_tool("send_message", shlex.quote(args.get("message", ""))),
+        _handle_send_message,
     )
 
-    # send_voice
+    # ------------------------------------------------------------------
+    # send_voice  (in-process: tau.tools.send_voice)
+    # ------------------------------------------------------------------
+    def _handle_send_voice(args: dict) -> ToolResult:
+        try:
+            from tau.tools.send_voice import send_voice_message
+            from tau.telegram import get_chat_id
+            chat_id = get_chat_id()
+            if not chat_id:
+                return ToolResult(success=False, output="No chat ID found.")
+            text = args.get("message", "")
+            send_voice_message(chat_id, text)
+            return ToolResult(success=True, output=f"Voice message sent: {text}")
+        except Exception as e:
+            return ToolResult(success=False, output=str(e))
+
     tools.register_tool(
         "send_voice",
         {
@@ -361,10 +430,22 @@ def _register_tau_tools(tools) -> None:
                 "required": ["message"],
             },
         },
-        lambda args: _run_tau_tool("send_voice", shlex.quote(args.get("message", ""))),
+        _handle_send_voice,
     )
 
-    # search_skills
+    # ------------------------------------------------------------------
+    # search_skills  (in-process: tau.tools.search_skills)
+    # ------------------------------------------------------------------
+    def _handle_search_skills(args: dict) -> ToolResult:
+        try:
+            from tau.tools.search_skills import search_skills, format_skill_list
+            query = args.get("query") or None
+            category = args.get("category") or None
+            results = search_skills(query, category)
+            return ToolResult(success=True, output=format_skill_list(results))
+        except Exception as e:
+            return ToolResult(success=False, output=str(e))
+
     tools.register_tool(
         "search_skills",
         {
@@ -384,14 +465,22 @@ def _register_tau_tools(tools) -> None:
                 },
             },
         },
-        lambda args: _run_tau_tool(
-            "search_skills",
-            shlex.quote(args.get("query") or "")
-            + (f" --category {shlex.quote(args['category'])}" if args.get("category") else ""),
-        ),
+        _handle_search_skills,
     )
 
-    # create_task
+    # ------------------------------------------------------------------
+    # create_task  (in-process: tau.tools.create_task)
+    # ------------------------------------------------------------------
+    def _handle_create_task(args: dict) -> ToolResult:
+        try:
+            from tau.tools.create_task import create_task
+            title = args.get("title", "")
+            description = args.get("description", "")
+            task_id = create_task(title, description)
+            return ToolResult(success=True, output=f"Created {task_id}: {title}")
+        except Exception as e:
+            return ToolResult(success=False, output=str(e))
+
     tools.register_tool(
         "create_task",
         {
@@ -406,13 +495,35 @@ def _register_tau_tools(tools) -> None:
                 "required": ["title", "description"],
             },
         },
-        lambda args: _run_tau_tool(
-            "create_task",
-            f"{shlex.quote(args.get('title', ''))} {shlex.quote(args.get('description', ''))}",
-        ),
+        _handle_create_task,
     )
 
-    # schedule_message
+    # ------------------------------------------------------------------
+    # schedule_message  (in-process: tau.tools.schedule_message)
+    # ------------------------------------------------------------------
+    def _handle_schedule_message(args: dict) -> ToolResult:
+        try:
+            from tau.tools.schedule_message import schedule_at, schedule_cron
+            message = args.get("message", "")
+            delay = args.get("delay")
+            at_time = args.get("at")
+            cron_expr = args.get("cron")
+
+            if at_time:
+                schedule_at(at_time, message)
+                return ToolResult(success=True, output=f"Scheduled at {at_time}: {message}")
+            elif delay:
+                time_spec = f"now + {delay.replace('h', ' hours').replace('m', ' minutes')}"
+                schedule_at(time_spec, message)
+                return ToolResult(success=True, output=f"Scheduled in {delay}: {message}")
+            elif cron_expr:
+                schedule_cron(cron_expr, message)
+                return ToolResult(success=True, output=f"Added cron job ({cron_expr}): {message}")
+            else:
+                return ToolResult(success=False, output="Specify --delay, --at, or --cron")
+        except Exception as e:
+            return ToolResult(success=False, output=str(e))
+
     tools.register_tool(
         "schedule_message",
         {
@@ -435,16 +546,24 @@ def _register_tau_tools(tools) -> None:
                 "required": ["message"],
             },
         },
-        lambda args: _run_tau_tool(
-            "schedule_message",
-            (f"--in {shlex.quote(args['delay'])} " if args.get("delay") else "")
-            + (f"--at {shlex.quote(args['at'])} " if args.get("at") else "")
-            + (f"--cron {shlex.quote(args['cron'])} " if args.get("cron") else "")
-            + shlex.quote(args.get("message", "")),
-        ),
+        _handle_schedule_message,
     )
 
-    # commands (catch-all for bot commands)
+    # ------------------------------------------------------------------
+    # commands  (in-process: tau.tools.commands.run_command)
+    # ------------------------------------------------------------------
+    def _handle_commands(args: dict) -> ToolResult:
+        try:
+            from tau.tools.commands import run_command
+            command = args.get("command", "")
+            cmd_args = args.get("args", "")
+            # Split args string into list if non-empty
+            arg_list = cmd_args.split() if cmd_args else []
+            result = run_command(command, *arg_list)
+            return ToolResult(success=True, output=result)
+        except Exception as e:
+            return ToolResult(success=False, output=str(e))
+
     tools.register_tool(
         "commands",
         {
@@ -462,10 +581,7 @@ def _register_tau_tools(tools) -> None:
                 "required": ["command"],
             },
         },
-        lambda args: _run_tau_tool(
-            "commands",
-            f"{shlex.quote(args.get('command', ''))} {shlex.quote(args.get('args', ''))}",
-        ),
+        _handle_commands,
     )
 
 
@@ -479,7 +595,7 @@ def llm_chat(prompt: str, *, model: str | None = None, timeout: float = 300.0) -
     Used for summaries, fact extraction, and other pure-LLM tasks.
     Returns the raw text response (think-tags stripped).
     """
-    llm = _make_llm_client(model or CHAT_MODEL, timeout=timeout)
+    llm = _get_cached_llm_client(model or CHAT_MODEL, timeout=timeout)
     try:
         response = llm.chat(
             messages=[
@@ -490,8 +606,6 @@ def llm_chat(prompt: str, *, model: str | None = None, timeout: float = 300.0) -
         return strip_think_tags(response.text or "")
     except Exception as e:
         return f"Error: {e}"
-    finally:
-        llm.close()
 
 
 # ---------------------------------------------------------------------------
@@ -513,24 +627,14 @@ def run_baseagent(
     _ensure_agent_on_path()
     from src.core.loop import run_agent_loop  # type: ignore[import-untyped]
     from src.core.session import SimpleAgentContext  # type: ignore[import-untyped]
-    from src.llm.client import LLMClient  # type: ignore[import-untyped]
-    from src.tools.registry import ToolRegistry  # type: ignore[import-untyped]
     from src.output.jsonl import set_event_callback  # type: ignore[import-untyped]
 
     effective_model = model or (CHAT_MODEL if readonly else AGENT_MODEL)
     effective_cwd = cwd or WORKSPACE
     config = _make_config(readonly=readonly)
 
-    llm = LLMClient(
-        model=effective_model,
-        temperature=config["temperature"],
-        max_tokens=config["max_tokens"],
-        timeout=300.0,
-    )
-
-    tools = ToolRegistry(cwd=Path(effective_cwd))
-    if not readonly:
-        _register_tau_tools(tools)
+    llm = _get_cached_llm_client(effective_model, timeout=300.0)
+    tools = _get_cached_tool_registry(effective_cwd, register_tau=not readonly)
 
     # Use the proper AgentContext from the agent package
     ctx = SimpleAgentContext(instruction=prompt, cwd=effective_cwd)
@@ -558,7 +662,6 @@ def run_baseagent(
         return f"Error: {e}"
     finally:
         set_event_callback(None)
-        llm.close()
 
     final = captured_messages[-1] if captured_messages else ""
     return strip_think_tags(final)
@@ -595,24 +698,14 @@ def run_baseagent_streaming(
     def _worker():
         from src.core.loop import run_agent_loop  # type: ignore[import-untyped]
         from src.core.session import SimpleAgentContext  # type: ignore[import-untyped]
-        from src.llm.client import LLMClient  # type: ignore[import-untyped]
-        from src.tools.registry import ToolRegistry  # type: ignore[import-untyped]
         from src.output.jsonl import set_event_callback  # type: ignore[import-untyped]
 
         effective_model = model or (CHAT_MODEL if readonly else AGENT_MODEL)
         effective_cwd = cwd or WORKSPACE
         config = _make_config(readonly=readonly, chat_mode=chat_mode)
 
-        llm = LLMClient(
-            model=effective_model,
-            temperature=config["temperature"],
-            max_tokens=config["max_tokens"],
-            timeout=300.0,
-        )
-
-        tools = ToolRegistry(cwd=Path(effective_cwd))
-        if not readonly:
-            _register_tau_tools(tools)
+        llm = _get_cached_llm_client(effective_model, timeout=300.0)
+        tools = _get_cached_tool_registry(effective_cwd, register_tau=not readonly)
 
         ctx = SimpleAgentContext(instruction=prompt, cwd=effective_cwd)
 
@@ -633,7 +726,6 @@ def run_baseagent_streaming(
             event_queue.put({"type": "error", "message": str(e)})
         finally:
             set_event_callback(None)
-            llm.close()
             event_queue.put(None)  # sentinel
 
     t = threading.Thread(target=_worker, daemon=True, name="BaseAgentWorker")
