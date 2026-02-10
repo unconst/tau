@@ -1227,7 +1227,7 @@ def run_adapt_streaming(
     stream = TelegramStreamingMessage(
         chat_id,
         reply_to_message_id=reply_to_message_id,
-        initial_text="⏳",
+        initial_text="⏱ 0s",
         min_edit_interval_seconds=0.9,
         min_chars_delta=10,
     )
@@ -2053,7 +2053,7 @@ def run_agent_ask_streaming(
         chat_id,
         reply_to_message_id=reply_to_message_id,
         existing_message_id=existing_message_id,
-        initial_text="⏳",
+        initial_text="⏱ 0s",
         min_edit_interval_seconds=0.9,
         min_chars_delta=10,
     )
