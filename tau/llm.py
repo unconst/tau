@@ -774,6 +774,7 @@ def run_baseagent_streaming(
     chat_mode: bool = False,
     plan_first: bool = False,
     plan_approval_callback=None,
+    chat_id: int | None = None,
 ) -> threading.Thread:
     """Run the baseagent loop in a background thread.
 
@@ -811,6 +812,10 @@ def run_baseagent_streaming(
 
         llm = _get_cached_llm_client(effective_model, timeout=300.0)
         tools = _get_cached_tool_registry(effective_cwd, register_tau=not readonly)
+
+        # Wire up ask_user callback if we have a chat_id (Telegram context)
+        if chat_id is not None:
+            setup_ask_user_callback(tools, chat_id)
 
         ctx = SimpleAgentContext(instruction=prompt, cwd=effective_cwd)
 

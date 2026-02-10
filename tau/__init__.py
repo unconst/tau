@@ -17,7 +17,6 @@ from .telegram import (
     TelegramStreamingMessage, authorize, is_owner, is_private_chat,
     is_group_chat, save_chat_metadata, list_chats, get_chat_history_for,
     send_to_chat, send_plan_approval, send_question_with_options,
-    send_thinking_gif, delete_thinking_gif,
 )
 from .agent import run_loop, TASKS_DIR, get_all_tasks, git_commit_changes, set_debug_mode, read_file, run_memory_maintenance
 from .tools.commands import run_command
@@ -1221,28 +1220,17 @@ def run_adapt_streaming(
     reply_to_message_id: int | None = None,
     timeout_seconds: int = 3600,
 ) -> str:
-    """Run the agent CLI for adaptation and stream thinking/progress to Telegram.
-    
-    Streams minor updates during the process, then sends a final summary of what was done.
-    """
-    gif_msg_id = send_thinking_gif(chat_id, reply_to_message_id=reply_to_message_id)
-
+    """Run the agent CLI for adaptation and stream output to Telegram."""
     stream = TelegramStreamingMessage(
         chat_id,
         reply_to_message_id=reply_to_message_id,
         initial_text="...",
-        min_edit_interval_seconds=0.9,  # Fast updates for responsive feel
-        min_chars_delta=10,  # Lower threshold to show progress sooner
     )
 
-    from .llm import run_baseagent_streaming, parse_event, format_tool_update
+    from .llm import run_baseagent_streaming, parse_event
 
     start_time = time.time()
-    thinking_updates: list[str] = []
-    thinking_text_buffer: str = ""  # Buffer for streaming assistant text
     final_result_text: str | None = None
-    current_tool: str | None = None
-    last_thinking_snippet: str = ""  # Track last shown thinking snippet
 
     q: queue.Queue = queue.Queue()
 
@@ -1259,35 +1247,7 @@ def run_adapt_streaming(
         return err
 
     timed_out = False
-    
-    def build_display():
-        """Build the display message showing current thinking and actions."""
-        lines = []
-        
-        # Show current thinking or the last complete snippet
-        display_thinking = ""
-        if thinking_text_buffer.strip():
-            cleaned = thinking_text_buffer.strip().replace("\n", " ")
-            if last_thinking_snippet:
-                display_thinking = last_thinking_snippet
-                if len(cleaned) > len(last_thinking_snippet) + 5:
-                    remaining = cleaned[len(last_thinking_snippet):].strip()
-                    display_thinking += " " + remaining
-            else:
-                display_thinking = cleaned
-            
-            if len(display_thinking) > 150:
-                display_thinking = "..." + display_thinking[-147:]
-            
-            lines.append(f"💭 {display_thinking}\n")
-        
-        if thinking_updates:
-            lines.extend(thinking_updates[-6:])
-        
-        return "\n".join(lines) if lines else "..."
 
-    last_display_update = start_time
-    
     try:
         while True:
             if time.time() - start_time > timeout_seconds:
@@ -1295,25 +1255,12 @@ def run_adapt_streaming(
                 break
 
             try:
-                event = q.get(timeout=0.25)
+                event = q.get(timeout=0.5)
             except queue.Empty:
-                event = None
-                now = time.time()
-                if now - last_display_update >= 1.5:
-                    stream.set_text(build_display())
-                    last_display_update = now
                 continue
 
             if event is None:
-                # Sentinel — agent thread finished
                 break
-
-            # Refresh display periodically even during rapid unrecognised
-            # events (e.g. stream.text.delta) so the timer never freezes.
-            now = time.time()
-            if now - last_display_update >= 1.5:
-                stream.set_text(build_display())
-                last_display_update = now
 
             parsed = parse_event(event)
             if parsed is None:
@@ -1321,61 +1268,10 @@ def run_adapt_streaming(
 
             kind = parsed["kind"]
 
-            if kind == "tool_start":
-                current_tool = parsed.get("tool_name")
-                update = format_tool_update(parsed)
-                if update:
-                    thinking_updates.append(update)
-                    stream.set_text(build_display())
-                    last_display_update = time.time()
-
-            elif kind == "tool_done":
-                if current_tool:
-                    if thinking_updates:
-                        thinking_updates[-1] = thinking_updates[-1].replace("...", " ✓")
-                        stream.set_text(build_display())
-                        last_display_update = time.time()
-                    current_tool = None
-
-            elif kind in ("message", "message_done"):
+            if kind in ("message", "message_done"):
                 text = parsed.get("text", "")
-                if text:
-                    if kind == "message_done":
-                        thinking_text_buffer = text
-                    else:
-                        if len(text) > len(thinking_text_buffer):
-                            thinking_text_buffer = text
-
-                    cleaned = thinking_text_buffer.strip().replace("\n", " ")
-
-                    last_sentence_end = -1
-                    for i in range(len(cleaned) - 1, -1, -1):
-                        if cleaned[i] in '.!?' and (i == len(cleaned) - 1 or cleaned[i + 1] in ' \n\t'):
-                            last_sentence_end = i
-                            break
-
-                    if last_sentence_end > 0:
-                        complete_text = cleaned[:last_sentence_end + 1]
-                        if len(complete_text) > 100:
-                            snippet_start = len(complete_text) - 100
-                            for i in range(snippet_start, len(complete_text)):
-                                if complete_text[i] in '.!?' and i + 1 < len(complete_text):
-                                    snippet_start = i + 2
-                                    break
-                            snippet = complete_text[snippet_start:].strip()
-                        else:
-                            snippet = complete_text
-
-                        if snippet and snippet != last_thinking_snippet:
-                            last_thinking_snippet = snippet
-                            stream.set_text(build_display())
-                            last_display_update = time.time()
-
-                    if len(thinking_text_buffer) > 50:
-                        final_result_text = thinking_text_buffer
-
-            elif kind == "turn_done":
-                pass
+                if text and len(text) > 50:
+                    final_result_text = text
 
             elif kind == "error":
                 err_text = parsed.get("text", "Agent error")
@@ -1383,7 +1279,6 @@ def run_adapt_streaming(
                     final_result_text = f"Error: {err_text}"
 
     finally:
-        delete_thinking_gif(chat_id, gif_msg_id)
         stream.finalize()
 
     if timed_out:
@@ -1391,15 +1286,10 @@ def run_adapt_streaming(
         stream.set_text(msg)
         return msg
 
-    # Build final summary describing what was done
-    # Prefer the agent's own explanation if available
     if final_result_text:
-        # Clean up and truncate the result
         summary = final_result_text.strip()
-        # Remove markdown code blocks for cleaner display
         summary = re.sub(r'```[\s\S]*?```', '[code]', summary)
         if len(summary) > 600:
-            # Find a good cut point at sentence boundary
             cut = summary[:600].rfind('. ')
             if cut > 300:
                 summary = summary[:cut+1]
@@ -1411,12 +1301,7 @@ def run_adapt_streaming(
                     summary = summary[:597] + "..."
         final_msg = f"✅ Done\n\n{summary}"
     else:
-        # Fallback: Use the tool operations as summary
-        ops = [u.replace("...", "").replace(" ✓", "") for u in thinking_updates]
-        if ops:
-            final_msg = "✅ Done\n\nChanges made:\n" + "\n".join(ops[-10:])
-        else:
-            final_msg = "✅ Done"
+        final_msg = "✅ Done"
     
     stream.set_text(final_msg)
     return final_result_text or "Adaptation complete"
@@ -2226,6 +2111,7 @@ def run_agent_ask_streaming(
             chat_mode=is_chat_mode,
             plan_first=plan_first,
             plan_approval_callback=plan_approval_cb,
+            chat_id=chat_id,
         )
     except Exception as e:
         err = f"Error: {str(e)}"
@@ -2353,17 +2239,12 @@ def run_agent_ask_streaming(
                 last_display_update = time.time()
 
             elif kind == "user_input_requested":
-                # Agent is asking the user a question — render it via Telegram
+                # Agent is asking the user a question.
+                # The ask_user callback (setup_ask_user_callback) handles
+                # the Telegram interaction directly. This event is only
+                # emitted as a fallback; show status either way.
                 question = parsed.get("text", "")
-                options_json = parsed.get("tool_detail")
-                options = json.loads(options_json) if options_json else None
-                req_id = parsed.get("request_id", "")
-
                 if question:
-                    send_question_with_options(
-                        chat_id, question, options=options,
-                        reply_to_message_id=reply_to_message_id,
-                    )
                     thinking_updates.append(f"❓ Asked: {question[:40]}...")
                     stream.set_text(build_display())
                     last_display_update = time.time()

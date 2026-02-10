@@ -577,10 +577,14 @@ Proceed with verification now.
                         tools=tool_specs,
                         max_tokens=config.get("max_tokens", tier.max_tokens),
                         model=tier.model,
-                        extra_body={
-                            "reasoning": {"effort": config.get("reasoning_effort", tier.reasoning_effort)},
-                        },
                     )
+
+                    # Only send reasoning effort when the model supports it
+                    reasoning_effort = config.get("reasoning_effort", tier.reasoning_effort)
+                    if reasoning_effort and reasoning_effort != "none" and getattr(tier, "supports_reasoning", False):
+                        call_kwargs["extra_body"] = {
+                            "reasoning": {"effort": reasoning_effort},
+                        }
 
                     # Use streaming if available and enabled
                     if use_streaming and hasattr(llm, "chat_stream"):
