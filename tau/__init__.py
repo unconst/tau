@@ -1074,10 +1074,13 @@ def run_adapt_streaming(
     
     Streams minor updates during the process, then sends a final summary of what was done.
     """
+    from .spinners import get_random_spinner
+    spinner = get_random_spinner()
+
     stream = TelegramStreamingMessage(
         chat_id,
         reply_to_message_id=reply_to_message_id,
-        initial_text="🫡 Starting...",
+        initial_text=spinner.frame_at(0),
         min_edit_interval_seconds=0.9,  # Fast updates for responsive feel
         min_chars_delta=10,  # Lower threshold to show progress sooner
     )
@@ -1107,22 +1110,10 @@ def run_adapt_streaming(
 
     timed_out = False
     
-    # Cycling status messages for interactive feel
-    adapting_phases = [
-        "🫡 Adapting...",
-        "📝 Planning changes...",
-        "🔍 Analyzing code...",
-        "🧠 Reasoning...",
-        "⚙️ Working...",
-        "✨ Making progress...",
-    ]
-    
     def build_display():
         """Build the display message showing current thinking and actions."""
-        # Cycle through phases every 2 seconds
         elapsed = time.time() - start_time
-        phase_idx = int(elapsed / 2) % len(adapting_phases)
-        lines = [adapting_phases[phase_idx] + "\n"]
+        lines = [spinner.frame_at(elapsed) + "\n"]
         
         # Show current thinking or the last complete snippet
         display_thinking = ""
@@ -1336,10 +1327,13 @@ def run_plan_generation(
     Returns:
         Tuple of (plan_content, plan_filename)
     """
+    from .spinners import get_random_spinner
+    spinner = get_random_spinner()
+
     stream = TelegramStreamingMessage(
         chat_id,
         reply_to_message_id=reply_to_message_id,
-        initial_text="📋 Creating plan...",
+        initial_text=spinner.frame_at(0),
         min_edit_interval_seconds=0.9,
         min_chars_delta=10,
     )
@@ -1375,18 +1369,9 @@ Output ONLY the plan content, no preamble or meta-commentary."""
     final_result_text: str | None = None
     last_thinking_snippet: str = ""
 
-    planning_phases = [
-        "📋 Creating plan...",
-        "🎯 Defining goals...",
-        "📝 Outlining steps...",
-        "🔍 Adding details...",
-        "✨ Finalizing...",
-    ]
-
     def build_display():
         elapsed = time.time() - start_time
-        phase_idx = int(elapsed / 2) % len(planning_phases)
-        lines = [planning_phases[phase_idx] + "\n"]
+        lines = [spinner.frame_at(elapsed) + "\n"]
         
         if thinking_text_buffer.strip():
             cleaned = thinking_text_buffer.strip().replace("\n", " ")
@@ -1955,11 +1940,15 @@ def run_agent_ask_streaming(
     if model is None:
         from .llm import CHAT_MODEL
         model = CHAT_MODEL
+
+    from .spinners import get_random_spinner
+    spinner = get_random_spinner()
+
     stream = TelegramStreamingMessage(
         chat_id,
         reply_to_message_id=reply_to_message_id,
         existing_message_id=existing_message_id,
-        initial_text=initial_text,
+        initial_text=spinner.frame_at(0),
         min_edit_interval_seconds=0.9,  # Fast updates for responsive feel
         min_chars_delta=10,  # Lower threshold to show progress sooner
     )
@@ -1974,19 +1963,9 @@ def run_agent_ask_streaming(
     current_tool: str | None = None
     last_thinking_snippet: str = ""
     
-    thinking_phases = [
-        "🤔 Thinking...",
-        "📚 Reading context...",
-        "🔍 Analyzing...",
-        "💭 Processing...",
-        "🧠 Reasoning...",
-        "✨ Forming response...",
-    ]
-    
     def build_display():
         elapsed = time.time() - start_time
-        phase_idx = int(elapsed / 2) % len(thinking_phases)
-        lines = [thinking_phases[phase_idx] + "\n"]
+        lines = [spinner.frame_at(elapsed) + "\n"]
         
         display_thinking = ""
         if thinking_text_buffer.strip():

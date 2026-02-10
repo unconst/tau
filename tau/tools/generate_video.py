@@ -9,11 +9,10 @@ Usage:
     python -m tau.tools.generate_video --prompt "A cat walking" --image base64_string
 
 The script calls the Chutes WAN 2.2 I2V (image-to-video) API and sends
-the resulting video via Telegram.
+the resulting video via Telegram.  The API returns raw MP4 bytes on success.
 """
 
 import base64
-import io
 import os
 import sys
 import tempfile
@@ -28,14 +27,6 @@ logger = logging.getLogger(__name__)
 CHUTES_API_TOKEN = os.getenv("CHUTES_API_TOKEN")
 WAN_I2V_URL = "https://chutes-wan-2-2-i2v-14b-fast.chutes.ai/generate"
 
-# Default negative prompt (Chinese + English quality boosters from the Chutes example)
-DEFAULT_NEGATIVE_PROMPT = (
-    "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，"
-    "最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，"
-    "画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，"
-    "杂乱的背景，三条腿，背景人很多，倒着走"
-)
-
 
 def image_to_base64(image_source: str) -> str:
     """Convert an image source to a base64 string.
@@ -47,7 +38,6 @@ def image_to_base64(image_source: str) -> str:
     """
     # Already base64?
     if not os.path.exists(image_source) and not image_source.startswith(("http://", "https://")):
-        # Assume it's already base64
         return image_source
 
     # URL — download first
@@ -66,10 +56,9 @@ def generate_video(
     image: str,
     *,
     frames: int = 81,
-    guidance_scale: float = 1.0,
-    negative_prompt: str | None = None,
+    fps: int = 16,
+    resolution: str = "480p",
     fast: bool = True,
-    seed: int | None = None,
     timeout: int = 300,
 ) -> bytes:
     """Call the Chutes WAN 2.2 I2V API and return raw video bytes.
@@ -77,11 +66,10 @@ def generate_video(
     Args:
         prompt: Text description of the desired video motion/content.
         image: Image source — file path, URL, or base64 string.
-        frames: Number of frames to generate (default 81 ≈ 3.4s at 24fps).
-        guidance_scale: CFG scale (default 1.0).
-        negative_prompt: Things to avoid. Uses a sensible default if None.
+        frames: Number of frames to generate (default 81).
+        fps: Frames per second (default 16).
+        resolution: Output resolution (default "480p").
         fast: Use fast mode (default True).
-        seed: Random seed for reproducibility. None = random.
         timeout: Request timeout in seconds.
 
     Returns:
@@ -97,13 +85,12 @@ def generate_video(
     image_b64 = image_to_base64(image)
 
     body = {
-        "fast": fast,
-        "seed": seed,
+        "prompt": prompt,
         "image": image_b64,
         "frames": frames,
-        "prompt": prompt,
-        "guidance_scale": guidance_scale,
-        "negative_prompt": negative_prompt or DEFAULT_NEGATIVE_PROMPT,
+        "fps": fps,
+        "resolution": resolution,
+        "fast": fast,
     }
 
     headers = {
@@ -111,54 +98,36 @@ def generate_video(
         "Content-Type": "application/json",
     }
 
-    logger.info(f"Calling WAN I2V API: prompt='{prompt[:50]}...', frames={frames}")
+    logger.info(f"Calling WAN I2V API: prompt='{prompt[:50]}...', frames={frames}, fps={fps}, res={resolution}")
 
-    resp = requests.post(
-        WAN_I2V_URL,
-        headers=headers,
-        json=body,
-        timeout=timeout,
-    )
+    # Retry with backoff on 429 (capacity) errors
+    max_retries = 4
+    for attempt in range(max_retries + 1):
+        resp = requests.post(
+            WAN_I2V_URL,
+            headers=headers,
+            json=body,
+            timeout=timeout,
+        )
+        if resp.status_code == 429 and attempt < max_retries:
+            wait = 15 * (attempt + 1)  # 15s, 30s, 45s, 60s
+            logger.info(f"Rate limited (429), retrying in {wait}s (attempt {attempt + 1}/{max_retries})")
+            time.sleep(wait)
+            continue
+        break
+
     resp.raise_for_status()
 
-    # The API may return:
-    # 1. Raw video bytes (content-type contains "video")
-    # 2. JSON with a video URL or base64 video
-    content_type = resp.headers.get("content-type", "")
+    # API returns raw MP4 bytes on 200
+    if len(resp.content) < 1000:
+        # Suspiciously small — might be a JSON error body
+        try:
+            data = resp.json()
+            raise Exception(f"API returned JSON instead of video: {data}")
+        except (ValueError, Exception):
+            pass
 
-    if "video" in content_type or "octet-stream" in content_type:
-        # Raw binary video
-        return resp.content
-
-    # Try JSON response
-    try:
-        data = resp.json()
-    except Exception:
-        # If it's not JSON and not video content-type, treat as raw bytes
-        if len(resp.content) > 1000:
-            return resp.content
-        raise Exception(f"Unexpected response: {resp.text[:200]}")
-
-    # Extract video from JSON — try common field names
-    for key in ("video", "output", "result", "data", "url", "video_url"):
-        value = data.get(key)
-        if value is None:
-            continue
-
-        # If it's a URL, download the video
-        if isinstance(value, str) and value.startswith(("http://", "https://")):
-            video_resp = requests.get(value, timeout=120)
-            video_resp.raise_for_status()
-            return video_resp.content
-
-        # If it's base64, decode it
-        if isinstance(value, str) and len(value) > 100:
-            try:
-                return base64.b64decode(value)
-            except Exception:
-                pass
-
-    raise Exception(f"Could not extract video from API response: {list(data.keys())}")
+    return resp.content
 
 
 def send_video_message(
