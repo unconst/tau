@@ -1,4 +1,4 @@
-"""Track and terminate active subprocesses (e.g. Codex CLI).
+"""Track and terminate active subprocesses (e.g. agent threads).
 
 This lets Telegram commands like /clear stop any in-flight agent work.
 """

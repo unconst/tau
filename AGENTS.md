@@ -36,5 +36,5 @@ The agent loop prompt in `tau/agent.py` defines specific tool commands (send_mes
 
 - Python 3.10+, type hints preferred
 - Use `subprocess.Popen` for long-running commands, `subprocess.run` for quick ones
-- All codex CLI invocations go through `tau/codex.py` helpers
+- All LLM/agent invocations go through `tau/codex.py` helpers (agent wrapper)
 - Keep changes minimal and focused

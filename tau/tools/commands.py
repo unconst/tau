@@ -70,7 +70,7 @@ def cmd_task(description: str) -> str:
 def cmd_plan(description: str) -> str:
     """Create an execution plan for a task.
     
-    Uses the Codex agent to generate a comprehensive plan based on 
+    Uses the agent to generate a comprehensive plan based on 
     the task description and workspace context.
     
     Args:
@@ -135,19 +135,10 @@ Use the workspace context above to inform your plan.
 
 Output ONLY the plan content, no preamble."""
 
-    from tau.codex import build_cmd as _build_codex_cmd, CHAT_MODEL
-    cmd = _build_codex_cmd(plan_prompt, model=CHAT_MODEL, readonly=True)
+    from tau.codex import llm_chat
     
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=str(WORKSPACE),
-            timeout=600,
-        )
-        from tau.codex import strip_think_tags
-        plan_content = strip_think_tags(result.stdout.strip() or result.stderr.strip())
+        plan_content = llm_chat(plan_prompt, timeout=600.0)
         
         if not plan_content:
             return "Error: Failed to generate plan content"
@@ -168,8 +159,6 @@ Output ONLY the plan content, no preamble."""
         
         return f"Plan saved to {plan_filename}\n\n{plan_content[:500]}..."
         
-    except subprocess.TimeoutExpired:
-        return "Error: Plan generation timed out"
     except Exception as e:
         return f"Error generating plan: {str(e)}"
 
@@ -230,7 +219,7 @@ def cmd_status() -> str:
 
 
 def cmd_adapt(prompt: str) -> str:
-    """Self-modify the bot using Codex agent.
+    """Self-modify the bot using the agent.
     
     WARNING: This modifies the bot's own code and triggers a restart.
     Use carefully.
@@ -244,19 +233,10 @@ def cmd_adapt(prompt: str) -> str:
     if not prompt:
         return "Error: Adaptation prompt is required"
     
-    from tau.codex import build_cmd as _build_codex_cmd, AGENT_MODEL
-    cmd = _build_codex_cmd(prompt, model=AGENT_MODEL)
+    from tau.codex import run_baseagent
     
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=str(WORKSPACE),
-            timeout=3600,
-        )
-        from tau.codex import strip_think_tags
-        output = strip_think_tags(result.stdout.strip() or result.stderr.strip())
+        output = run_baseagent(prompt)
         
         # Commit changes
         try:
@@ -275,8 +255,6 @@ def cmd_adapt(prompt: str) -> str:
         
         return f"Adaptation complete: {output[:500]}"
         
-    except subprocess.TimeoutExpired:
-        return "Error: Adaptation timed out after 1 hour"
     except Exception as e:
         return f"Error during adaptation: {str(e)}"
 

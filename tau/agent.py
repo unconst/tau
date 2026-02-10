@@ -1,6 +1,6 @@
 """Minimal two-buffer agent loop with task-specific memory.
 
-Uses Codex CLI (``codex exec``) as the underlying LLM backend.
+Uses the agent package in-process as the underlying LLM backend.
 """
 
 import os
@@ -282,7 +282,7 @@ def detect_and_archive_stale_entries():
 
 
 def compress_summary_content(content: str, target_ratio: float = 0.5) -> str:
-    """Compress a summary to target ratio of original size using the agent."""
+    """Compress a summary to target ratio of original size using the LLM."""
     target_chars = int(len(content) * target_ratio)
     
     compress_prompt = f"""Compress this summary to approximately {target_chars} characters.
@@ -293,25 +293,9 @@ Original:
 
 Output ONLY the compressed summary, no preamble."""
 
-    from .codex import build_cmd, CHAT_MODEL
-    cmd = build_cmd(compress_prompt, model=CHAT_MODEL, readonly=True)
-
     try:
-        from . import processes
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            stdin=subprocess.DEVNULL,
-            cwd=WORKSPACE,
-            start_new_session=True,
-        )
-        processes.track(proc, label="agent:compress", cmd=cmd, own_process_group=True)
-        stdout, stderr = proc.communicate(timeout=120)
-        processes.untrack(proc)
-        from .codex import strip_think_tags
-        result = strip_think_tags(stdout.strip() if stdout.strip() else stderr.strip())
+        from .codex import llm_chat
+        result = llm_chat(compress_prompt, timeout=120.0)
         return result[:target_chars + 100]  # Allow slight overage
     except Exception:
         return content[:target_chars]  # Fallback to truncation
@@ -331,26 +315,9 @@ Summary:
 Return a bullet list of core facts (each starting with "- "), or "NONE" if no new core facts.
 Be very selective - only truly persistent information that would be useful months later."""
 
-    from .codex import build_cmd, CHAT_MODEL
-    cmd = build_cmd(extract_prompt, model=CHAT_MODEL, readonly=True)
-
     try:
-        from . import processes
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            stdin=subprocess.DEVNULL,
-            cwd=WORKSPACE,
-            start_new_session=True,
-        )
-        processes.track(proc, label="agent:extract_facts", cmd=cmd, own_process_group=True)
-        stdout, stderr = proc.communicate(timeout=120)
-        processes.untrack(proc)
-        
-        from .codex import strip_think_tags
-        facts = strip_think_tags(stdout.strip() if stdout.strip() else stderr.strip())
+        from .codex import llm_chat
+        facts = llm_chat(extract_prompt, timeout=120.0)
         if "NONE" in facts.upper() or not facts:
             return []
         
@@ -612,64 +579,19 @@ def create_high_level_summary(detailed_content: str, task_title: str) -> str:
     return summary
 
 
-def run_codex(prompt: str) -> str:
-    """Run Codex agent with prompt, return output."""
-    from .codex import build_cmd, AGENT_MODEL
-    cmd = build_cmd(prompt, model=AGENT_MODEL)
+def run_agent(prompt: str) -> str:
+    """Run the agent with prompt, return output.
 
-    proc = None
-    stdout = ""
-    stderr = ""
+    Uses the in-process agent loop.  The Tau system prompt (identity,
+    memory, tasks) is passed as part of the instruction since the caller
+    already constructs the full prompt from ``PROMPT_TEMPLATE``.
+    """
+    from .codex import run_baseagent
+
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            stdin=subprocess.DEVNULL,
-            cwd=WORKSPACE,
-            start_new_session=True,
-        )
-        processes.track(proc, label="agent:loop", cmd=cmd, own_process_group=True)
-        stdout, stderr = proc.communicate(timeout=86400)  # 24 hours
-    except subprocess.TimeoutExpired:
-        # Kill the whole process group (agent can spawn children).
-        try:
-            import signal as _signal
-            if proc is not None:
-                os.killpg(proc.pid, _signal.SIGTERM)
-        except Exception:
-            try:
-                if proc is not None:
-                    proc.terminate()
-            except Exception:
-                pass
-        try:
-            if proc is not None:
-                proc.wait(timeout=2)
-        except Exception:
-            try:
-                import signal as _signal
-                if proc is not None:
-                    os.killpg(proc.pid, _signal.SIGKILL)
-            except Exception:
-                try:
-                    if proc is not None:
-                        proc.kill()
-                except Exception:
-                    pass
-        return "Error: Agent timed out after 24 hours"
+        return run_baseagent(prompt, cwd=WORKSPACE)
     except Exception as e:
         return f"Error: {str(e)}"
-    finally:
-        processes.untrack(proc)
-
-    if proc is not None and processes.pop_cancelled(proc.pid):
-        return "Cancelled."
-
-    from .codex import strip_think_tags
-    out = stdout.strip() if stdout and stdout.strip() else (stderr or "").strip()
-    return strip_think_tags(out)
 
 
 def git_commit_changes(description: str):
@@ -947,7 +869,7 @@ def run_loop(stop_event=None):
                     
                     # Run agent
                     think("executing...")
-                    output = run_codex(prompt)
+                    output = run_agent(prompt)
                     
                     # Commit any changes made by the agent
                     # Use task title + first part of output as commit description

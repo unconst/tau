@@ -54,7 +54,7 @@ def test_run_loop_processes_one_task_and_cleans_up(tau_app, monkeypatch):
     (task_dir / "task.md").write_text("## do work\n- created: 2026-01-01 00:00\n")
 
     # Make the agent produce a completion marker
-    monkeypatch.setattr(app.agent, "run_codex", lambda prompt: "Did work. Task complete")
+    monkeypatch.setattr(app.agent, "run_agent", lambda prompt: "Did work. Task complete")
 
     stop_event = app.tau.threading.Event()
 

@@ -914,13 +914,6 @@ step_dependencies() {
         check_pending "uv"
     fi
     
-    # Check codex CLI
-    if command_exists codex; then
-        check_ok "codex cli"
-    else
-        check_pending "codex cli"
-    fi
-    
     # Handle missing dependencies
     if [ "$missing_git" = true ] || [ "$missing_python" = true ] || \
        [ "$missing_curl" = true ]; then
@@ -1366,137 +1359,10 @@ step_python() {
     debug "Activated, python now: $(command -v python)"
     
     run_silent "Installing tau" uv pip install -e .
+    run_silent "Installing agent" uv pip install -e ./agent
     run_silent "Installing supervisor" uv pip install supervisor
     
     mkdir -p "$INSTALL_DIR/context/logs"
-}
-
-step_codex() {
-    # Update PATH to include common install locations
-    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-    
-    if command_exists codex; then
-        debug "Codex CLI already installed: $(command -v codex)"
-        return 0
-    fi
-    
-    log ""
-    info "Codex CLI enables autonomous agent operation"
-    
-    if prompt_yn "Install Codex CLI"; then
-        local tmplog
-        tmplog=$(mktemp)
-        CLEANUP_FILES+=("$tmplog")
-        
-        # --- Check for system build tools (C compiler + linker) ---
-        local has_build_tools=true
-        if ! command_exists cc && ! command_exists gcc; then
-            has_build_tools=false
-            if [ "$(uname)" = "Darwin" ]; then
-                info "C compiler not found — installing Xcode command-line tools..."
-                if xcode-select --install 2>/dev/null; then
-                    # Wait for install to finish (up to 5 minutes)
-                    local waited=0 max_wait=300
-                    while ! command_exists cc && [ $waited -lt $max_wait ]; do
-                        sleep 5
-                        waited=$((waited + 5))
-                    done
-                    if command_exists cc; then
-                        has_build_tools=true
-                        ok "Xcode command-line tools installed"
-                    else
-                        warn "Xcode tools install may still be running."
-                        info "Re-run this script after it finishes, or run: xcode-select --install"
-                    fi
-                else
-                    warn "Could not trigger Xcode tools install."
-                    info "Run manually: xcode-select --install"
-                fi
-            else
-                warn "No C compiler (cc/gcc) found. Install build-essential (Debian/Ubuntu)"
-                info "  or gcc (Fedora/RHEL) before building Codex from source."
-            fi
-        fi
-
-        # --- Strategy 1: build from bundled source (codex/ in repo) ---
-        local codex_src="$INSTALL_DIR/codex/codex-rs"
-        if [ -d "$codex_src" ] && [ "$has_build_tools" = true ]; then
-            # Ensure Rust toolchain is available
-            if ! command_exists cargo; then
-                info "Installing Rust toolchain (required to build Codex)..."
-                if curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y >"$tmplog" 2>&1; then
-                    export PATH="$HOME/.cargo/bin:$PATH"
-                    ok "Rust toolchain installed"
-                else
-                    warn "Rust installation failed"
-                    if [ -s "$tmplog" ]; then
-                        debug "Error: $(tail -5 "$tmplog")"
-                    fi
-                fi
-            fi
-            
-            if command_exists cargo; then
-                info "Building Codex CLI from source (this may take a few minutes)..."
-                if cargo build --release --manifest-path "$codex_src/Cargo.toml" >"$tmplog" 2>&1; then
-                    local binary="$codex_src/target/release/codex"
-                    if [ -f "$binary" ]; then
-                        mkdir -p "$HOME/.local/bin"
-                        cp "$binary" "$HOME/.local/bin/codex"
-                        chmod +x "$HOME/.local/bin/codex"
-                        export PATH="$HOME/.local/bin:$PATH"
-                        
-                        if command_exists codex; then
-                            ok "Codex CLI installed"
-                        else
-                            warn "Built but not found in PATH"
-                            info "Add ~/.local/bin to your PATH, then restart terminal"
-                        fi
-                    else
-                        warn "Build succeeded but binary not found"
-                    fi
-                else
-                    warn "Codex CLI build failed"
-                    if [ -s "$tmplog" ]; then
-                        debug "Error: $(tail -5 "$tmplog")"
-                    fi
-                fi
-            fi
-        elif [ -d "$codex_src" ] && [ "$has_build_tools" = false ]; then
-            warn "Skipping source build — no C compiler available"
-        fi
-        
-        if ! command_exists codex; then
-            warn "Could not install Codex CLI automatically"
-            info "Build manually from the bundled source:"
-            info "  cd $INSTALL_DIR/codex/codex-rs && cargo build --release"
-            info "  cp target/release/codex ~/.local/bin/"
-        fi
-        
-        rm -f "$tmplog"
-    else
-        info "Tau will work without it (limited functionality)"
-        info "Build later:  cd codex/codex-rs && cargo build --release && cp target/release/codex ~/.local/bin/"
-    fi
-    
-    # --- Ensure the Tau workspace is trusted by codex ---
-    if command_exists codex; then
-        local codex_config="$HOME/.codex/config.toml"
-        mkdir -p "$HOME/.codex"
-        if [ -f "$codex_config" ]; then
-            if ! grep -q "projects.\"$INSTALL_DIR\"" "$codex_config" 2>/dev/null; then
-                printf '\n[projects."%s"]\ntrust_level = "trusted"\n' "$INSTALL_DIR" >> "$codex_config"
-                debug "Added Tau workspace trust to codex config"
-            fi
-        else
-            # Create a minimal config with the trust entry
-            cat > "$codex_config" << TOMLEOF
-
-[projects."$INSTALL_DIR"]
-trust_level = "trusted"
-TOMLEOF
-            debug "Created codex config with Tau workspace trust"
-        fi
-    fi
 }
 
 step_telegram() {
@@ -1543,7 +1409,7 @@ step_chutes() {
     [ "$HAS_TTY" = false ] && return 0
     
     log ""
-    info "Chutes API token is required for the Codex agent (get one at chutes.ai)"
+    info "Chutes API token is required for the LLM backend (get one at chutes.ai)"
     printf "  ${DIM}Chutes API token (Enter to skip):${NC} "
     read -r CHUTES_KEY </dev/tty 2>/dev/null || CHUTES_KEY=""
     
@@ -1551,7 +1417,7 @@ step_chutes() {
         echo "CHUTES_API_TOKEN=$CHUTES_KEY" >> "$ENV_FILE"
         ok "Chutes token configured"
     else
-        warn "Skipped - Codex agent will not work without CHUTES_API_TOKEN in .env"
+        warn "Skipped - agent will not work without CHUTES_API_TOKEN in .env"
         info "Get a token at https://chutes.ai and add CHUTES_API_TOKEN=... to .env"
     fi
 }
@@ -1921,7 +1787,6 @@ main() {
     step_dependencies
     step_clone
     step_python
-    step_codex
     step_chutes
     step_telegram
     step_openai
