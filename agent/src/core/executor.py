@@ -20,10 +20,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
-    pass  # AgentContext is duck-typed
+    from src.tools.registry import ExecutorConfig, ExecutorStats, ToolRegistry
 
 from src.tools.base import ToolResult
-from src.tools.registry import ExecutorConfig, ExecutorStats, ToolRegistry
 
 
 class RiskLevel(Enum):
@@ -98,7 +97,7 @@ class AgentExecutor:
     def __init__(
         self,
         cwd: Optional[Path] = None,
-        config: Optional[ExecutorConfig] = None,
+        config: Optional["ExecutorConfig"] = None,
         sandbox_policy: SandboxPolicy = SandboxPolicy.PROMPT,
     ):
         """Initialize the executor.
@@ -108,6 +107,8 @@ class AgentExecutor:
             config: Executor configuration (timeouts, concurrency, etc.)
             sandbox_policy: Policy for handling risky operations
         """
+        from src.tools.registry import ToolRegistry
+
         self.registry = ToolRegistry(cwd=cwd)
         if config:
             self.registry._config = config
@@ -115,7 +116,7 @@ class AgentExecutor:
         self._execution_cache: Dict[str, CachedExecutionResult] = {}
 
     @property
-    def config(self) -> ExecutorConfig:
+    def config(self) -> "ExecutorConfig":
         """Get the executor configuration."""
         return self.registry._config
 
@@ -400,7 +401,7 @@ class AgentExecutor:
         else:  # PERMISSIVE
             return risk != RiskLevel.CRITICAL
 
-    def stats(self) -> ExecutorStats:
+    def stats(self) -> "ExecutorStats":
         """Get execution statistics."""
         return self.registry.stats()
 

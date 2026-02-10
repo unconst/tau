@@ -17,8 +17,6 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from src.core.session import SimpleAgentContext
-from src.llm.router import ModelRouter
 from src.tools.base import ToolResult
 
 MAX_CONCURRENT = 4
@@ -82,7 +80,9 @@ def run_subagent(
         ToolResult with the subagent's final message.
     """
     from src.core.loop import run_agent_loop
+    from src.core.session import SimpleAgentContext
     from src.llm.client import LLMClient
+    from src.llm.router import ModelRouter
     from src.output.jsonl import set_event_callback
     from src.tools.registry import ToolRegistry
 

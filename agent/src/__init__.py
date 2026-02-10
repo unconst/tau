@@ -5,19 +5,23 @@ Uses Chutes API via httpx for LLM interaction.
 
 Usage:
     python agent.py --instruction "Your task here..."
+
+Heavy modules (tools, core.loop, core.executor) are NOT re-exported here
+to avoid circular imports.  Import them directly::
+
+    from src.tools.registry import ToolRegistry
+    from src.core.loop import run_agent_loop
 """
 
 __version__ = "1.0.0"
 __author__ = "Platform Network"
 
-# Import main components for convenience
+# Only re-export lightweight, leaf-node modules that don't trigger cycles.
 from src.config.defaults import CONFIG
 from src.output.jsonl import emit
-from src.tools.registry import ToolRegistry
 
 __all__ = [
     "CONFIG",
-    "ToolRegistry",
     "emit",
     "__version__",
 ]

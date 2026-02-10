@@ -4,9 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from src.tools.subagent import SUBAGENT_SPEC
-from src.tools.web_search import WEB_SEARCH_SPEC
-
 # Shell command tool
 SHELL_COMMAND_SPEC: dict[str, Any] = {
     "name": "shell_command",
@@ -312,22 +309,49 @@ Use after editing files to check for errors you may have introduced.""",
     },
 }
 
-# All tool specs
-TOOL_SPECS: dict[str, dict[str, Any]] = {
-    "shell_command": SHELL_COMMAND_SPEC,
-    "read_file": READ_FILE_SPEC,
-    "write_file": WRITE_FILE_SPEC,
-    "list_dir": LIST_DIR_SPEC,
-    "grep_files": GREP_FILES_SPEC,
-    "apply_patch": APPLY_PATCH_SPEC,
-    "view_image": VIEW_IMAGE_SPEC,
-    "update_plan": UPDATE_PLAN_SPEC,
-    "web_search": WEB_SEARCH_SPEC,
-    "spawn_subagent": SUBAGENT_SPEC,
-    "str_replace": STR_REPLACE_SPEC,
-    "glob_files": GLOB_FILES_SPEC,
-    "lint": LINT_SPEC,
-}
+# ---------------------------------------------------------------------------
+# Lazy TOOL_SPECS — built on first access to avoid circular imports
+# (subagent.py and web_search.py would pull in core/llm modules at import
+# time, creating a registry -> specs -> subagent -> core -> executor ->
+# registry cycle).
+# ---------------------------------------------------------------------------
+
+_TOOL_SPECS: dict[str, dict[str, Any]] | None = None
+
+
+def _build_tool_specs() -> dict[str, dict[str, Any]]:
+    """Build the full tool specs dict, importing external specs lazily."""
+    from src.tools.subagent import SUBAGENT_SPEC
+    from src.tools.web_search import WEB_SEARCH_SPEC
+
+    return {
+        "shell_command": SHELL_COMMAND_SPEC,
+        "read_file": READ_FILE_SPEC,
+        "write_file": WRITE_FILE_SPEC,
+        "list_dir": LIST_DIR_SPEC,
+        "grep_files": GREP_FILES_SPEC,
+        "apply_patch": APPLY_PATCH_SPEC,
+        "view_image": VIEW_IMAGE_SPEC,
+        "update_plan": UPDATE_PLAN_SPEC,
+        "web_search": WEB_SEARCH_SPEC,
+        "spawn_subagent": SUBAGENT_SPEC,
+        "str_replace": STR_REPLACE_SPEC,
+        "glob_files": GLOB_FILES_SPEC,
+        "lint": LINT_SPEC,
+    }
+
+
+def _get_tool_specs() -> dict[str, dict[str, Any]]:
+    """Return the (lazily-initialized) tool specs dict."""
+    global _TOOL_SPECS
+    if _TOOL_SPECS is None:
+        _TOOL_SPECS = _build_tool_specs()
+    return _TOOL_SPECS
+
+
+# Keep a public name for backward compatibility — but callers should prefer
+# get_all_tools() / get_tool_spec() which go through the lazy accessor.
+TOOL_SPECS: dict[str, dict[str, Any]] = {}  # populated on first get_all_tools() call
 
 
 def get_all_tools() -> list[dict[str, Any]]:
@@ -336,7 +360,7 @@ def get_all_tools() -> list[dict[str, Any]]:
     Returns:
         List of tool specification dicts
     """
-    return list(TOOL_SPECS.values())
+    return list(_get_tool_specs().values())
 
 
 def get_tool_spec(name: str) -> dict[str, Any] | None:
@@ -348,4 +372,4 @@ def get_tool_spec(name: str) -> dict[str, Any] | None:
     Returns:
         Tool specification dict or None if not found
     """
-    return TOOL_SPECS.get(name)
+    return _get_tool_specs().get(name)

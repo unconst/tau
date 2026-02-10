@@ -1,6 +1,14 @@
-"""Core module - agent loop, session management, and context compaction."""
+"""Core module - agent loop, session management, and context compaction.
 
-# Compaction module (context management)
+Heavy submodules (``executor``, ``loop``) are NOT re-exported here to
+avoid circular imports.  Import them directly::
+
+    from src.core.loop import run_agent_loop
+    from src.core.executor import AgentExecutor
+"""
+
+# Compaction module (context management) — no cross-package deps, safe to
+# import eagerly.
 from src.core.compaction import (
     AUTO_COMPACT_THRESHOLD,
     MODEL_CONTEXT_LIMIT,
@@ -19,25 +27,11 @@ from src.core.compaction import (
     prune_old_tool_outputs,
     run_compaction,
 )
-from src.core.executor import (
-    AgentExecutor,
-    ExecutionResult,
-    RiskLevel,
-    SandboxPolicy,
-)
 
-# Import run_agent_loop
-from src.core.loop import run_agent_loop
-
-# Session management
+# Session management — only depends on src.config.models, safe to import.
 from src.core.session import AgentContext, Session, ShellResult, SimpleAgentContext, TokenUsage
 
 __all__ = [
-    # Executor
-    "AgentExecutor",
-    "ExecutionResult",
-    "RiskLevel",
-    "SandboxPolicy",
     # Compaction
     "manage_context",
     "WorkingSet",
@@ -55,8 +49,6 @@ __all__ = [
     "PRUNE_PROTECT",
     "PRUNE_MINIMUM",
     "PRUNE_MARKER",
-    # Loop
-    "run_agent_loop",
     # Session
     "AgentContext",
     "SimpleAgentContext",
