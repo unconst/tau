@@ -375,6 +375,13 @@ def build_tau_system_prompt(
     if skills_section:
         parts.append(f"# Relevant Skills\n\n{skills_section}")
 
+    parts.append(
+        f"# Runtime\n\n"
+        f"- Agent model: {AGENT_MODEL}\n"
+        f"- Chat model: {CHAT_MODEL}\n"
+        f"- API: Chutes (llm.chutes.ai)"
+    )
+
     parts.append("""# Tools Available
 
 You have the following tools:

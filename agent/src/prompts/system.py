@@ -783,6 +783,7 @@ def get_system_prompt(
     cwd: Optional[Path] = None,
     shell: Optional[str] = None,
     environment_context: Optional[Dict[str, object]] = None,
+    model: Optional[str] = None,
 ) -> str:
     """Get the full system prompt with environment context.
 
@@ -793,6 +794,7 @@ def get_system_prompt(
         cwd: Current working directory.
         shell: Shell being used.
         environment_context: Optional execution policy/sandbox context.
+        model: Model identifier being used for this session.
 
     Returns:
         Complete system prompt string.
@@ -807,6 +809,8 @@ def get_system_prompt(
         f"- Platform: {platform.system()}",
         f"- Shell: {shell_str}",
     ]
+    if model:
+        env_lines.append(f"- Model: {model}")
     if environment_context:
         env_lines.extend(
             [

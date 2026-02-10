@@ -317,6 +317,7 @@ def run_agent_loop(
                 "readable_roots": readable_roots,
                 "writable_roots": writable_roots,
             },
+            model=config.get("model"),
         )
 
     # 4. Build fresh or restored state
