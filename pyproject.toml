@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "An agent that can do stuff and upgrade its own code in real time."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["pytelegrambotapi", "openai", "python-dotenv", "supervisor"]
+dependencies = ["pytelegrambotapi", "requests", "python-dotenv", "supervisor"]
 
 [project.optional-dependencies]
 # Eve (Eden.art) creative tools integration - install with: uv pip install -e ".[eve]"

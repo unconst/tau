@@ -10,7 +10,8 @@ import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from openai import OpenAI
+import base64
+import requests as _requests
 from .telegram import (
     bot, save_chat_id, notify, WORKSPACE, append_chat_history,
     TelegramStreamingMessage, authorize, is_owner, is_private_chat,
@@ -405,11 +406,9 @@ CHAT_SUMMARY_FILE = os.path.join(WORKSPACE, "context", "CHAT_SUMMARY.md")
 # Event to signal agent loop to stop
 _stop_event = threading.Event()
 
-# Initialize OpenAI client
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    notify("⚠️ Warning: OPENAI_API_KEY not set. Voice transcription will not work.")
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+# Chutes API token (used for STT via Whisper on Chutes)
+CHUTES_API_TOKEN = os.getenv("CHUTES_API_TOKEN")
+WHISPER_URL = "https://chutes-whisper-large-v3.chutes.ai/transcribe"
 
 
 def download_voice_file(file_id: str) -> str:
@@ -433,17 +432,26 @@ def download_voice_file(file_id: str) -> str:
 
 
 def transcribe_voice(voice_path: str) -> str:
-    """Transcribe a voice file using OpenAI Whisper API."""
-    if not openai_client:
-        raise Exception("OpenAI API key not configured")
-    
+    """Transcribe a voice file using Chutes Whisper API."""
+    if not CHUTES_API_TOKEN:
+        raise Exception("CHUTES_API_TOKEN not set — voice transcription unavailable")
+
     try:
         with open(voice_path, 'rb') as audio_file:
-            transcript = openai_client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file
-            )
-        return transcript.text
+            audio_b64 = base64.b64encode(audio_file.read()).decode("utf-8")
+
+        resp = _requests.post(
+            WHISPER_URL,
+            headers={
+                "Authorization": f"Bearer {CHUTES_API_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={"audio_b64": audio_b64},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("text") or data.get("transcription") or ""
     except Exception as e:
         raise Exception(f"Failed to transcribe voice: {str(e)}")
 
@@ -1707,30 +1715,16 @@ Please respond to the user's message above, considering the full context of our 
         # Process transcribed text as normal message
         try:
             from .llm import CHAT_MODEL
-            backend = (os.getenv("TAU_CHAT_BACKEND") or "baseagent").strip().lower()
-            openai_model = os.getenv("TAU_OPENAI_CHAT_MODEL", "gpt-4o-mini")
             agent_model = os.getenv("TAU_CHAT_MODEL", CHAT_MODEL)
-            use_openai = backend in ("openai", "oa") or (backend == "auto" and openai_client is not None)
 
-            if use_openai:
-                response = run_openai_chat_streaming(
-                    prompt_with_context,
-                    chat_id=message.chat.id,
-                    existing_message_id=processing_msg.message_id,
-                    initial_text="🎤 Thinking...",
-                    model=openai_model,
-                    timeout_seconds=60,
-                    max_tokens=500,
-                )
-            else:
-                response = run_agent_ask_streaming(
-                    prompt_with_context,
-                    chat_id=message.chat.id,
-                    existing_message_id=processing_msg.message_id,
-                    initial_text="🎤 Thinking...",
-                    model=agent_model,
-                    timeout_seconds=600,
-                )
+            response = run_agent_ask_streaming(
+                prompt_with_context,
+                chat_id=message.chat.id,
+                existing_message_id=processing_msg.message_id,
+                initial_text="🎤 Thinking...",
+                model=agent_model,
+                timeout_seconds=600,
+            )
             append_chat_history("assistant", response, chat_id=message.chat.id)
         finally:
             # Stop typing indicator
@@ -1984,84 +1978,6 @@ def run_agent_ask_streaming(
     return final_answer
 
 
-def run_openai_chat_streaming(
-    user_prompt: str,
-    *,
-    chat_id: int,
-    reply_to_message_id: int | None = None,
-    existing_message_id: int | None = None,
-    initial_text: str = "🤔 Thinking...",
-    model: str = "gpt-4o-mini",
-    timeout_seconds: int = 45,
-    max_tokens: int = 400,
-    temperature: float = 0.2,
-) -> str:
-    """Stream a fast OpenAI chat completion into Telegram."""
-    stream = TelegramStreamingMessage(
-        chat_id,
-        reply_to_message_id=reply_to_message_id,
-        existing_message_id=existing_message_id,
-        initial_text=initial_text,
-        min_edit_interval_seconds=0.9,
-        min_chars_delta=20,
-    )
-
-    if not openai_client:
-        msg = "⚠️ OPENAI_API_KEY not set, fast chat unavailable."
-        stream.set_text(msg)
-        return msg
-
-    start_time = time.time()
-    parts: list[str] = []
-
-    try:
-        resp = openai_client.chat.completions.create(
-            model=model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are Tau, an autonomous AI assistant running as a Telegram bot. "
-                        "Answer the user directly and concisely. No preamble. No tool logs. No hidden reasoning. "
-                        "When asked how to use you, explain conversationally: "
-                        "users can just chat naturally, ask you to remind them of things, "
-                        "set up recurring tasks, work on longer research in the background, "
-                        "and even ask you to modify your own code. Give natural examples, not command syntax."
-                    ),
-                },
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=True,
-            timeout=timeout_seconds,
-        )
-
-        for chunk in resp:
-            if time.time() - start_time > timeout_seconds:
-                raise TimeoutError("OpenAI request timed out")
-
-            delta = None
-            try:
-                delta = chunk.choices[0].delta.content  # type: ignore[attr-defined]
-            except Exception:
-                delta = None
-
-            if delta:
-                parts.append(delta)
-                stream.append(delta)
-
-        stream.finalize()
-        final = "".join(parts).strip()
-        if not final:
-            final = "No response."
-            stream.set_text(final)
-        return final
-
-    except Exception as e:
-        msg = f"Error: {str(e)}"
-        stream.set_text(msg)
-        return msg
 
 
 def _extract_final_answer(output: str) -> str:
@@ -2192,52 +2108,15 @@ def handle_message(message):
     if is_private_chat(message):
         save_chat_id(message.chat.id)
 
-    # Backend + model selection:
-    # - default: use agent in-process for normal chat
-    # - set TAU_CHAT_BACKEND=openai to use OpenAI directly
-    # - set TAU_CHAT_BACKEND=auto to use OpenAI when OPENAI_API_KEY is available
-    # - "smart" routing: short/simple messages auto-route to fast OpenAI path
+    # Model selection — always use the agent path via Chutes
     from .llm import CHAT_MODEL, build_tau_system_prompt
-    backend = (os.getenv("TAU_CHAT_BACKEND") or "baseagent").strip().lower()
-    openai_model = os.getenv("TAU_OPENAI_CHAT_MODEL", "gpt-4o-mini")
     agent_model = os.getenv("TAU_CHAT_MODEL", CHAT_MODEL)
-    use_openai = backend in ("openai", "oa") or (backend == "auto" and openai_client is not None)
 
-    # Smart routing: if OpenAI is available and the message looks simple,
-    # use the fast OpenAI path instead of the full agent loop.
-    if not use_openai and openai_client is not None:
-        msg_lower = (message.text or "").lower().strip()
-        is_simple = (
-            len(msg_lower) < 200
-            and not any(kw in msg_lower for kw in [
-                "adapt", "modify", "change your", "update your", "edit your",
-                "create a task", "add task", "remind", "schedule", "cron",
-                "search skill", "generate", "make me", "build",
-                "/", "run ", "execute", "shell", "code",
-            ])
-        )
-        if is_simple:
-            use_openai = True
-            logger.info("Smart routing: simple message → fast OpenAI path")
-
-    if use_openai:
-        # OpenAI path: keep prompt small for speed (no system prompt override)
-        from .telegram import get_chat_history
-        chat_history = get_chat_history(chat_id=message.chat.id)
-        chat_lines = chat_history.strip().split('\n')
-        recent_chat = '\n'.join(chat_lines[-20:]) if len(chat_lines) > 20 else chat_history
-        openai_prompt = f"""RECENT CONTEXT (for continuity):
-{recent_chat}
-
-USER: {message.text}"""
-        logger.info(f"Using OpenAI fast chat model={openai_model}, prompt={len(openai_prompt)} chars")
-    else:
-        # Agent path: build a Tau-aware system prompt with full context
-        tau_system_prompt = build_tau_system_prompt(
-            chat_id=message.chat.id,
-            user_message=message.text,
-        )
-        logger.info(f"Using agent model={agent_model}, system_prompt={len(tau_system_prompt)} chars")
+    tau_system_prompt = build_tau_system_prompt(
+        chat_id=message.chat.id,
+        user_message=message.text,
+    )
+    logger.info(f"Using agent model={agent_model}, system_prompt={len(tau_system_prompt)} chars")
     
     # Start typing indicator in background
     typing_stop = threading.Event()
@@ -2252,28 +2131,16 @@ USER: {message.text}"""
     logger.info("Generating response...")
     
     try:
-        if use_openai:
-            response = run_openai_chat_streaming(
-                openai_prompt,
-                chat_id=message.chat.id,
-                reply_to_message_id=message.message_id,
-                initial_text="🤔 Thinking...",
-                model=openai_model,
-                timeout_seconds=45,
-                max_tokens=400,
-            )
-        else:
-            # Pass user's raw message as instruction; system prompt has all context
-            response = run_agent_ask_streaming(
-                message.text,
-                chat_id=message.chat.id,
-                reply_to_message_id=message.message_id,
-                initial_text="🤔 Thinking...",
-                model=agent_model,
-                timeout_seconds=300,
-                system_prompt_override=tau_system_prompt,
-                readonly=False,
-            )
+        response = run_agent_ask_streaming(
+            message.text,
+            chat_id=message.chat.id,
+            reply_to_message_id=message.message_id,
+            initial_text="🤔 Thinking...",
+            model=agent_model,
+            timeout_seconds=300,
+            system_prompt_override=tau_system_prompt,
+            readonly=False,
+        )
         elapsed = (datetime.now() - start_time).total_seconds()
         logger.info(f"Response completed in {elapsed:.1f}s (streamed)")
         append_chat_history("assistant", response, chat_id=message.chat.id)
