@@ -1368,14 +1368,10 @@ def run_plan_generation(
     Returns:
         Tuple of (plan_content, plan_filename)
     """
-    gif_msg_id = send_thinking_gif(chat_id, reply_to_message_id=reply_to_message_id)
-
     stream = TelegramStreamingMessage(
         chat_id,
         reply_to_message_id=reply_to_message_id,
         initial_text="...",
-        min_edit_interval_seconds=0.9,
-        min_chars_delta=10,
     )
 
     # Generate a filename-safe slug from the task description
@@ -1404,25 +1400,8 @@ Output ONLY the plan content, no preamble or meta-commentary."""
     from .llm import run_baseagent_streaming, parse_event
 
     start_time = time.time()
-    thinking_updates: list[str] = []
     thinking_text_buffer: str = ""
     final_result_text: str | None = None
-    last_thinking_snippet: str = ""
-
-    def build_display():
-        lines = []
-        
-        if thinking_text_buffer.strip():
-            cleaned = thinking_text_buffer.strip().replace("\n", " ")
-            display_thinking = last_thinking_snippet if last_thinking_snippet else cleaned
-            if len(display_thinking) > 150:
-                display_thinking = "..." + display_thinking[-147:]
-            lines.append(f"💭 {display_thinking}\n")
-        
-        if thinking_updates:
-            lines.extend(thinking_updates[-6:])
-        
-        return "\n".join(lines) if lines else "..."
 
     q: queue.Queue = queue.Queue()
 
@@ -1439,7 +1418,6 @@ Output ONLY the plan content, no preamble or meta-commentary."""
         return err, ""
 
     timed_out = False
-    last_display_update = start_time
 
     try:
         while True:
@@ -1448,24 +1426,12 @@ Output ONLY the plan content, no preamble or meta-commentary."""
                 break
 
             try:
-                event = q.get(timeout=0.25)
+                event = q.get(timeout=0.5)
             except queue.Empty:
-                event = None
-                now = time.time()
-                if now - last_display_update >= 1.5:
-                    stream.set_text(build_display())
-                    last_display_update = now
                 continue
 
             if event is None:
                 break
-
-            # Refresh display periodically even during rapid unrecognised
-            # events (e.g. stream.text.delta) so the timer never freezes.
-            now = time.time()
-            if now - last_display_update >= 1.5:
-                stream.set_text(build_display())
-                last_display_update = now
 
             parsed = parse_event(event)
             if parsed is None:
@@ -1480,31 +1446,6 @@ Output ONLY the plan content, no preamble or meta-commentary."""
                         thinking_text_buffer = text
                     elif len(text) > len(thinking_text_buffer):
                         thinking_text_buffer = text
-
-                    cleaned = thinking_text_buffer.strip().replace("\n", " ")
-                    last_sentence_end = -1
-                    for i in range(len(cleaned) - 1, -1, -1):
-                        if cleaned[i] in '.!?' and (i == len(cleaned) - 1 or cleaned[i + 1] in ' \n\t'):
-                            last_sentence_end = i
-                            break
-
-                    if last_sentence_end > 0:
-                        complete_text = cleaned[:last_sentence_end + 1]
-                        if len(complete_text) > 100:
-                            snippet_start = len(complete_text) - 100
-                            for i in range(snippet_start, len(complete_text)):
-                                if complete_text[i] in '.!?' and i + 1 < len(complete_text):
-                                    snippet_start = i + 2
-                                    break
-                            snippet = complete_text[snippet_start:].strip()
-                        else:
-                            snippet = complete_text
-
-                        if snippet and snippet != last_thinking_snippet:
-                            last_thinking_snippet = snippet
-                            stream.set_text(build_display())
-                            last_display_update = time.time()
-
                     if len(thinking_text_buffer) > 50:
                         final_result_text = thinking_text_buffer
 
@@ -1514,7 +1455,6 @@ Output ONLY the plan content, no preamble or meta-commentary."""
                     final_result_text = f"Error: {err_text}"
 
     finally:
-        delete_thinking_gif(chat_id, gif_msg_id)
         stream.finalize()
 
     if timed_out:
