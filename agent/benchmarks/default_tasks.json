@@ -1,0 +1,16 @@
+{
+  "tasks": [
+    {
+      "name": "Locate loop architecture",
+      "prompt": "Analyze the repository and explain how the main agent loop works, including which files own tool execution and context management."
+    },
+    {
+      "name": "Search and summarize prompt rules",
+      "prompt": "Find where system prompt instructions are defined and summarize the most important behavioral constraints."
+    },
+    {
+      "name": "Safe refactor suggestion",
+      "prompt": "Inspect the tool registry and propose a minimal refactor to reduce duplicated execution logic without changing behavior."
+    }
+  ]
+}

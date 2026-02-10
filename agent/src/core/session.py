@@ -6,6 +6,7 @@ and the ``Session`` class that tracks conversation state.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import uuid
 from dataclasses import dataclass, field
@@ -153,6 +154,8 @@ class Session:
     # Status
     is_done: bool = False
     final_message: Optional[str] = None
+    approval_cache: dict[str, bool] = field(default_factory=dict)
+    checkpoint_dir_name: str = ".agent/sessions"
 
     def add_system_message(self, content: str) -> None:
         """Add a system message."""
@@ -220,7 +223,76 @@ class Session:
         """Update last activity timestamp."""
         self.last_activity = datetime.now()
 
+    def is_approved(self, key: str) -> bool:
+        """Check whether an operation is approved for this session."""
+        return self.approval_cache.get(key, False)
+
+    def approve_for_session(self, key: str) -> None:
+        """Cache an approval for the current session."""
+        self.approval_cache[key] = True
+
     @property
     def elapsed_time(self) -> float:
         """Get elapsed time in seconds."""
         return (datetime.now() - self.started_at).total_seconds()
+
+    def checkpoint_path(self) -> Path:
+        """Return the checkpoint path for this session."""
+        base = self.cwd / self.checkpoint_dir_name
+        base.mkdir(parents=True, exist_ok=True)
+        return base / f"{self.id}.json"
+
+    def save_rollout(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        iteration: int,
+        pending_completion: bool,
+        tool_call_count: int,
+        usage: dict[str, int],
+    ) -> Path:
+        """Persist session state for crash-safe resume."""
+        payload = {
+            "session_id": self.id,
+            "saved_at": datetime.now().isoformat(),
+            "cwd": str(self.cwd),
+            "iteration": iteration,
+            "pending_completion": pending_completion,
+            "tool_call_count": tool_call_count,
+            "usage": usage,
+            "approval_cache": self.approval_cache,
+            "messages": messages,
+        }
+        path = self.checkpoint_path()
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
+
+    @classmethod
+    def load_rollout(
+        cls,
+        cwd: Path,
+        session_id: str | None = None,
+        resume_latest: bool = False,
+    ) -> dict[str, Any] | None:
+        """Load rollout state from disk."""
+        base = cwd / ".agent/sessions"
+        if not base.exists():
+            return None
+
+        target: Path | None = None
+        if session_id:
+            candidate = base / f"{session_id}.json"
+            if candidate.exists():
+                target = candidate
+        elif resume_latest:
+            candidates = sorted(base.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if candidates:
+                target = candidates[0]
+
+        if target is None:
+            return None
+
+        try:
+            return json.loads(target.read_text(encoding="utf-8"))
+        except Exception:
+            return None

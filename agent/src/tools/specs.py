@@ -25,6 +25,14 @@ Use `rg` (ripgrep) for searching text or files as it's much faster than grep."""
                 "type": "number",
                 "description": "The timeout for the command in milliseconds",
             },
+            "persist_approval": {
+                "type": "boolean",
+                "description": "When true, persist approval as an exec-policy allow prefix for similar commands.",
+            },
+            "abort_on_denied": {
+                "type": "boolean",
+                "description": "When true, abort the current turn if policy denies this command.",
+            },
         },
         "required": ["command"],
     },
@@ -373,3 +381,105 @@ def get_tool_spec(name: str) -> dict[str, Any] | None:
         Tool specification dict or None if not found
     """
     return _get_tool_specs().get(name)
+
+
+MUTATING_TOOLS: set[str] = {
+    "write_file",
+    "apply_patch",
+    "str_replace",
+    "shell_command",
+}
+
+READ_ONLY_TOOLS: set[str] = {
+    "read_file",
+    "list_dir",
+    "grep_files",
+    "glob_files",
+    "view_image",
+    "web_search",
+    "lint",
+    "update_plan",
+    "spawn_subagent",
+}
+
+
+def tool_is_mutating(name: str) -> bool:
+    """Return True if the tool can mutate workspace/system state."""
+    return name in MUTATING_TOOLS
+
+
+PARALLEL_SAFE_TOOLS: set[str] = {
+    "read_file",
+    "list_dir",
+    "grep_files",
+    "glob_files",
+    "view_image",
+    "web_search",
+    "lint",
+    "update_plan",
+    "spawn_subagent",
+}
+
+
+def tool_supports_parallel(name: str) -> bool:
+    """Return True when a tool can safely run in parallel."""
+    return name in PARALLEL_SAFE_TOOLS
+
+
+def _matches_type(value: Any, schema_type: str) -> bool:
+    if schema_type == "string":
+        return isinstance(value, str)
+    if schema_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if schema_type == "boolean":
+        return isinstance(value, bool)
+    if schema_type == "array":
+        return isinstance(value, list)
+    if schema_type == "object":
+        return isinstance(value, dict)
+    return True
+
+
+def _validate_schema(value: Any, schema: dict[str, Any], path: str, errors: list[str]) -> None:
+    schema_type = schema.get("type")
+    if schema_type and not _matches_type(value, schema_type):
+        errors.append(f"{path} must be of type {schema_type}")
+        return
+
+    enum_values = schema.get("enum")
+    if enum_values is not None and value not in enum_values:
+        errors.append(f"{path} must be one of {enum_values}")
+        return
+
+    if schema_type == "object":
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+        if not isinstance(value, dict):
+            return
+        for key in required:
+            if key not in value:
+                errors.append(f"{path}.{key} is required")
+        for key, key_value in value.items():
+            key_schema = properties.get(key)
+            if key_schema is None:
+                continue
+            _validate_schema(key_value, key_schema, f"{path}.{key}", errors)
+    elif schema_type == "array":
+        if not isinstance(value, list):
+            return
+        item_schema = schema.get("items")
+        if not item_schema:
+            return
+        for idx, item in enumerate(value):
+            _validate_schema(item, item_schema, f"{path}[{idx}]", errors)
+
+
+def validate_tool_arguments(name: str, arguments: dict[str, Any]) -> list[str]:
+    """Validate arguments against tool schema; returns a list of errors."""
+    spec = get_tool_spec(name)
+    if not spec:
+        return [f"Unknown tool: {name}"]
+    params = spec.get("parameters", {})
+    errors: list[str] = []
+    _validate_schema(arguments, params, name, errors)
+    return errors

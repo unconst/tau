@@ -64,6 +64,16 @@ def exec_command(
     # Execution options
     workdir: Optional[Path] = typer.Option(None, "--workdir", "-w", help="Working directory"),
     max_iterations: Optional[int] = typer.Option(None, help="Maximum iterations"),
+    resume: Optional[str] = typer.Option(
+        None,
+        "--resume",
+        help="Resume from a specific saved session ID",
+    ),
+    resume_latest: bool = typer.Option(
+        False,
+        "--resume-latest",
+        help="Resume from the most recent saved session",
+    ),
     # Danger mode (bypass approvals and sandbox)
     dangerously_bypass_approvals: bool = typer.Option(
         False,
@@ -114,7 +124,11 @@ def exec_command(
             console.print(f"Working directory: [cyan]{cwd}[/cyan]")
             console.print()
 
-        final_message = agent.run(prompt)
+        final_message = agent.run(
+            prompt,
+            resume_session_id=resume,
+            resume_latest=resume_latest,
+        )
 
         # In human mode, print the final message clearly
         if not json_mode and final_message:

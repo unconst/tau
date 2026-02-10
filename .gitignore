@@ -49,3 +49,5 @@ tasks/*/*.py
 
 # Context tasks (runtime-generated)
 context/tasks/
+
+codex/

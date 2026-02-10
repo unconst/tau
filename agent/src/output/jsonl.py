@@ -12,6 +12,10 @@ Event Types:
 - item.started: Item (tool call, message) started
 - item.updated: Item updated (e.g., todo list)
 - item.completed: Item completed
+- stream.text.delta: Streaming assistant text chunk
+- stream.tool.started: Tool lifecycle start marker
+- stream.tool.completed: Tool lifecycle completion marker
+- stream.retry: LLM stream retry/backoff notification
 - error: Fatal error
 """
 
@@ -117,6 +121,106 @@ class ItemCompletedEvent:
 
     item: Dict[str, Any]
     type: str = field(default="item.completed", init=False)
+
+
+@dataclass
+class StreamTextDeltaEvent:
+    """Emitted for incremental assistant text streaming."""
+
+    delta: str
+    type: str = field(default="stream.text.delta", init=False)
+
+
+@dataclass
+class StreamToolStartedEvent:
+    """Emitted when the runtime starts a tool call."""
+
+    tool_name: str
+    call_id: str
+    type: str = field(default="stream.tool.started", init=False)
+
+
+@dataclass
+class StreamToolCompletedEvent:
+    """Emitted when the runtime finishes a tool call."""
+
+    tool_name: str
+    call_id: str
+    success: bool
+    retried_without_guards: bool = False
+    type: str = field(default="stream.tool.completed", init=False)
+
+
+@dataclass
+class StreamRetryEvent:
+    """Emitted when the runtime retries a failed stream request."""
+
+    attempt: int
+    max_attempts: int
+    wait_seconds: int
+    error_code: str
+    type: str = field(default="stream.retry", init=False)
+
+
+@dataclass
+class StreamErrorEvent:
+    """Emitted for recoverable stream/runtime errors."""
+
+    stage: str
+    error_code: str
+    message: str
+    consecutive_failures: int
+    type: str = field(default="stream.error", init=False)
+
+
+@dataclass
+class ToolDecisionEvent:
+    """Emitted after policy decision for a tool call."""
+
+    tool_name: str
+    call_id: str
+    decision: str
+    reason: Optional[str]
+    source: str
+    approval_outcome: str
+    type: str = field(default="tool.decision", init=False)
+
+
+@dataclass
+class ToolEscalationEvent:
+    """Emitted when a tool call escalates retries."""
+
+    tool_name: str
+    call_id: str
+    attempt: int
+    retried_without_guards: bool
+    type: str = field(default="tool.escalation", init=False)
+
+
+@dataclass
+class PolicyEvaluationEvent:
+    """Emitted with exec-policy or heuristic evaluation details."""
+
+    tool_name: str
+    call_id: str
+    evaluation: Optional[Dict[str, Any]]
+    fallback: bool
+    type: str = field(default="policy.evaluation", init=False)
+
+
+@dataclass
+class TurnMetricsEvent:
+    """Emitted with machine-readable turn metrics."""
+
+    session_id: str
+    iterations: int
+    llm_retries: int
+    compactions: int
+    parallel_batches: int
+    approval_denials: int
+    guard_escalations: int
+    completion_reason: str
+    type: str = field(default="turn.metrics", init=False)
 
 
 # =============================================================================

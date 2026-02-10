@@ -586,6 +586,14 @@ Before making tool calls, send a brief preamble to the user explaining what you'
 
 You are a coding agent. Please keep going until the query is completely resolved, before ending your turn and yielding back to the user. Only terminate your turn when you are sure that the problem is solved. Autonomously resolve the query to the best of your ability, using the tools available to you, before coming back to the user. Do NOT guess or make up an answer.
 
+## Planning discipline
+
+For non-trivial tasks, use the `update_plan` tool and keep it current as you work.
+- Keep exactly one step marked `in_progress` while any steps are still `pending`
+- Move steps through states in order; do not leave stale plan status behind actual work
+- Keep step descriptions short and actionable
+- Mark all steps `completed` (or explicitly defer) before finishing
+
 You MUST adhere to the following criteria when solving queries:
 
 - Working on the repo(s) in the current environment is allowed, even if they are proprietary.
@@ -774,6 +782,7 @@ When using the shell, you must adhere to the following guidelines:
 def get_system_prompt(
     cwd: Optional[Path] = None,
     shell: Optional[str] = None,
+    environment_context: Optional[Dict[str, object]] = None,
 ) -> str:
     """Get the full system prompt with environment context.
 
@@ -783,6 +792,7 @@ def get_system_prompt(
     Args:
         cwd: Current working directory.
         shell: Shell being used.
+        environment_context: Optional execution policy/sandbox context.
 
     Returns:
         Complete system prompt string.
@@ -797,6 +807,17 @@ def get_system_prompt(
         f"- Platform: {platform.system()}",
         f"- Shell: {shell_str}",
     ]
+    if environment_context:
+        env_lines.extend(
+            [
+                f"- approval_policy: {environment_context.get('approval_policy', 'unknown')}",
+                f"- sandbox_mode: {environment_context.get('sandbox_mode', 'unknown')}",
+                f"- network_access: {environment_context.get('network_access', 'unknown')}",
+                f"- readonly: {environment_context.get('readonly', False)}",
+                f"- readable_roots: {environment_context.get('readable_roots', [])}",
+                f"- writable_roots: {environment_context.get('writable_roots', [])}",
+            ]
+        )
 
     return f"{SYSTEM_PROMPT}\n\n# Environment\n" + "\n".join(env_lines)
 

@@ -135,6 +135,12 @@ def _log(msg: str):
 def main():
     parser = argparse.ArgumentParser(description="SuperAgent for Term Challenge SDK 3.0")
     parser.add_argument("--instruction", required=True, help="Task instruction from validator")
+    parser.add_argument("--resume", help="Resume from a specific saved session ID")
+    parser.add_argument(
+        "--resume-latest",
+        action="store_true",
+        help="Resume from the latest saved session",
+    )
     args = parser.parse_args()
 
     _log("=" * 60)
@@ -164,7 +170,11 @@ def main():
             llm=llm,
             tools=tools,
             ctx=ctx,
-            config=CONFIG,
+            config={
+                **CONFIG,
+                "resume_session_id": args.resume,
+                "resume_latest": args.resume_latest,
+            },
         )
     except CostLimitExceeded as e:
         _log(f"Cost limit exceeded: {e}")

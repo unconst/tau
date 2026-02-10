@@ -18,6 +18,7 @@ import sys
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
+from src.core.history_manager import HistoryManager
 from src.utils.tokens import estimate_tokens
 
 if TYPE_CHECKING:
@@ -419,32 +420,36 @@ def run_compaction(
     compaction_messages = messages.copy()
     compaction_messages.append({"role": "user", "content": COMPACTION_PROMPT})
 
-    try:
-        response = llm.chat(
-            compaction_messages,
-            model=model,
-            max_tokens=4096,
-        )
+    max_attempts = 2
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = llm.chat(
+                compaction_messages,
+                model=model,
+                max_tokens=4096,
+            )
 
-        summary = response.text or ""
+            summary = response.text or ""
 
-        if not summary:
-            _log("Compaction failed: empty response")
-            return messages
+            if not summary:
+                _log("Compaction failed: empty response")
+                continue
 
-        summary_tokens = estimate_tokens(summary)
-        _log(f"Compaction complete: {summary_tokens} token summary")
+            summary_tokens = estimate_tokens(summary)
+            _log(f"Compaction complete: {summary_tokens} token summary")
 
-        compacted = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": SUMMARY_PREFIX + summary},
-        ]
+            compacted = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": SUMMARY_PREFIX + summary},
+            ]
+            return compacted
 
-        return compacted
+        except Exception as e:
+            _log(f"Compaction failed (attempt {attempt}/{max_attempts}): {e}")
+            time.sleep(min(2.0, attempt * 0.5))
 
-    except Exception as e:
-        _log(f"Compaction failed: {e}")
-        return messages
+    _log("Compaction fallback: keeping deterministically trimmed history")
+    return messages
 
 
 # =============================================================================
@@ -506,9 +511,33 @@ def manage_context(
             _token_budget.reset(pruned)
         return pruned
 
-    # Step 2: Run AI compaction
-    _log(f"Pruning insufficient ({pruned_tokens} tokens), running AI compaction...")
-    compacted = run_compaction(llm, pruned, system_prompt)
+    # Step 2: Pair-aware deterministic trimming before AI compaction
+    preserve_system = bool(pruned and pruned[0].get("role") == "system")
+    system_message = pruned[0] if preserve_system else None
+    trimmed = pruned
+    trim_attempts = 0
+    while is_overflow(estimate_total_tokens(trimmed)) and len(trimmed) > 2 and trim_attempts < 12:
+        trimmed = HistoryManager.remove_first_item(
+            trimmed,
+            preserve_system_prompt=preserve_system,
+        )
+        trim_attempts += 1
+    if preserve_system and system_message and (
+        not trimmed or trimmed[0].get("role") != "system"
+    ):
+        trimmed = [system_message] + trimmed
+    if trim_attempts:
+        _log(f"Pair-aware trimming removed {trim_attempts} oldest items")
+
+    # Step 3: Run AI compaction if needed
+    if not is_overflow(estimate_total_tokens(trimmed)) and not force_compaction:
+        _log("Pair-aware trimming was sufficient")
+        if _token_budget is not None:
+            _token_budget.reset(trimmed)
+        return trimmed
+
+    _log("Pruning + trimming insufficient, running AI compaction...")
+    compacted = run_compaction(llm, trimmed, system_prompt)
     compacted_tokens = estimate_total_tokens(compacted)
 
     _log(f"Compaction result: {total_tokens} -> {compacted_tokens} tokens")

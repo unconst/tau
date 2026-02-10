@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from src.tools.base import ToolResult
-from src.tools.specs import get_all_tools
+from src.tools.guards import GuardConfig, GuardError, PathGuards
+from src.tools.specs import get_all_tools, tool_is_mutating
 
 if TYPE_CHECKING:
     pass  # AgentContext is duck-typed (has shell(), cwd, etc.)
@@ -114,6 +116,7 @@ class ToolRegistry:
         self._config = config or ExecutorConfig()
         self._cache: Dict[str, CachedResult] = {}
         self._stats = ExecutorStats()
+        self._guards = PathGuards(GuardConfig.from_paths(self.cwd))
         # Custom tools registered at runtime (name -> (spec_dict, handler_callable))
         self._custom_tools: Dict[str, tuple[Dict[str, Any], Callable[..., ToolResult]]] = {}
 
@@ -142,6 +145,7 @@ class ToolRegistry:
         ctx: "AgentContext",
         name: str,
         arguments: dict[str, Any],
+        enforce_guards: bool = True,
     ) -> ToolResult:
         """Execute a tool by name.
 
@@ -167,39 +171,43 @@ class ToolRegistry:
         cwd = Path(ctx.cwd) if hasattr(ctx, "cwd") else self.cwd
 
         try:
-            # Check custom tools first
-            if name in self._custom_tools:
-                _, handler = self._custom_tools[name]
-                result = handler(arguments)
-            elif name == "shell_command":
-                result = self._execute_shell(ctx, cwd, arguments)
-            elif name == "read_file":
-                result = self._execute_read_file(cwd, arguments)
-            elif name == "write_file":
-                result = self._execute_write_file(cwd, arguments)
-            elif name == "list_dir":
-                result = self._execute_list_dir(cwd, arguments)
-            elif name == "grep_files":
-                result = self._execute_grep(ctx, cwd, arguments)
-            elif name == "apply_patch":
-                result = self._execute_apply_patch(cwd, arguments)
-            elif name == "view_image":
-                result = self._execute_view_image(cwd, arguments)
-            elif name == "update_plan":
-                result = self._execute_update_plan(arguments)
-            elif name == "web_search":
-                result = self._execute_web_search(arguments)
-            elif name == "spawn_subagent":
-                result = self._execute_subagent(ctx, cwd, arguments)
-            elif name == "str_replace":
-                result = self._execute_str_replace(cwd, arguments)
-            elif name == "glob_files":
-                result = self._execute_glob_files(cwd, arguments)
-            elif name == "lint":
-                result = self._execute_lint(cwd, arguments)
-            else:
-                result = ToolResult.fail(f"Unknown tool: {name}")
+            max_attempts = 1 if tool_is_mutating(name) else 3
+            timeout_seconds = self._config.default_timeout
+            if name == "shell_command":
+                timeout_seconds = max(
+                    timeout_seconds,
+                    float(max(1, int(arguments.get("timeout_ms", 60000)) // 1000)),
+                )
 
+            result = None
+            last_error_text = ""
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    result = self._execute_once(ctx, cwd, name, arguments, enforce_guards)
+                    if result.success or attempt >= max_attempts:
+                        break
+                    last_error_text = (result.error or result.output or "").lower()
+                    if not self._is_transient_failure(last_error_text):
+                        break
+                except FuturesTimeoutError:
+                    last_error_text = "execution timed out"
+                    if attempt >= max_attempts:
+                        result = ToolResult.fail(
+                            f"Tool {name} timed out after {timeout_seconds:.1f}s"
+                        )
+                        break
+                except Exception as e:
+                    last_error_text = str(e).lower()
+                    if attempt >= max_attempts or not self._is_transient_failure(last_error_text):
+                        result = ToolResult.fail(f"Tool {name} failed: {e}")
+                        break
+                time.sleep(min(2.0, 0.25 * attempt))
+
+            if result is None:
+                result = ToolResult.fail(f"Tool {name} failed after retries")
+
+        except GuardError as e:
+            result = ToolResult.fail(str(e))
         except Exception as e:
             result = ToolResult.fail(f"Tool {name} failed: {e}")
 
@@ -214,11 +222,112 @@ class ToolRegistry:
 
         return result
 
+    def _execute_once(
+        self,
+        ctx: "AgentContext",
+        cwd: Path,
+        name: str,
+        arguments: dict[str, Any],
+        enforce_guards: bool,
+    ) -> ToolResult:
+        """Execute one tool call with timeout handling."""
+        if name in self._custom_tools:
+            _, handler = self._custom_tools[name]
+            return self._run_with_timeout(lambda: handler(arguments), self._config.default_timeout)
+        if name == "shell_command":
+            return self._execute_shell(ctx, cwd, arguments, enforce_guards)
+        if name == "read_file":
+            return self._run_with_timeout(
+                lambda: self._execute_read_file(cwd, arguments, enforce_guards),
+                self._config.default_timeout,
+            )
+        if name == "write_file":
+            return self._run_with_timeout(
+                lambda: self._execute_write_file(cwd, arguments, enforce_guards),
+                self._config.default_timeout,
+            )
+        if name == "list_dir":
+            return self._run_with_timeout(
+                lambda: self._execute_list_dir(cwd, arguments, enforce_guards),
+                self._config.default_timeout,
+            )
+        if name == "grep_files":
+            return self._run_with_timeout(
+                lambda: self._execute_grep(ctx, cwd, arguments, enforce_guards),
+                self._config.default_timeout,
+            )
+        if name == "apply_patch":
+            return self._run_with_timeout(
+                lambda: self._execute_apply_patch(cwd, arguments, enforce_guards),
+                self._config.default_timeout,
+            )
+        if name == "view_image":
+            return self._run_with_timeout(
+                lambda: self._execute_view_image(cwd, arguments, enforce_guards),
+                self._config.default_timeout,
+            )
+        if name == "update_plan":
+            return self._run_with_timeout(
+                lambda: self._execute_update_plan(arguments),
+                self._config.default_timeout,
+            )
+        if name == "web_search":
+            return self._run_with_timeout(
+                lambda: self._execute_web_search(arguments),
+                self._config.default_timeout,
+            )
+        if name == "spawn_subagent":
+            return self._run_with_timeout(
+                lambda: self._execute_subagent(ctx, cwd, arguments),
+                self._config.default_timeout,
+            )
+        if name == "str_replace":
+            return self._run_with_timeout(
+                lambda: self._execute_str_replace(cwd, arguments, enforce_guards),
+                self._config.default_timeout,
+            )
+        if name == "glob_files":
+            return self._run_with_timeout(
+                lambda: self._execute_glob_files(cwd, arguments, enforce_guards),
+                self._config.default_timeout,
+            )
+        if name == "lint":
+            return self._run_with_timeout(
+                lambda: self._execute_lint(cwd, arguments, enforce_guards),
+                self._config.default_timeout,
+            )
+        return ToolResult.fail(f"Unknown tool: {name}")
+
+    @staticmethod
+    def _is_transient_failure(text: str) -> bool:
+        return any(
+            marker in text
+            for marker in (
+                "timeout",
+                "timed out",
+                "temporarily unavailable",
+                "connection reset",
+                "connection aborted",
+                "rate limit",
+                "429",
+                "503",
+                "502",
+                "500",
+            )
+        )
+
+    @staticmethod
+    def _run_with_timeout(fn: Callable[[], ToolResult], timeout_seconds: float) -> ToolResult:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(fn)
+            return future.result(timeout=timeout_seconds)
+
     def _execute_shell(
         self,
         ctx: "AgentContext",
         cwd: Path,
         args: dict[str, Any],
+        enforce_guards: bool,
     ) -> ToolResult:
         """Execute shell command using subprocess directly."""
         command = args.get("command", "")
@@ -233,6 +342,26 @@ class ToolRegistry:
         if workdir:
             wd = Path(workdir)
             effective_cwd = wd if wd.is_absolute() else cwd / wd
+        if enforce_guards:
+            self._guards.require_read(effective_cwd)
+            lower = command.lower()
+            mutating_hint = any(
+                token in lower
+                for token in (
+                    "rm ",
+                    "mv ",
+                    "cp ",
+                    "git commit",
+                    "git push",
+                    "apply_patch",
+                    ">>",
+                    ">",
+                    "touch ",
+                    "mkdir ",
+                )
+            )
+            if mutating_hint:
+                self._guards.require_mutation_allowed("shell_command")
 
         timeout_sec = max(1, timeout_ms // 1000)
 
@@ -265,7 +394,12 @@ class ToolRegistry:
         except Exception as e:
             return ToolResult.fail(str(e))
 
-    def _execute_read_file(self, cwd: Path, args: dict[str, Any]) -> ToolResult:
+    def _execute_read_file(
+        self,
+        cwd: Path,
+        args: dict[str, Any],
+        enforce_guards: bool,
+    ) -> ToolResult:
         """Read file contents."""
         file_path = args.get("file_path", "")
         offset = args.get("offset", 1)
@@ -277,6 +411,8 @@ class ToolRegistry:
         path = Path(file_path)
         if not path.is_absolute():
             path = cwd / path
+        if enforce_guards:
+            path = self._guards.require_read(path)
 
         if not path.exists():
             return ToolResult.fail(f"File not found: {path}")
@@ -308,7 +444,12 @@ class ToolRegistry:
         except Exception as e:
             return ToolResult.fail(f"Failed to read file: {e}")
 
-    def _execute_write_file(self, cwd: Path, args: dict[str, Any]) -> ToolResult:
+    def _execute_write_file(
+        self,
+        cwd: Path,
+        args: dict[str, Any],
+        enforce_guards: bool,
+    ) -> ToolResult:
         """Write content to a file."""
         file_path = args.get("file_path", "")
         content = args.get("content", "")
@@ -319,6 +460,9 @@ class ToolRegistry:
         path = Path(file_path)
         if not path.is_absolute():
             path = cwd / path
+        if enforce_guards:
+            self._guards.require_mutation_allowed("write_file")
+            path = self._guards.require_write(path)
 
         try:
             # Ensure parent directory exists
@@ -332,7 +476,12 @@ class ToolRegistry:
         except Exception as e:
             return ToolResult.fail(f"Failed to write file: {e}")
 
-    def _execute_list_dir(self, cwd: Path, args: dict[str, Any]) -> ToolResult:
+    def _execute_list_dir(
+        self,
+        cwd: Path,
+        args: dict[str, Any],
+        enforce_guards: bool,
+    ) -> ToolResult:
         """List directory contents."""
         dir_path = args.get("dir_path", ".")
         depth = args.get("depth", 2)
@@ -341,6 +490,8 @@ class ToolRegistry:
         path = Path(dir_path)
         if not path.is_absolute():
             path = cwd / path
+        if enforce_guards:
+            path = self._guards.require_read(path)
 
         if not path.exists():
             return ToolResult.fail(f"Directory not found: {path}")
@@ -404,6 +555,7 @@ class ToolRegistry:
         ctx: "AgentContext",
         cwd: Path,
         args: dict[str, Any],
+        enforce_guards: bool,
     ) -> ToolResult:
         """Search files using ripgrep."""
         pattern = args.get("pattern", "")
@@ -424,6 +576,11 @@ class ToolRegistry:
         cmd_parts.append(search_path)
 
         cmd = " ".join(f'"{p}"' if " " in p else p for p in cmd_parts)
+        if enforce_guards:
+            target = Path(search_path)
+            if not target.is_absolute():
+                target = cwd / target
+            self._guards.require_read(target)
 
         try:
             result = subprocess.run(
@@ -450,24 +607,60 @@ class ToolRegistry:
         except Exception as e:
             return ToolResult.fail(f"Search failed: {e}")
 
-    def _execute_apply_patch(self, cwd: Path, args: dict[str, Any]) -> ToolResult:
+    def _execute_apply_patch(
+        self,
+        cwd: Path,
+        args: dict[str, Any],
+        enforce_guards: bool,
+    ) -> ToolResult:
         """Apply a patch to files."""
         patch = args.get("patch", "")
 
         if not patch:
             return ToolResult.fail("No patch provided")
 
+        if enforce_guards:
+            self._guards.require_mutation_allowed("apply_patch")
+            for patch_path in self._extract_apply_patch_targets(patch):
+                self._guards.require_write(self._resolve_path(cwd, patch_path))
         from src.tools.apply_patch import ApplyPatchTool
 
         tool = ApplyPatchTool(cwd)
         return tool.execute(patch=patch)
 
-    def _execute_view_image(self, cwd: Path, args: dict[str, Any]) -> ToolResult:
+    def _extract_apply_patch_targets(self, patch: str) -> list[str]:
+        """Parse apply_patch envelope and extract target file paths."""
+        targets: list[str] = []
+        pattern = re.compile(r"^\*\*\* (?:Add|Update|Delete) File:\s+(.+?)\s*$")
+        for line in patch.splitlines():
+            match = pattern.match(line)
+            if match:
+                targets.append(match.group(1).strip())
+        return targets
+
+    @staticmethod
+    def _resolve_path(cwd: Path, file_path: str) -> Path:
+        path = Path(file_path)
+        if not path.is_absolute():
+            path = cwd / path
+        return path
+
+    def _execute_view_image(
+        self,
+        cwd: Path,
+        args: dict[str, Any],
+        enforce_guards: bool,
+    ) -> ToolResult:
         """View an image file."""
         path = args.get("path", "")
 
         if not path:
             return ToolResult.fail("No path provided")
+        if enforce_guards:
+            p = Path(path)
+            if not p.is_absolute():
+                p = cwd / p
+            self._guards.require_read(p)
 
         from src.tools.view_image import view_image
 
@@ -477,12 +670,43 @@ class ToolRegistry:
         """Update the task plan."""
         steps = args.get("steps", [])
         explanation = args.get("explanation")
+        if not isinstance(steps, list) or not steps:
+            return ToolResult.fail("update_plan requires a non-empty steps array")
 
-        self._plan = steps
+        normalized_steps: list[dict[str, str]] = []
+        allowed_statuses = {"pending", "in_progress", "completed"}
+        in_progress_count = 0
+        pending_count = 0
+        for idx, step in enumerate(steps, 1):
+            if not isinstance(step, dict):
+                return ToolResult.fail(f"Step {idx} must be an object")
+            description = (step.get("description") or "").strip()
+            status = (step.get("status") or "").strip()
+            if not description:
+                return ToolResult.fail(f"Step {idx} is missing a description")
+            if status not in allowed_statuses:
+                return ToolResult.fail(
+                    f"Step {idx} has invalid status `{status}` (expected pending, in_progress, or completed)"
+                )
+            if status == "in_progress":
+                in_progress_count += 1
+            if status == "pending":
+                pending_count += 1
+            normalized_steps.append({"description": description, "status": status})
+
+        # Keep plan progression predictable for long-horizon tasks.
+        if in_progress_count > 1:
+            return ToolResult.fail("Plan can only contain one in_progress step")
+        if pending_count > 0 and in_progress_count != 1:
+            return ToolResult.fail(
+                "Plan must have exactly one in_progress step while pending steps remain"
+            )
+
+        self._plan = normalized_steps
 
         # Format plan for output
         lines = ["Plan updated:"]
-        for i, step in enumerate(steps, 1):
+        for i, step in enumerate(normalized_steps, 1):
             status_icon = {
                 "pending": "[ ]",
                 "in_progress": "[>]",
@@ -494,6 +718,18 @@ class ToolRegistry:
             lines.append(f"\nReason: {explanation}")
 
         return ToolResult.ok("\n".join(lines))
+
+    def format_plan_for_context(self) -> str:
+        """Format current plan as compact context for the model."""
+        if not self._plan:
+            return ""
+        lines = ["Current execution plan:"]
+        for i, step in enumerate(self._plan, 1):
+            status = step.get("status", "pending")
+            icon = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(status, "[ ]")
+            lines.append(f"{icon} {i}. {step.get('description', '')}")
+        lines.append("Keep this plan updated with update_plan as work progresses.")
+        return "\n".join(lines)
 
     def _execute_web_search(self, args: dict[str, Any]) -> ToolResult:
         """Execute a web search."""
@@ -533,7 +769,12 @@ class ToolRegistry:
     # str_replace execution
     # -------------------------------------------------------------------------
 
-    def _execute_str_replace(self, cwd: Path, args: dict[str, Any]) -> ToolResult:
+    def _execute_str_replace(
+        self,
+        cwd: Path,
+        args: dict[str, Any],
+        enforce_guards: bool,
+    ) -> ToolResult:
         """Targeted find-and-replace in a file."""
         file_path = args.get("file_path", "")
         old_string = args.get("old_string", "")
@@ -548,6 +789,9 @@ class ToolRegistry:
         path = Path(file_path)
         if not path.is_absolute():
             path = cwd / path
+        if enforce_guards:
+            self._guards.require_mutation_allowed("str_replace")
+            path = self._guards.require_write(path)
 
         if not path.exists():
             return ToolResult.fail(f"File not found: {path}")
@@ -589,7 +833,12 @@ class ToolRegistry:
     # glob_files execution
     # -------------------------------------------------------------------------
 
-    def _execute_glob_files(self, cwd: Path, args: dict[str, Any]) -> ToolResult:
+    def _execute_glob_files(
+        self,
+        cwd: Path,
+        args: dict[str, Any],
+        enforce_guards: bool,
+    ) -> ToolResult:
         """Find files matching a glob pattern."""
         pattern = args.get("pattern", "")
         path = args.get("path", ".")
@@ -601,6 +850,8 @@ class ToolRegistry:
         search_path = Path(path)
         if not search_path.is_absolute():
             search_path = cwd / search_path
+        if enforce_guards:
+            search_path = self._guards.require_read(search_path)
 
         if not search_path.exists():
             return ToolResult.fail(f"Path not found: {search_path}")
@@ -636,13 +887,24 @@ class ToolRegistry:
     # lint execution
     # -------------------------------------------------------------------------
 
-    def _execute_lint(self, cwd: Path, args: dict[str, Any]) -> ToolResult:
+    def _execute_lint(
+        self,
+        cwd: Path,
+        args: dict[str, Any],
+        enforce_guards: bool,
+    ) -> ToolResult:
         """Run linter on specified files and return diagnostics."""
         files = args.get("files", [])
         linter = args.get("linter")  # auto-detect if not specified
 
         if not files:
             return ToolResult.fail("No files provided. Pass a list of file paths to lint.")
+        if enforce_guards:
+            for file_path in files:
+                p = Path(file_path)
+                if not p.is_absolute():
+                    p = cwd / p
+                self._guards.require_read(p)
 
         # Auto-detect linter if not specified
         if not linter:
@@ -820,6 +1082,25 @@ class ToolRegistry:
     def get_plan(self) -> list[dict[str, str]]:
         """Get the current plan."""
         return self._plan.copy()
+
+    def configure_guards(
+        self,
+        *,
+        readable_roots: list[str] | None = None,
+        writable_roots: list[str] | None = None,
+        readonly: bool = False,
+        enabled: bool = True,
+    ) -> None:
+        """Configure path/mutation guard behavior for this registry."""
+        self._guards = PathGuards(
+            GuardConfig.from_paths(
+                cwd=self.cwd,
+                readable_roots=readable_roots,
+                writable_roots=writable_roots,
+                readonly=readonly,
+                enabled=enabled,
+            )
+        )
 
     def get_tools_for_llm(self) -> list:
         """Get tool specifications formatted for the LLM.

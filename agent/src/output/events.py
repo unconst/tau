@@ -24,6 +24,13 @@ class EventType(str, Enum):
 
     TOOL_CALL_START = "tool.call.start"
     TOOL_CALL_END = "tool.call.end"
+    STREAM_TEXT_DELTA = "stream.text.delta"
+    STREAM_RETRY = "stream.retry"
+    STREAM_TOOL_STARTED = "stream.tool.started"
+    STREAM_TOOL_COMPLETED = "stream.tool.completed"
+    TOOL_DECISION = "tool.decision"
+    TOOL_ESCALATION = "tool.escalation"
+    POLICY_EVALUATION = "policy.evaluation"
 
     ERROR = "error"
 
@@ -121,4 +128,81 @@ class Event:
         return cls(
             type=EventType.ERROR,
             data={"message": message, "details": details or {}},
+        )
+
+    @classmethod
+    def stream_text_delta(cls, delta: str) -> "Event":
+        """Create a streaming text-delta event."""
+        return cls(type=EventType.STREAM_TEXT_DELTA, data={"delta": delta})
+
+    @classmethod
+    def stream_retry(
+        cls,
+        attempt: int,
+        max_attempts: int,
+        wait_seconds: int,
+        error_code: str,
+    ) -> "Event":
+        """Create a stream retry event."""
+        return cls(
+            type=EventType.STREAM_RETRY,
+            data={
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "wait_seconds": wait_seconds,
+                "error_code": error_code,
+            },
+        )
+
+    @classmethod
+    def tool_decision(
+        cls,
+        tool_name: str,
+        decision: str,
+        reason: Optional[str],
+        source: str,
+    ) -> "Event":
+        """Create a tool decision event."""
+        return cls(
+            type=EventType.TOOL_DECISION,
+            data={
+                "tool_name": tool_name,
+                "decision": decision,
+                "reason": reason,
+                "source": source,
+            },
+        )
+
+    @classmethod
+    def tool_escalation(
+        cls,
+        tool_name: str,
+        attempt: int,
+        retried_without_guards: bool,
+    ) -> "Event":
+        """Create a tool escalation event."""
+        return cls(
+            type=EventType.TOOL_ESCALATION,
+            data={
+                "tool_name": tool_name,
+                "attempt": attempt,
+                "retried_without_guards": retried_without_guards,
+            },
+        )
+
+    @classmethod
+    def policy_evaluation(
+        cls,
+        tool_name: str,
+        evaluation: Optional[dict[str, Any]],
+        fallback: bool,
+    ) -> "Event":
+        """Create a policy evaluation event."""
+        return cls(
+            type=EventType.POLICY_EVALUATION,
+            data={
+                "tool_name": tool_name,
+                "evaluation": evaluation,
+                "fallback": fallback,
+            },
         )

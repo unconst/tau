@@ -47,6 +47,8 @@ class Agent:
         system_prompt: Optional[str] = None,
         model: Optional[str] = None,
         readonly: bool = False,
+        resume_session_id: Optional[str] = None,
+        resume_latest: bool = False,
     ) -> str:
         """Run the agent with a user prompt.
 
@@ -78,6 +80,14 @@ class Agent:
             "reasoning_effort": self.config.reasoning.effort.value,
             "cache_enabled": self.config.cache.enabled,
             "streaming": True,
+            "approval_policy": "on-failure",
+            "bypass_approvals": False,
+            "bypass_sandbox": False,
+            "readonly": readonly,
+            "readable_roots": self.config.paths.readable_roots,
+            "writable_roots": self.config.paths.writable_roots,
+            "resume_session_id": resume_session_id,
+            "resume_latest": resume_latest,
         }
 
         captured_messages: list[str] = []

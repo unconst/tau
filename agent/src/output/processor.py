@@ -110,6 +110,37 @@ class OutputProcessor:
         elif event.type == EventType.ERROR:
             message = event.data.get("message", "Unknown error")
             self.console.print(f"[red]Error: {message}[/red]")
+        elif event.type == EventType.STREAM_TEXT_DELTA:
+            delta = event.data.get("delta", "")
+            if delta:
+                self.console.print(delta, end="")
+        elif event.type == EventType.STREAM_RETRY:
+            attempt = event.data.get("attempt", 0)
+            max_attempts = event.data.get("max_attempts", 0)
+            wait_seconds = event.data.get("wait_seconds", 0)
+            self.console.print(
+                f"[yellow]Retrying stream ({attempt}/{max_attempts}) in {wait_seconds}s[/yellow]"
+            )
+        elif event.type == EventType.TOOL_DECISION:
+            self.console.print(
+                "[dim]policy "
+                f"{event.data.get('tool_name', 'unknown')}: "
+                f"{event.data.get('decision', 'skip')} "
+                f"({event.data.get('source', 'heuristic')})[/dim]"
+            )
+        elif event.type == EventType.TOOL_ESCALATION:
+            retried = event.data.get("retried_without_guards", False)
+            attempt = event.data.get("attempt", 1)
+            if retried:
+                self.console.print(
+                    f"[yellow]Escalated tool retry without guards (attempt {attempt})[/yellow]"
+                )
+        elif event.type == EventType.POLICY_EVALUATION:
+            fallback = event.data.get("fallback", True)
+            if fallback:
+                self.console.print("[dim]Policy evaluation: heuristic fallback[/dim]")
+            else:
+                self.console.print("[dim]Policy evaluation: rule-matched[/dim]")
 
     # Convenience methods
 
