@@ -16,7 +16,7 @@ from .telegram import (
     bot, save_chat_id, notify, WORKSPACE, append_chat_history,
     TelegramStreamingMessage, authorize, is_owner, is_private_chat,
     is_group_chat, save_chat_metadata, list_chats, get_chat_history_for,
-    send_to_chat,
+    send_to_chat, send_plan_approval, send_question_with_options,
 )
 from .agent import run_loop, TASKS_DIR, get_all_tasks, git_commit_changes, set_debug_mode, read_file, run_memory_maintenance
 from .tools.commands import run_command
@@ -325,6 +325,14 @@ def execute_intent(intent: dict, chat_id: int, message_id: int) -> str:
 
 # Track pending confirmations: chat_id -> intent dict
 _pending_confirmations: dict[int, dict] = {}
+
+# Track pending plan approvals: chat_id -> threading.Event (set=approved, clear=rejected)
+_pending_plan_approvals: dict[int, dict] = {}
+_plan_approval_lock = threading.Lock()
+
+# Track pending ask_user responses: request_id -> {"event": threading.Event, "answer": str}
+_pending_user_inputs: dict[str, dict] = {}
+_user_input_lock = threading.Lock()
 
 # Debug mode flag - controls verbose notifications
 DEBUG_MODE = False
@@ -784,6 +792,54 @@ Please execute this scheduled task. Provide a fresh update based on the current 
         time.sleep(1)
 
 
+@bot.callback_query_handler(func=lambda call: call.data in ("plan_approve", "plan_reject"))
+def handle_plan_callback(call):
+    """Handle plan approval/rejection from inline keyboard."""
+    chat_id = call.message.chat.id
+    approved = call.data == "plan_approve"
+
+    with _plan_approval_lock:
+        pending = _pending_plan_approvals.get(chat_id)
+        if pending:
+            pending["approved"] = approved
+            pending["event"].set()
+
+    label = "✅ Plan approved" if approved else "❌ Plan rejected"
+    try:
+        bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
+        bot.answer_callback_query(call.id, label)
+        bot.send_message(chat_id, label)
+    except Exception:
+        pass
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("ask_user_"))
+def handle_ask_user_callback(call):
+    """Handle ask_user option selection from inline keyboard."""
+    chat_id = call.message.chat.id
+    option_idx = call.data.replace("ask_user_", "")
+
+    with _user_input_lock:
+        # Find the pending input for this chat
+        for req_id, pending in list(_pending_user_inputs.items()):
+            if pending.get("chat_id") == chat_id:
+                options = pending.get("options", [])
+                try:
+                    idx = int(option_idx)
+                    answer = options[idx] if idx < len(options) else option_idx
+                except (ValueError, IndexError):
+                    answer = option_idx
+                pending["answer"] = answer
+                pending["event"].set()
+                break
+
+    try:
+        bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
+        bot.answer_callback_query(call.id, f"Selected: {answer[:30]}")
+    except Exception:
+        pass
+
+
 @bot.message_handler(commands=['cron'])
 def add_cron(message):
     """Add a cron job that runs a prompt at specified intervals."""
@@ -985,6 +1041,100 @@ def stop_via_supervisor():
         except Exception:
             pass
     return False
+
+
+@bot.message_handler(commands=['compress'])
+def compress_context(message):
+    """Manually trigger conversation summary compression.
+
+    Regenerates the chat summary from the full conversation history,
+    which can free context window space for longer conversations.
+    """
+    save_chat_metadata(message)
+    if not authorize(message):
+        return
+    save_chat_id(message.chat.id)
+    append_chat_history("user", "/compress", chat_id=message.chat.id)
+
+    processing_msg = bot.reply_to(message, "🗜️ Compressing conversation context...")
+
+    try:
+        from .telegram import CHAT_HISTORY_FILE, get_chat_history
+
+        # Force a full summary regeneration
+        full_chat = ""
+        if os.path.exists(CHAT_HISTORY_FILE):
+            with open(CHAT_HISTORY_FILE) as f:
+                full_chat = f.read()
+
+        if not full_chat.strip() or len(full_chat) < 200:
+            response = "Not enough conversation history to compress."
+            try:
+                bot.edit_message_text(response, message.chat.id, processing_msg.message_id)
+            except Exception:
+                bot.reply_to(message, response)
+            append_chat_history("assistant", response, chat_id=message.chat.id)
+            return
+
+        # Generate fresh compressed summary
+        summary_prompt = f"""You are Tau's memory system. Compress this conversation into a concise summary.
+
+FULL CHAT HISTORY ({len(full_chat)} chars):
+{full_chat[-8000:]}
+
+Create a summary that captures:
+1. Key topics and decisions
+2. User preferences
+3. Ongoing tasks/projects
+4. Important context for future interactions
+
+Rules:
+- Under 1500 characters
+- Bullet points for scanning
+- Focus on actionable info
+- Current state, not play-by-play
+
+Output ONLY the summary."""
+
+        from .llm import llm_chat
+        summary = llm_chat(summary_prompt, timeout=120.0)
+
+        if summary and len(summary) > 50:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+            summary_content = f"""# Chat Summary
+
+<!-- Compressed via /compress command -->
+
+## Summary
+
+{summary}
+
+---
+*Compressed: {timestamp}*
+"""
+            save_summary_with_version(summary_content)
+
+            # Also reset the chat position tracker so incremental updates start fresh
+            new_chat, new_position = get_new_chat_since_last_summary()
+            save_chat_position(new_position)
+
+            response = f"✅ Context compressed ({len(full_chat)} chars → {len(summary)} char summary)"
+        else:
+            response = "Compression produced no useful output. Try again later."
+
+        try:
+            bot.edit_message_text(response, message.chat.id, processing_msg.message_id)
+        except Exception:
+            bot.reply_to(message, response)
+        append_chat_history("assistant", response, chat_id=message.chat.id)
+
+    except Exception as e:
+        error_msg = f"Compression error: {str(e)}"
+        try:
+            bot.edit_message_text(error_msg, message.chat.id, processing_msg.message_id)
+        except Exception:
+            bot.reply_to(message, error_msg)
+        append_chat_history("assistant", error_msg, chat_id=message.chat.id)
 
 
 @bot.message_handler(commands=['clear'])
@@ -1929,6 +2079,7 @@ def run_agent_ask_streaming(
     timeout_seconds: int = 600,
     system_prompt_override: str | None = None,
     readonly: bool = True,
+    plan_first: bool = False,
 ) -> str:
     """Run the agent and stream JSONL output by editing one Telegram message.
     
@@ -1962,10 +2113,33 @@ def run_agent_ask_streaming(
     thinking_text_buffer: str = ""
     current_tool: str | None = None
     last_thinking_snippet: str = ""
+    # Progress dashboard state
+    current_plan_steps: list[dict] = []
+    tool_call_count = 0
+    iteration_count = 0
+    cost_estimate = 0.0
     
+    def _format_elapsed(seconds: float) -> str:
+        if seconds < 60:
+            return f"{seconds:.0f}s"
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{minutes}m{secs:02d}s"
+
     def build_display():
         elapsed = time.time() - start_time
         lines = [spinner.frame_at(elapsed) + "\n"]
+
+        # Show plan progress if we have a plan
+        if current_plan_steps:
+            completed = sum(1 for s in current_plan_steps if s.get("status") == "completed")
+            total = len(current_plan_steps)
+            in_progress = [s for s in current_plan_steps if s.get("status") == "in_progress"]
+            progress_bar = f"📊 {completed}/{total}"
+            if in_progress:
+                current_step = in_progress[0].get("description", "")
+                progress_bar += f" — {current_step}"
+            lines.append(progress_bar + "\n")
         
         display_thinking = ""
         if thinking_text_buffer.strip():
@@ -1986,6 +2160,14 @@ def run_agent_ask_streaming(
         if thinking_updates:
             lines.append("")
             lines.extend(thinking_updates[-6:])
+
+        # Footer: elapsed time and tool count
+        footer_parts = [f"⏱ {_format_elapsed(elapsed)}"]
+        if tool_call_count > 0:
+            footer_parts.append(f"🔧 {tool_call_count} tools")
+        if cost_estimate > 0:
+            footer_parts.append(f"💰 ${cost_estimate:.4f}")
+        lines.append("\n" + " · ".join(footer_parts))
         
         return "\n".join(lines)
 
@@ -1993,6 +2175,26 @@ def run_agent_ask_streaming(
 
     # Enable chat_mode when a Tau system prompt is provided (conversational use)
     is_chat_mode = system_prompt_override is not None
+
+    # Plan approval callback for plan_first mode
+    plan_approval_cb = None
+    if plan_first:
+        def plan_approval_cb(plan_text: str) -> bool:
+            """Block until user approves/rejects the plan via Telegram inline keyboard."""
+            approval_event = threading.Event()
+            approval_state = {"approved": False, "event": approval_event}
+            with _plan_approval_lock:
+                _pending_plan_approvals[chat_id] = approval_state
+
+            send_plan_approval(chat_id, plan_text, reply_to_message_id=reply_to_message_id)
+
+            # Wait up to 5 minutes for user response
+            approval_event.wait(timeout=300)
+
+            with _plan_approval_lock:
+                _pending_plan_approvals.pop(chat_id, None)
+
+            return approval_state.get("approved", False)
 
     try:
         agent_thread = run_baseagent_streaming(
@@ -2003,6 +2205,8 @@ def run_agent_ask_streaming(
             timeout_seconds=timeout_seconds,
             system_prompt_override=system_prompt_override,
             chat_mode=is_chat_mode,
+            plan_first=plan_first,
+            plan_approval_callback=plan_approval_cb,
         )
     except Exception as e:
         err = f"Error: {str(e)}"
@@ -2030,6 +2234,18 @@ def run_agent_ask_streaming(
 
             if event is None:
                 break
+
+            # Handle raw events for progress dashboard
+            etype = event.get("type", "")
+            if etype == "plan.updated":
+                current_plan_steps = event.get("steps", [])
+            if etype in ("stream.tool.started", "stream.tool.completed"):
+                if etype == "stream.tool.completed":
+                    tool_call_count += 1
+            if etype == "turn.metrics":
+                cost_data = event.get("budget", {})
+                cost_estimate = cost_data.get("consumed_cost", 0.0)
+                iteration_count = event.get("iterations", 0)
 
             parsed = parse_event(event)
             if parsed is None:
@@ -2085,6 +2301,40 @@ def run_agent_ask_streaming(
                         if snippet and snippet != last_thinking_snippet:
                             last_thinking_snippet = snippet
 
+                    stream.set_text(build_display())
+                    last_display_update = time.time()
+
+            elif kind == "plan_proposed":
+                # Plan is being shown via inline keyboard separately
+                plan_text = parsed.get("text", "")
+                if plan_text:
+                    thinking_updates.append("📋 Plan proposed — waiting for approval...")
+                    stream.set_text(build_display())
+                    last_display_update = time.time()
+
+            elif kind == "plan_approved":
+                thinking_updates.append("✅ Plan approved — executing...")
+                stream.set_text(build_display())
+                last_display_update = time.time()
+
+            elif kind == "plan_rejected":
+                thinking_updates.append("❌ Plan rejected")
+                stream.set_text(build_display())
+                last_display_update = time.time()
+
+            elif kind == "user_input_requested":
+                # Agent is asking the user a question — render it via Telegram
+                question = parsed.get("text", "")
+                options_json = parsed.get("tool_detail")
+                options = json.loads(options_json) if options_json else None
+                req_id = parsed.get("request_id", "")
+
+                if question:
+                    send_question_with_options(
+                        chat_id, question, options=options,
+                        reply_to_message_id=reply_to_message_id,
+                    )
+                    thinking_updates.append(f"❓ Asked: {question[:40]}...")
                     stream.set_text(build_display())
                     last_display_update = time.time()
 
@@ -2246,6 +2496,16 @@ def handle_message(message):
     # Owner is speaking — save their private chat id for notifications
     if is_private_chat(message):
         save_chat_id(message.chat.id)
+
+    # Check if this is a reply to a pending ask_user question (text reply)
+    with _user_input_lock:
+        for req_id, pending in list(_pending_user_inputs.items()):
+            if pending.get("chat_id") == message.chat.id and not pending["event"].is_set():
+                pending["answer"] = message.text
+                pending["event"].set()
+                _pending_user_inputs.pop(req_id, None)
+                # Don't process this as a normal message
+                return
 
     # Model selection — always use the agent path via Chutes
     from .llm import CHAT_MODEL, build_tau_system_prompt

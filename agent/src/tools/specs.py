@@ -317,6 +317,31 @@ Use after editing files to check for errors you may have introduced.""",
     },
 }
 
+# Ask user tool — pauses the agent loop and requests user input
+ASK_USER_SPEC: dict[str, Any] = {
+    "name": "ask_user",
+    "description": """Ask the user a clarifying question before proceeding.
+Use this when the task is ambiguous and you need user input to make the right decision.
+The agent loop will pause until the user responds via Telegram.
+Only use this for genuinely ambiguous situations — do not ask unnecessary questions.""",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": "The question to ask the user",
+            },
+            "options": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional list of predefined choices for the user (renders as buttons)",
+            },
+        },
+        "required": ["question"],
+    },
+}
+
+
 # ---------------------------------------------------------------------------
 # Lazy TOOL_SPECS — built on first access to avoid circular imports
 # (subagent.py and web_search.py would pull in core/llm modules at import
@@ -329,7 +354,7 @@ _TOOL_SPECS: dict[str, dict[str, Any]] | None = None
 
 def _build_tool_specs() -> dict[str, dict[str, Any]]:
     """Build the full tool specs dict, importing external specs lazily."""
-    from src.tools.subagent import SUBAGENT_SPEC
+    from src.tools.subagent import SUBAGENT_SPEC, COMPARISON_SPEC
     from src.tools.web_search import WEB_SEARCH_SPEC
 
     return {
@@ -343,9 +368,11 @@ def _build_tool_specs() -> dict[str, dict[str, Any]]:
         "update_plan": UPDATE_PLAN_SPEC,
         "web_search": WEB_SEARCH_SPEC,
         "spawn_subagent": SUBAGENT_SPEC,
+        "spawn_comparison": COMPARISON_SPEC,
         "str_replace": STR_REPLACE_SPEC,
         "glob_files": GLOB_FILES_SPEC,
         "lint": LINT_SPEC,
+        "ask_user": ASK_USER_SPEC,
     }
 
 
@@ -400,12 +427,19 @@ READ_ONLY_TOOLS: set[str] = {
     "lint",
     "update_plan",
     "spawn_subagent",
+    "spawn_comparison",
+    "ask_user",
 }
 
 
-def tool_is_mutating(name: str) -> bool:
+def tool_is_mutating(name: str, arguments: dict[str, Any] | None = None) -> bool:
     """Return True if the tool can mutate workspace/system state."""
-    return name in MUTATING_TOOLS
+    if name in MUTATING_TOOLS:
+        return True
+    if name == "spawn_subagent":
+        subagent_type = (arguments or {}).get("type", "explore")
+        return subagent_type == "execute"
+    return False
 
 
 PARALLEL_SAFE_TOOLS: set[str] = {

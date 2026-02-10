@@ -9,12 +9,88 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Generator, List, Optional, Set
 
 import httpx
+
+from src.core.budget import AgentBudget
+
+
+# ---------------------------------------------------------------------------
+# Rate-limit state — parsed from response headers
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RateLimitInfo:
+    """Snapshot of rate-limit state parsed from API response headers."""
+
+    remaining_requests: Optional[int] = None
+    remaining_tokens: Optional[int] = None
+    reset_requests_at: Optional[float] = None  # epoch seconds
+    reset_tokens_at: Optional[float] = None     # epoch seconds
+
+    def seconds_until_reset(self) -> Optional[float]:
+        """Seconds until the earliest limit resets, or None if unknown."""
+        now = time.time()
+        candidates = []
+        if self.reset_requests_at is not None:
+            candidates.append(max(0.0, self.reset_requests_at - now))
+        if self.reset_tokens_at is not None:
+            candidates.append(max(0.0, self.reset_tokens_at - now))
+        return min(candidates) if candidates else None
+
+
+def _parse_rate_limit_headers(headers: httpx.Headers) -> RateLimitInfo:
+    """Extract rate-limit info from response headers (OpenAI convention)."""
+    info = RateLimitInfo()
+
+    def _int_or_none(name: str) -> Optional[int]:
+        val = headers.get(name)
+        if val is not None:
+            try:
+                return int(val)
+            except (ValueError, TypeError):
+                pass
+        return None
+
+    def _parse_reset(name: str) -> Optional[float]:
+        """Parse reset header — could be epoch seconds, ISO timestamp, or relative duration."""
+        val = headers.get(name)
+        if val is None:
+            return None
+        try:
+            # Try as epoch float first
+            ts = float(val)
+            if ts > 1_000_000_000:  # looks like epoch
+                return ts
+            else:
+                # Relative seconds
+                return time.time() + ts
+        except (ValueError, TypeError):
+            pass
+        # Try parsing duration strings like "2s", "500ms"
+        val_lower = val.lower().strip()
+        if val_lower.endswith("ms"):
+            try:
+                return time.time() + float(val_lower[:-2]) / 1000.0
+            except ValueError:
+                pass
+        elif val_lower.endswith("s"):
+            try:
+                return time.time() + float(val_lower[:-1])
+            except ValueError:
+                pass
+        return None
+
+    info.remaining_requests = _int_or_none("x-ratelimit-remaining-requests")
+    info.remaining_tokens = _int_or_none("x-ratelimit-remaining-tokens")
+    info.reset_requests_at = _parse_reset("x-ratelimit-reset-requests")
+    info.reset_tokens_at = _parse_reset("x-ratelimit-reset-tokens")
+    return info
 
 
 # ---------------------------------------------------------------------------
@@ -88,10 +164,23 @@ class CostLimitExceeded(Exception):
 class LLMError(Exception):
     """LLM API error."""
 
-    def __init__(self, message: str, code: str = "unknown"):
+    def __init__(
+        self,
+        message: str,
+        code: str = "unknown",
+        rate_limit_info: Optional[RateLimitInfo] = None,
+    ):
         super().__init__(message)
         self.message = message
         self.code = code
+        self.rate_limit_info = rate_limit_info
+
+
+class ContextWindowExceeded(LLMError):
+    """Raised when the request exceeds the model's context window."""
+
+    def __init__(self, message: str):
+        super().__init__(message, code="context_window_exceeded")
 
 
 @dataclass
@@ -153,6 +242,12 @@ class StreamChunk:
     finish_reason: Optional[str] = None
 
 
+def _log_client(msg: str) -> None:
+    """Log to stderr from client module."""
+    timestamp = time.strftime("%H:%M:%S")
+    print(f"[{timestamp}] [llm] {msg}", file=sys.stderr, flush=True)
+
+
 class LLMClient:
     """LLM Client using httpx for Chutes API (OpenAI-compatible format).
 
@@ -173,12 +268,16 @@ class LLMClient:
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
         timeout: float = 120.0,
+        budget: Optional[AgentBudget] = None,
+        budget_reservation_key: Optional[str] = None,
     ):
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.cost_limit = cost_limit or float(os.environ.get("LLM_COST_LIMIT", "10.0"))
         self.base_url = base_url or os.environ.get("CHUTES_BASE_URL", self.DEFAULT_BASE_URL)
         self.timeout = timeout
+        self._budget = budget
+        self._budget_reservation_key = budget_reservation_key
 
         # Get API key — accept CHUTES_API_TOKEN (canonical) or CHUTES_API_KEY (legacy)
         self._api_key = api_key
@@ -201,6 +300,14 @@ class LLMClient:
         self._input_tokens = 0
         self._output_tokens = 0
         self._cached_tokens = 0
+        self._reasoning_tokens = 0
+
+        # Rate-limit tracking
+        self._last_rate_limit: Optional[RateLimitInfo] = None
+
+        # Stream retry configuration
+        self.stream_max_retries = int(os.environ.get("STREAM_MAX_RETRIES", "5"))
+        self.stream_idle_timeout = float(os.environ.get("STREAM_IDLE_TIMEOUT", "300.0"))
 
         # Create httpx client with timeout
         self._client = httpx.Client(
@@ -211,6 +318,47 @@ class LLMClient:
             },
             timeout=httpx.Timeout(timeout, connect=30.0),
         )
+
+    @staticmethod
+    def _is_context_window_error(status_code: int, error_msg: str) -> bool:
+        """Detect context-window-exceeded errors from status code or message."""
+        lowered = error_msg.lower()
+        keywords = (
+            "context_length_exceeded",
+            "context window",
+            "maximum context length",
+            "token limit",
+            "context length",
+            "too many tokens",
+            "input is too long",
+        )
+        if status_code == 400 and any(kw in lowered for kw in keywords):
+            return True
+        return False
+
+    def _raise_http_error(
+        self,
+        status_code: int,
+        error_msg: str,
+        headers: Optional[httpx.Headers] = None,
+    ) -> None:
+        """Map HTTP status to the appropriate LLMError subclass and raise."""
+        rl_info = _parse_rate_limit_headers(headers) if headers else None
+        if rl_info and rl_info.remaining_requests is not None:
+            self._last_rate_limit = rl_info
+
+        if self._is_context_window_error(status_code, error_msg):
+            raise ContextWindowExceeded(error_msg)
+        if status_code == 401:
+            raise LLMError(error_msg, code="authentication_error", rate_limit_info=rl_info)
+        elif status_code == 429:
+            raise LLMError(error_msg, code="rate_limit", rate_limit_info=rl_info)
+        elif status_code >= 500:
+            raise LLMError(error_msg, code="server_error", rate_limit_info=rl_info)
+        else:
+            raise LLMError(
+                f"HTTP {status_code}: {error_msg}", code="api_error", rate_limit_info=rl_info
+            )
 
     def _supports_temperature(self, model: str) -> bool:
         """Check if model supports temperature parameter."""
@@ -249,7 +397,9 @@ class LLMClient:
     ) -> LLMResponse:
         """Send a chat request to Chutes API."""
         # Check cost limit
-        if self._total_cost >= self.cost_limit:
+        if self._total_cost >= self.cost_limit or (
+            self._budget is not None and self._budget.is_exhausted()
+        ):
             raise CostLimitExceeded(
                 f"Cost limit exceeded: ${self._total_cost:.4f} >= ${self.cost_limit:.4f}",
                 used=self._total_cost,
@@ -283,6 +433,11 @@ class LLMClient:
             response = self._client.post("/chat/completions", json=payload)
             self._request_count += 1
 
+            # Parse rate-limit headers from every response
+            rl_info = _parse_rate_limit_headers(response.headers)
+            if rl_info.remaining_requests is not None:
+                self._last_rate_limit = rl_info
+
             # Handle HTTP errors
             if response.status_code != 200:
                 error_body = response.text
@@ -292,18 +447,12 @@ class LLMClient:
                 except (json.JSONDecodeError, KeyError):
                     error_msg = error_body
 
-                # Map status codes to error codes
-                if response.status_code == 401:
-                    raise LLMError(error_msg, code="authentication_error")
-                elif response.status_code == 429:
-                    raise LLMError(error_msg, code="rate_limit")
-                elif response.status_code >= 500:
-                    raise LLMError(error_msg, code="server_error")
-                else:
-                    raise LLMError(f"HTTP {response.status_code}: {error_msg}", code="api_error")
+                self._raise_http_error(response.status_code, error_msg, response.headers)
 
             data = response.json()
 
+        except (CostLimitExceeded, LLMError, ContextWindowExceeded):
+            raise
         except httpx.TimeoutException as e:
             raise LLMError(f"Request timed out: {e}", code="timeout")
         except httpx.ConnectError as e:
@@ -320,26 +469,47 @@ class LLMClient:
             input_tokens = usage.get("prompt_tokens", 0) or 0
             output_tokens = usage.get("completion_tokens", 0) or 0
             cached_tokens = 0
+            reasoning_tokens = 0
 
             # Check for cached tokens (OpenAI format)
             prompt_details = usage.get("prompt_tokens_details", {})
             if prompt_details:
                 cached_tokens = prompt_details.get("cached_tokens", 0) or 0
 
+            # Check for reasoning tokens (OpenAI format)
+            completion_details = usage.get("completion_tokens_details", {})
+            if completion_details:
+                reasoning_tokens = completion_details.get("reasoning_tokens", 0) or 0
+
             self._input_tokens += input_tokens
             self._output_tokens += output_tokens
             self._cached_tokens += cached_tokens
+            self._reasoning_tokens += reasoning_tokens
             self._total_tokens += input_tokens + output_tokens
 
             result.tokens = {
                 "input": input_tokens,
                 "output": output_tokens,
                 "cached": cached_tokens,
+                "reasoning": reasoning_tokens,
             }
 
             # Estimate cost (generic pricing, adjust per model if needed)
             # Using conservative estimates: $3/1M input, $15/1M output
             cost = (input_tokens * 3.0 / 1_000_000) + (output_tokens * 15.0 / 1_000_000)
+            if self._budget is not None and not self._budget.consume(
+                cost=cost,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cached_tokens=cached_tokens,
+                reasoning_tokens=reasoning_tokens,
+                reservation_key=self._budget_reservation_key,
+            ):
+                raise CostLimitExceeded(
+                    "Shared runtime budget exceeded",
+                    used=self._budget.snapshot().consumed_cost,
+                    limit=self._budget.max_cost,
+                )
             self._total_cost += cost
 
         # Extract model
@@ -392,9 +562,11 @@ class LLMClient:
     ) -> LLMResponse:
         """Stream a chat response via SSE, returning the assembled result.
 
-        This is the preferred method for interactive use.  Text deltas are
-        emitted via callbacks as they arrive and complete tool calls are
-        dispatched as soon as their argument JSON is fully received.
+        Includes **stream-level retry**: if the SSE connection drops mid-stream
+        (idle timeout, network reset, etc.) the entire request is retried up to
+        ``stream_max_retries`` times with exponential back-off.  This is
+        separate from the loop-level retry in ``loop.py`` which restarts the
+        whole turn.
 
         Args:
             messages: Conversation messages.
@@ -408,7 +580,9 @@ class LLMClient:
         Returns:
             The fully-assembled LLMResponse (same shape as ``chat``).
         """
-        if self._total_cost >= self.cost_limit:
+        if self._total_cost >= self.cost_limit or (
+            self._budget is not None and self._budget.is_exhausted()
+        ):
             raise CostLimitExceeded(
                 f"Cost limit exceeded: ${self._total_cost:.4f} >= ${self.cost_limit:.4f}",
                 used=self._total_cost,
@@ -437,91 +611,138 @@ class LLMClient:
         if extra_body:
             payload.update(extra_body)
 
-        # Accumulators for incremental parsing
-        text_parts: List[str] = []
-        # tool_call index -> {id, name, arguments_parts}
-        tc_accum: Dict[int, Dict[str, Any]] = {}
-        finish_reason = ""
-        usage: Dict[str, Any] = {}
+        # Stream-level retry loop
+        last_stream_error: Optional[Exception] = None
+        for stream_attempt in range(1, self.stream_max_retries + 1):
+            # Accumulators for incremental parsing (reset each attempt)
+            text_parts: List[str] = []
+            tc_accum: Dict[int, Dict[str, Any]] = {}
+            finish_reason = ""
+            usage: Dict[str, Any] = {}
+            stream_completed = False
 
-        try:
-            with self._client.stream("POST", "/chat/completions", json=payload) as resp:
-                self._request_count += 1
-                if resp.status_code != 200:
-                    # Read full body for error
-                    body_bytes = resp.read()
-                    error_body = body_bytes.decode("utf-8", errors="replace")
-                    try:
-                        error_json = json.loads(error_body)
-                        error_msg = error_json.get("error", {}).get("message", error_body)
-                    except (json.JSONDecodeError, KeyError):
-                        error_msg = error_body
-                    if resp.status_code == 401:
-                        raise LLMError(error_msg, code="authentication_error")
-                    elif resp.status_code == 429:
-                        raise LLMError(error_msg, code="rate_limit")
-                    elif resp.status_code >= 500:
-                        raise LLMError(error_msg, code="server_error")
-                    else:
-                        raise LLMError(f"HTTP {resp.status_code}: {error_msg}", code="api_error")
+            try:
+                # Use a per-stream timeout for idle detection
+                stream_timeout = httpx.Timeout(
+                    self.timeout,
+                    connect=30.0,
+                    read=self.stream_idle_timeout,
+                )
+                stream_client = httpx.Client(
+                    base_url=self.base_url,
+                    headers={
+                        "Authorization": f"Bearer {self._api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=stream_timeout,
+                )
 
-                for raw_line in resp.iter_lines():
-                    line = raw_line.strip()
-                    if not line or not line.startswith("data: "):
-                        continue
-                    data_str = line[6:]
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
+                try:
+                    with stream_client.stream("POST", "/chat/completions", json=payload) as resp:
+                        self._request_count += 1
 
-                    # Extract usage if present (some providers send it on the last chunk)
-                    if "usage" in chunk and chunk["usage"]:
-                        usage = chunk["usage"]
+                        # Parse rate-limit headers
+                        rl_info = _parse_rate_limit_headers(resp.headers)
+                        if rl_info.remaining_requests is not None:
+                            self._last_rate_limit = rl_info
 
-                    choices = chunk.get("choices", [])
-                    if not choices:
-                        continue
-                    delta = choices[0].get("delta", {})
-                    fr = choices[0].get("finish_reason")
-                    if fr:
-                        finish_reason = fr
+                        if resp.status_code != 200:
+                            body_bytes = resp.read()
+                            error_body = body_bytes.decode("utf-8", errors="replace")
+                            try:
+                                error_json = json.loads(error_body)
+                                error_msg = error_json.get("error", {}).get("message", error_body)
+                            except (json.JSONDecodeError, KeyError):
+                                error_msg = error_body
+                            self._raise_http_error(resp.status_code, error_msg, resp.headers)
 
-                    # --- Text delta ---
-                    content = delta.get("content")
-                    if content:
-                        text_parts.append(content)
-                        if on_text:
-                            on_text(content)
+                        for raw_line in resp.iter_lines():
+                            line = raw_line.strip()
+                            if not line or not line.startswith("data: "):
+                                continue
+                            data_str = line[6:]
+                            if data_str == "[DONE]":
+                                stream_completed = True
+                                break
+                            try:
+                                chunk = json.loads(data_str)
+                            except json.JSONDecodeError:
+                                continue
 
-                    # --- Tool call deltas ---
-                    tc_deltas = delta.get("tool_calls", [])
-                    for tcd in tc_deltas:
-                        idx = tcd.get("index", 0)
-                        if idx not in tc_accum:
-                            tc_accum[idx] = {
-                                "id": tcd.get("id", ""),
-                                "name": tcd.get("function", {}).get("name", ""),
-                                "arguments_parts": [],
-                            }
-                        acc = tc_accum[idx]
-                        # Update id/name if provided (first chunk)
-                        if tcd.get("id"):
-                            acc["id"] = tcd["id"]
-                        fn = tcd.get("function", {})
-                        if fn.get("name"):
-                            acc["name"] = fn["name"]
-                        if fn.get("arguments"):
-                            acc["arguments_parts"].append(fn["arguments"])
+                            if "usage" in chunk and chunk["usage"]:
+                                usage = chunk["usage"]
 
-        except httpx.TimeoutException as e:
-            raise LLMError(f"Request timed out: {e}", code="timeout")
-        except httpx.ConnectError as e:
-            raise LLMError(f"Connection error: {e}", code="connection_error")
-        except httpx.HTTPError as e:
-            raise LLMError(f"HTTP error: {e}", code="api_error")
+                            choices = chunk.get("choices", [])
+                            if not choices:
+                                continue
+                            delta = choices[0].get("delta", {})
+                            fr = choices[0].get("finish_reason")
+                            if fr:
+                                finish_reason = fr
+
+                            content = delta.get("content")
+                            if content:
+                                text_parts.append(content)
+                                if on_text:
+                                    on_text(content)
+
+                            tc_deltas = delta.get("tool_calls", [])
+                            for tcd in tc_deltas:
+                                idx = tcd.get("index", 0)
+                                if idx not in tc_accum:
+                                    tc_accum[idx] = {
+                                        "id": tcd.get("id", ""),
+                                        "name": tcd.get("function", {}).get("name", ""),
+                                        "arguments_parts": [],
+                                    }
+                                acc = tc_accum[idx]
+                                if tcd.get("id"):
+                                    acc["id"] = tcd["id"]
+                                fn = tcd.get("function", {})
+                                if fn.get("name"):
+                                    acc["name"] = fn["name"]
+                                if fn.get("arguments"):
+                                    acc["arguments_parts"].append(fn["arguments"])
+
+                        # If we read all lines without [DONE], treat as completed
+                        # (some providers close the stream without [DONE])
+                        stream_completed = True
+                finally:
+                    stream_client.close()
+
+            except (ContextWindowExceeded, CostLimitExceeded):
+                raise  # Never retry these
+
+            except (LLMError, httpx.TimeoutException, httpx.ConnectError, httpx.HTTPError) as e:
+                last_stream_error = e
+                # Don't retry auth or context window errors
+                if isinstance(e, LLMError) and e.code in ("authentication_error", "context_window_exceeded"):
+                    raise
+
+                if stream_attempt < self.stream_max_retries:
+                    # Compute backoff — respect server-suggested delay if available
+                    base_wait = min(20.0, 0.2 * (2 ** (stream_attempt - 1)))
+                    suggested_wait: Optional[float] = None
+                    if isinstance(e, LLMError) and e.rate_limit_info:
+                        suggested_wait = e.rate_limit_info.seconds_until_reset()
+                    wait_time = max(base_wait, suggested_wait or 0.0)
+                    _log_client(
+                        f"Stream error (attempt {stream_attempt}/{self.stream_max_retries}): "
+                        f"{type(e).__name__}: {e} — retrying in {wait_time:.1f}s"
+                    )
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    # Exhausted retries — raise as LLMError
+                    if isinstance(e, LLMError):
+                        raise
+                    raise LLMError(
+                        f"Stream failed after {self.stream_max_retries} attempts: {e}",
+                        code="stream_exhausted",
+                    )
+
+            if stream_completed:
+                break
 
         # --- Assemble final LLMResponse ---
         result = LLMResponse()
@@ -546,19 +767,47 @@ class LLMClient:
             input_tokens = usage.get("prompt_tokens", 0) or 0
             output_tokens = usage.get("completion_tokens", 0) or 0
             cached_tokens = 0
+            reasoning_tokens = 0
             prompt_details = usage.get("prompt_tokens_details", {})
             if prompt_details:
                 cached_tokens = prompt_details.get("cached_tokens", 0) or 0
+            completion_details = usage.get("completion_tokens_details", {})
+            if completion_details:
+                reasoning_tokens = completion_details.get("reasoning_tokens", 0) or 0
             self._input_tokens += input_tokens
             self._output_tokens += output_tokens
             self._cached_tokens += cached_tokens
+            self._reasoning_tokens += reasoning_tokens
             self._total_tokens += input_tokens + output_tokens
-            result.tokens = {"input": input_tokens, "output": output_tokens, "cached": cached_tokens}
+            result.tokens = {
+                "input": input_tokens,
+                "output": output_tokens,
+                "cached": cached_tokens,
+                "reasoning": reasoning_tokens,
+            }
             cost = (input_tokens * 3.0 / 1_000_000) + (output_tokens * 15.0 / 1_000_000)
+            if self._budget is not None and not self._budget.consume(
+                cost=cost,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cached_tokens=cached_tokens,
+                reasoning_tokens=reasoning_tokens,
+                reservation_key=self._budget_reservation_key,
+            ):
+                raise CostLimitExceeded(
+                    "Shared runtime budget exceeded",
+                    used=self._budget.snapshot().consumed_cost,
+                    limit=self._budget.max_cost,
+                )
             self._total_cost += cost
 
         result.model = model or self.model
         return result
+
+    @property
+    def last_rate_limit(self) -> Optional[RateLimitInfo]:
+        """Return the most recent rate-limit snapshot, if any."""
+        return self._last_rate_limit
 
     def _prepare_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Prepare messages for the API, cleaning up any incompatible fields."""
@@ -585,14 +834,37 @@ class LLMClient:
 
     def get_stats(self) -> Dict[str, Any]:
         """Get usage statistics."""
-        return {
+        stats = {
             "total_tokens": self._total_tokens,
             "input_tokens": self._input_tokens,
             "output_tokens": self._output_tokens,
             "cached_tokens": self._cached_tokens,
+            "reasoning_tokens": self._reasoning_tokens,
             "total_cost": self._total_cost,
             "request_count": self._request_count,
         }
+        if self._budget is not None:
+            snap = self._budget.snapshot()
+            stats["shared_budget"] = {
+                "max_cost": snap.max_cost,
+                "consumed_cost": snap.consumed_cost,
+                "reserved_cost": snap.reserved_cost,
+                "remaining_cost": snap.remaining_cost,
+            }
+        return stats
+
+    @property
+    def budget(self) -> Optional[AgentBudget]:
+        """Return the shared runtime budget, if configured."""
+        return self._budget
+
+    def attach_budget(self, budget: Optional[AgentBudget]) -> None:
+        """Attach/replace shared runtime budget."""
+        self._budget = budget
+
+    def set_budget_reservation_key(self, reservation_key: Optional[str]) -> None:
+        """Set reservation key used for budget consumption."""
+        self._budget_reservation_key = reservation_key
 
     def close(self):
         """Close the HTTP client."""

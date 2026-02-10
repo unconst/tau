@@ -21,20 +21,24 @@ import json
 import random
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List
 
+from src.core.budget import AgentBudget
 from src.core.compaction import (
     manage_context,
     _TokenBudget,
 )
 from src.core.session import Session
 from src.core.turn_runtime import TurnRuntime
-from src.llm.client import CostLimitExceeded, LLMError
+from src.llm.client import ContextWindowExceeded, CostLimitExceeded, LLMError
 from src.llm.router import ModelRouter
 from src.output.jsonl import (
     ItemCompletedEvent,
     ItemStartedEvent,
+    PlanProposedEvent,
+    PlanApprovedEvent,
     ThreadStartedEvent,
     TurnCompletedEvent,
     TurnFailedEvent,
@@ -235,12 +239,44 @@ def run_agent_loop(
     if restored and restored.get("session_id"):
         session_id = str(restored["session_id"])
     session.id = session_id
+    trace_id = str(config.get("trace_id") or f"trace_{uuid.uuid4().hex[:12]}")
+    parent_trace_id = config.get("parent_trace_id")
+    subagent_id = config.get("subagent_id")
+    depth = int(config.get("depth", 0) or 0)
+    max_subagent_depth = int(config.get("max_subagent_depth", 1) or 1)
+    trace_context = {
+        "trace_id": trace_id,
+        "parent_trace_id": parent_trace_id,
+        "subagent_id": subagent_id,
+        "depth": depth,
+    }
+    budget = config.get("budget")
+    if not isinstance(budget, AgentBudget):
+        budget = AgentBudget(max_cost=float(getattr(llm, "cost_limit", 10.0)))
+    if hasattr(llm, "attach_budget"):
+        llm.attach_budget(budget)
 
     # 1. Emit thread.started
-    emit(ThreadStartedEvent(thread_id=session_id))
+    emit(
+        ThreadStartedEvent(
+            thread_id=session_id,
+            trace_id=trace_id,
+            parent_trace_id=parent_trace_id,
+            subagent_id=subagent_id,
+            depth=depth,
+        )
+    )
+    emit_raw({"type": "turn.context", "session_id": session_id, **trace_context, "max_subagent_depth": max_subagent_depth})
 
     # 2. Emit turn.started
-    emit(TurnStartedEvent())
+    emit(
+        TurnStartedEvent(
+            trace_id=trace_id,
+            parent_trace_id=parent_trace_id,
+            subagent_id=subagent_id,
+            depth=depth,
+        )
+    )
 
     bypass_approvals = config.get("bypass_approvals", False)
     try:
@@ -251,6 +287,22 @@ def run_agent_loop(
     bypass_sandbox = bool(config.get("bypass_sandbox", False))
     readable_roots = config.get("readable_roots", [])
     writable_roots = config.get("writable_roots", [])
+    # Propagate runtime constraints/budget to tool handlers via context.
+    setattr(
+        ctx,
+        "runtime_constraints",
+        {
+            "readonly": readonly_mode,
+            "bypass_sandbox": bypass_sandbox,
+            "approval_policy": approval_policy.value,
+            "readable_roots": readable_roots,
+            "writable_roots": writable_roots,
+            "max_subagent_depth": max_subagent_depth,
+            "depth": depth,
+            "trace_id": trace_id,
+        },
+    )
+    setattr(ctx, "agent_budget", budget)
 
     # 3. Build initial messages
     if system_prompt is None:
@@ -308,6 +360,81 @@ def run_agent_loop(
     cache_enabled = config.get("cache_enabled", True)
     use_streaming = config.get("streaming", True)
     skip_verification = config.get("skip_verification", False)
+    plan_first = config.get("plan_first", False)
+
+    # ================================================================
+    # Plan-Then-Execute Phase
+    # ================================================================
+    if plan_first and not restored:
+        _log("Plan-first mode: generating plan before execution...")
+        plan_system_prompt = (
+            system_prompt
+            + "\n\n# PLANNING PHASE\n\n"
+            "You are in PLANNING mode. Before executing anything, create a structured plan.\n"
+            "Do NOT make any changes, do NOT run commands, do NOT write files.\n"
+            "Only use read-only tools (read_file, list_dir, grep_files, glob_files, web_search) "
+            "to understand the codebase.\n\n"
+            "Output a clear, numbered plan with:\n"
+            "1. Steps to accomplish the task\n"
+            "2. Files that need to be modified/created\n"
+            "3. Key decisions or trade-offs\n\n"
+            "Format the plan clearly so the user can review it."
+        )
+        plan_messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": plan_system_prompt},
+            {"role": "user", "content": ctx.instruction},
+        ]
+        try:
+            plan_cached = _apply_caching(plan_messages, enabled=cache_enabled)
+            plan_kwargs = dict(
+                messages=plan_cached,
+                tools=tools.get_tools_for_llm(),
+                max_tokens=config.get("max_tokens", 8192),
+                model=config.get("model"),
+            )
+            if use_streaming and hasattr(llm, "chat_stream"):
+                def _on_plan_text(delta: str) -> None:
+                    emit_raw({"type": "stream.text.delta", "delta": delta})
+                plan_response = llm.chat_stream(**plan_kwargs, on_text=_on_plan_text)
+            else:
+                plan_response = llm.chat(**plan_kwargs)
+
+            plan_text = getattr(plan_response, "text", "") or ""
+            if plan_text.strip():
+                _log(f"Plan generated ({len(plan_text)} chars), emitting for approval")
+                emit(PlanProposedEvent(plan=plan_text))
+
+                # Check if a plan approval callback is provided (Telegram integration)
+                plan_callback = config.get("plan_approval_callback")
+                if plan_callback and callable(plan_callback):
+                    approved = plan_callback(plan_text)
+                    if not approved:
+                        _log("Plan rejected by user, aborting")
+                        emit_raw({"type": "plan.rejected"})
+                        ctx.done()
+                        return
+                    _log("Plan approved by user, proceeding to execution")
+                    emit(PlanApprovedEvent(plan=plan_text))
+
+                # Inject the plan as context for the execution phase
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": f"Here is my plan for this task:\n\n{plan_text}",
+                    }
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Good plan. Now execute it step by step. "
+                            "Use update_plan to track your progress."
+                        ),
+                    }
+                )
+        except Exception as e:
+            _log(f"Plan generation failed: {e}, proceeding without plan")
+            emit_raw({"type": "plan.error", "message": str(e)})
 
     # Configure root/path guards for first sandboxed attempts.
     tools.configure_guards(
@@ -374,6 +501,8 @@ Proceed with verification now.
     parallel_batch_count = 0
     approval_denials = 0
     guard_escalations = 0
+    subagent_failures = 0
+    subagent_rate_limit_failures = 0
     completion_reason = "max_iterations_reached"
     while iteration < max_iterations:
         iteration += 1
@@ -383,12 +512,21 @@ Proceed with verification now.
             # ================================================================
             # Context Management (replaces sliding window)
             # ================================================================
-            # Check token usage and apply pruning/compaction if needed
+            # Use per-model metadata for context limits when available
+            _tier = router.select(
+                messages=messages,
+                iteration=iteration,
+                tool_count=tool_call_count,
+                is_verification=pending_completion,
+            )
             context_messages = manage_context(
                 messages=messages,
                 system_prompt=system_prompt,
                 llm=llm,
                 _token_budget=token_budget,
+                context_window=_tier.context_window,
+                output_reserve=_tier.output_reserve,
+                auto_compact_threshold=_tier.auto_compact_threshold,
             )
 
             request_messages = list(context_messages)
@@ -467,6 +605,43 @@ Proceed with verification now.
                 except CostLimitExceeded:
                     raise  # Don't retry cost limit errors
 
+                except ContextWindowExceeded as e:
+                    # Auto-recovery: shrink context and retry instead of
+                    # wasting a generic retry attempt.
+                    _log(f"Context window exceeded — shrinking history and retrying (attempt {attempt})")
+                    emit_raw({
+                        "type": "stream.context_recovery",
+                        "attempt": attempt,
+                        "message_count": len(messages),
+                    })
+
+                    # Force compaction and rebuild cached_messages
+                    from src.core.compaction import manage_context as _manage_ctx
+                    messages = _manage_ctx(
+                        messages=messages,
+                        system_prompt=system_prompt,
+                        llm=llm,
+                        force_compaction=True,
+                        _token_budget=token_budget,
+                        context_window=tier.context_window,
+                        output_reserve=tier.output_reserve,
+                        auto_compact_threshold=tier.auto_compact_threshold,
+                    )
+                    compaction_count += 1
+                    # Rebuild request messages with new compacted history
+                    request_messages = list(messages)
+                    if hasattr(tools, "format_plan_for_context"):
+                        plan_context = tools.format_plan_for_context()
+                        if plan_context:
+                            request_messages.append({"role": "system", "content": plan_context})
+                    cached_messages = _apply_caching(request_messages, enabled=cache_enabled)
+                    # Update call_kwargs for next attempt
+                    if attempt < max_retries:
+                        llm_retry_count += 1
+                        continue
+                    else:
+                        raise  # Exhausted retries
+
                 except LLMError as e:
                     last_error = e
                     error_msg = str(e.message) if hasattr(e, "message") else str(e)
@@ -480,7 +655,13 @@ Proceed with verification now.
                     is_retryable = _is_retryable_llm_error(e.code, error_msg)
 
                     if attempt < max_retries and is_retryable:
+                        # Use rate-limit header info for smarter backoff
                         wait_time = _compute_retry_delay(attempt)
+                        if e.rate_limit_info and e.code == "rate_limit":
+                            header_wait = e.rate_limit_info.seconds_until_reset()
+                            if header_wait is not None and header_wait > 0:
+                                wait_time = min(header_wait + 0.5, 60.0)  # cap at 60s
+                                _log(f"Rate-limit header suggests reset in {header_wait:.1f}s")
                         _log(f"Retrying in {wait_time:.1f} seconds...")
                         emit_raw(
                             {
@@ -524,7 +705,15 @@ Proceed with verification now.
 
         except CostLimitExceeded as e:
             _log(f"Cost limit exceeded: {e}")
-            emit(TurnFailedEvent(error={"message": f"Cost limit exceeded: {e}"}))
+            emit(
+                TurnFailedEvent(
+                    error={"message": f"Cost limit exceeded: {e}"},
+                    trace_id=trace_id,
+                    parent_trace_id=parent_trace_id,
+                    subagent_id=subagent_id,
+                    depth=depth,
+                )
+            )
             completion_reason = "cost_limit_exceeded"
             session.save_rollout(
                 messages=messages,
@@ -540,6 +729,44 @@ Proceed with verification now.
             ctx.done()
             return
 
+        except ContextWindowExceeded as e:
+            # Context still too large even after compaction retries — fatal
+            consecutive_failures += 1
+            _log(f"Context window exceeded after recovery attempts: {e}")
+            emit_raw({
+                "type": "stream.error",
+                "stage": "llm",
+                "error_code": "context_window_exceeded",
+                "message": str(e),
+                "consecutive_failures": consecutive_failures,
+            })
+            if consecutive_failures >= 3:
+                emit(
+                    TurnFailedEvent(
+                        error={"message": str(e)},
+                        trace_id=trace_id,
+                        parent_trace_id=parent_trace_id,
+                        subagent_id=subagent_id,
+                        depth=depth,
+                    )
+                )
+                completion_reason = "context_window_fatal"
+                session.save_rollout(
+                    messages=messages,
+                    iteration=iteration,
+                    pending_completion=pending_completion,
+                    tool_call_count=tool_call_count,
+                    usage={
+                        "input_tokens": total_input_tokens,
+                        "cached_input_tokens": total_cached_tokens,
+                        "output_tokens": total_output_tokens,
+                    },
+                )
+                ctx.done()
+                return
+            # Try again on next iteration (compaction already happened)
+            continue
+
         except LLMError as e:
             consecutive_failures += 1
             _log(f"LLM error: {e.code} - {e.message}")
@@ -553,7 +780,15 @@ Proceed with verification now.
                 }
             )
             if e.code in ("authentication_error", "invalid_api_key") or consecutive_failures >= 3:
-                emit(TurnFailedEvent(error={"message": str(e)}))
+                emit(
+                    TurnFailedEvent(
+                        error={"message": str(e)},
+                        trace_id=trace_id,
+                        parent_trace_id=parent_trace_id,
+                        subagent_id=subagent_id,
+                        depth=depth,
+                    )
+                )
                 completion_reason = "llm_fatal_error"
                 session.save_rollout(
                     messages=messages,
@@ -592,7 +827,15 @@ Proceed with verification now.
                 }
             )
             if consecutive_failures >= 3:
-                emit(TurnFailedEvent(error={"message": str(e)}))
+                emit(
+                    TurnFailedEvent(
+                        error={"message": str(e)},
+                        trace_id=trace_id,
+                        parent_trace_id=parent_trace_id,
+                        subagent_id=subagent_id,
+                        depth=depth,
+                    )
+                )
                 completion_reason = "runtime_fatal_error"
                 session.save_rollout(
                     messages=messages,
@@ -626,6 +869,9 @@ Proceed with verification now.
             approval_cache=session.approval_cache,
             max_output_tokens=max_output_tokens,
             readonly=readonly_mode,
+            trace_context=trace_context,
+            budget=budget,
+            tool_output_max_tokens=tier.tool_output_max_tokens,
         )
         runtime_result = runtime.process_response(
             response=response,
@@ -642,6 +888,40 @@ Proceed with verification now.
         parallel_batch_count += runtime_result.parallel_batch_count_delta
         approval_denials += runtime_result.approval_denials_delta
         guard_escalations += runtime_result.guard_escalations_delta
+        subagent_failures += runtime_result.subagent_failures_delta
+        subagent_rate_limit_failures += runtime_result.subagent_rate_limit_failures_delta
+        # Circuit breaker for repeated subagent instability.
+        max_subagent_failures = int(config.get("max_subagent_failures", 3) or 3)
+        max_subagent_rate_limits = int(config.get("max_subagent_rate_limits", 2) or 2)
+        if subagent_failures >= max_subagent_failures or subagent_rate_limit_failures >= max_subagent_rate_limits:
+            emit(
+                TurnFailedEvent(
+                    error={
+                        "message": (
+                            "Subagent circuit breaker tripped: "
+                            f"failures={subagent_failures}, rate_limits={subagent_rate_limit_failures}"
+                        )
+                    },
+                    trace_id=trace_id,
+                    parent_trace_id=parent_trace_id,
+                    subagent_id=subagent_id,
+                    depth=depth,
+                )
+            )
+            completion_reason = "subagent_circuit_breaker"
+            session.save_rollout(
+                messages=messages,
+                iteration=iteration,
+                pending_completion=pending_completion,
+                tool_call_count=tool_call_count,
+                usage={
+                    "input_tokens": total_input_tokens,
+                    "cached_input_tokens": total_cached_tokens,
+                    "output_tokens": total_output_tokens,
+                },
+            )
+            ctx.done()
+            return
         if iteration % checkpoint_every == 0:
             session.save_rollout(
                 messages=messages,
@@ -655,7 +935,15 @@ Proceed with verification now.
                 },
             )
         if runtime_result.aborted:
-            emit(TurnFailedEvent(error={"message": runtime_result.abort_reason}))
+            emit(
+                TurnFailedEvent(
+                    error={"message": runtime_result.abort_reason},
+                    trace_id=trace_id,
+                    parent_trace_id=parent_trace_id,
+                    subagent_id=subagent_id,
+                    depth=depth,
+                )
+            )
             completion_reason = "tool_abort"
             session.save_rollout(
                 messages=messages,
@@ -682,7 +970,11 @@ Proceed with verification now.
                 "input_tokens": total_input_tokens,
                 "cached_input_tokens": total_cached_tokens,
                 "output_tokens": total_output_tokens,
-            }
+            },
+            trace_id=trace_id,
+            parent_trace_id=parent_trace_id,
+            subagent_id=subagent_id,
+            depth=depth,
         )
     )
 
@@ -694,13 +986,22 @@ Proceed with verification now.
         {
             "type": "turn.metrics",
             "session_id": session_id,
+            **trace_context,
             "iterations": iteration,
             "llm_retries": llm_retry_count,
             "compactions": compaction_count,
             "parallel_batches": parallel_batch_count,
             "approval_denials": approval_denials,
             "guard_escalations": guard_escalations,
+            "subagent_failures": subagent_failures,
+            "subagent_rate_limit_failures": subagent_rate_limit_failures,
             "completion_reason": completion_reason,
+            "budget": {
+                "max_cost": budget.snapshot().max_cost,
+                "consumed_cost": round(budget.snapshot().consumed_cost, 6),
+                "reserved_cost": round(budget.snapshot().reserved_cost, 6),
+                "remaining_cost": round(budget.snapshot().remaining_cost, 6),
+            },
         }
     )
     session.save_rollout(

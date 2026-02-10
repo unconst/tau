@@ -551,3 +551,69 @@ def send_to_chat(chat_id: int, text: str):
     chunks = split_message(text)
     for chunk in chunks:
         bot.send_message(chat_id, chunk)
+
+
+# ---------------------------------------------------------------------------
+# Plan approval via inline keyboard
+# ---------------------------------------------------------------------------
+
+def send_plan_approval(chat_id: int, plan_text: str, reply_to_message_id: int | None = None) -> int | None:
+    """Send a plan to Telegram with Approve/Reject inline keyboard buttons.
+
+    Returns the message_id of the sent message, or None on failure.
+    """
+    from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("✅ Approve", callback_data="plan_approve"),
+        InlineKeyboardButton("❌ Reject", callback_data="plan_reject"),
+    )
+
+    preview = plan_text[:3500] if len(plan_text) > 3500 else plan_text
+    text = f"📋 **Proposed Plan:**\n\n{preview}"
+
+    try:
+        msg = bot.send_message(
+            chat_id,
+            text,
+            reply_to_message_id=reply_to_message_id,
+            reply_markup=markup,
+        )
+        return msg.message_id
+    except Exception:
+        return None
+
+
+def send_question_with_options(
+    chat_id: int,
+    question: str,
+    options: list[str] | None = None,
+    reply_to_message_id: int | None = None,
+) -> int | None:
+    """Send a question to Telegram, optionally with inline keyboard choices.
+
+    Returns the message_id of the sent message, or None on failure.
+    """
+    from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+    text = f"❓ {question}"
+
+    markup = None
+    if options:
+        markup = InlineKeyboardMarkup(row_width=1)
+        for i, opt in enumerate(options):
+            markup.add(
+                InlineKeyboardButton(opt, callback_data=f"ask_user_{i}")
+            )
+
+    try:
+        msg = bot.send_message(
+            chat_id,
+            text,
+            reply_to_message_id=reply_to_message_id,
+            reply_markup=markup,
+        )
+        return msg.message_id
+    except Exception:
+        return None

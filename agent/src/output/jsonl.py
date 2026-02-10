@@ -54,6 +54,10 @@ class ThreadStartedEvent:
     """Emitted when a new thread/session is started."""
 
     thread_id: str
+    trace_id: Optional[str] = None
+    parent_trace_id: Optional[str] = None
+    subagent_id: Optional[str] = None
+    depth: Optional[int] = None
     type: str = field(default="thread.started", init=False)
 
 
@@ -66,6 +70,10 @@ class ThreadStartedEvent:
 class TurnStartedEvent:
     """Emitted when a turn is started (user sends message)."""
 
+    trace_id: Optional[str] = None
+    parent_trace_id: Optional[str] = None
+    subagent_id: Optional[str] = None
+    depth: Optional[int] = None
     type: str = field(default="turn.started", init=False)
 
 
@@ -83,6 +91,10 @@ class TurnCompletedEvent:
     """Emitted when a turn is completed successfully."""
 
     usage: Dict[str, int]
+    trace_id: Optional[str] = None
+    parent_trace_id: Optional[str] = None
+    subagent_id: Optional[str] = None
+    depth: Optional[int] = None
     type: str = field(default="turn.completed", init=False)
 
 
@@ -91,6 +103,10 @@ class TurnFailedEvent:
     """Emitted when a turn fails."""
 
     error: Dict[str, str]
+    trace_id: Optional[str] = None
+    parent_trace_id: Optional[str] = None
+    subagent_id: Optional[str] = None
+    depth: Optional[int] = None
     type: str = field(default="turn.failed", init=False)
 
 
@@ -206,6 +222,41 @@ class PolicyEvaluationEvent:
     evaluation: Optional[Dict[str, Any]]
     fallback: bool
     type: str = field(default="policy.evaluation", init=False)
+
+
+@dataclass
+class PlanProposedEvent:
+    """Emitted when the agent proposes a plan for user approval."""
+
+    plan: str
+    type: str = field(default="plan.proposed", init=False)
+
+
+@dataclass
+class PlanApprovedEvent:
+    """Emitted when the user approves a proposed plan."""
+
+    plan: str
+    type: str = field(default="plan.approved", init=False)
+
+
+@dataclass
+class UserInputRequestedEvent:
+    """Emitted when the agent requests user input via ask_user tool."""
+
+    question: str
+    options: Optional[List[str]] = None
+    request_id: str = ""
+    type: str = field(default="user_input.requested", init=False)
+
+
+@dataclass
+class UserInputReceivedEvent:
+    """Emitted when user input is received in response to ask_user."""
+
+    answer: str
+    request_id: str = ""
+    type: str = field(default="user_input.received", init=False)
 
 
 @dataclass

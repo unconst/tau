@@ -1,11 +1,15 @@
-"""Turn runtime for response processing and tool orchestration."""
+"""Turn runtime for response processing and tool orchestration.
+
+Includes execution-time tool output truncation — large outputs are
+truncated *before* entering the message history to prevent token waste.
+"""
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from src.output.jsonl import (
     ItemCompletedEvent,
@@ -29,6 +33,71 @@ from src.tools.specs import tool_is_mutating, tool_supports_parallel
 from src.utils.truncate import middle_out_truncate
 
 
+# ---------------------------------------------------------------------------
+# Per-tool output limits (lines).  These apply at execution time, *before*
+# the output enters the conversation history, so the model never sees the
+# full bloat.  They are intentionally generous — they trim pathological cases
+# (e.g. `cat huge_log`) while keeping normal outputs intact.
+# ---------------------------------------------------------------------------
+
+_TOOL_MAX_LINES: Dict[str, int] = {
+    "shell_command": 200,   # keep first 10 + last 190
+    "read_file": 500,       # already limited by offset/limit, but guard
+    "list_dir": 200,
+    "grep_files": 150,
+    "glob_files": 150,
+    "web_search": 100,
+    "spawn_subagent": 300,
+}
+
+# Absolute byte limit before we truncate (64 KB) — catches binary blobs,
+# accidental log dumps, etc.
+_TOOL_MAX_BYTES = 65_536
+
+
+def _truncate_tool_output(
+    output: str,
+    tool_name: str,
+    max_output_tokens: int,
+) -> str:
+    """Apply execution-time truncation to a tool output.
+
+    Two stages:
+    1. Line-based truncation per tool type (cheap, no token counting).
+    2. Token-based middle-out truncation (existing ``middle_out_truncate``).
+    """
+    if not output:
+        return output
+
+    # Stage 0: absolute byte guard
+    if len(output) > _TOOL_MAX_BYTES:
+        # Keep head + tail bytes
+        half = _TOOL_MAX_BYTES // 2
+        output = (
+            output[:half]
+            + f"\n\n[... truncated {len(output) - _TOOL_MAX_BYTES} bytes ...]\n\n"
+            + output[-half:]
+        )
+
+    # Stage 1: line-based truncation
+    max_lines = _TOOL_MAX_LINES.get(tool_name)
+    if max_lines and output.count("\n") > max_lines:
+        lines = output.split("\n")
+        if len(lines) > max_lines:
+            keep_head = min(10, max_lines // 5)
+            keep_tail = max_lines - keep_head
+            trimmed_count = len(lines) - max_lines
+            output = "\n".join(
+                lines[:keep_head]
+                + [f"\n[... {trimmed_count} lines truncated ...]\n"]
+                + lines[-keep_tail:]
+            )
+
+    # Stage 2: token-based truncation (existing logic)
+    output = middle_out_truncate(output, max_tokens=max_output_tokens)
+    return output
+
+
 @dataclass
 class TurnRuntimeResult:
     messages: List[Dict[str, Any]]
@@ -41,6 +110,8 @@ class TurnRuntimeResult:
     parallel_batch_count_delta: int = 0
     approval_denials_delta: int = 0
     guard_escalations_delta: int = 0
+    subagent_failures_delta: int = 0
+    subagent_rate_limit_failures_delta: int = 0
 
 
 class TurnRuntime:
@@ -56,6 +127,9 @@ class TurnRuntime:
         approval_cache: dict[str, bool],
         max_output_tokens: int,
         readonly: bool,
+        trace_context: dict[str, Any] | None = None,
+        budget: Any = None,
+        tool_output_max_tokens: int = 0,
     ) -> None:
         self._tools = tools
         self._router = ToolRouter()
@@ -71,6 +145,10 @@ class TurnRuntime:
         self._approval_cache = approval_cache
         self._max_output_tokens = max_output_tokens
         self._bypass_approvals = bypass_approvals
+        self._trace_context = trace_context or {}
+        self._budget = budget
+        # Per-model tool output limit (from ModelTier). 0 = use max_output_tokens only.
+        self._tool_output_max_tokens = tool_output_max_tokens or max_output_tokens
 
     def process_response(
         self,
@@ -166,7 +244,7 @@ class TurnRuntime:
             decision = self._policy.evaluate(
                 call.tool_name,
                 call.arguments,
-                is_mutating=tool_is_mutating(call.tool_name),
+                is_mutating=tool_is_mutating(call.tool_name, call.arguments),
             )
 
             if decision.kind == PolicyDecisionKind.FORBIDDEN:
@@ -201,6 +279,8 @@ class TurnRuntime:
 
         approval_denials = 0
         guard_escalations = 0
+        subagent_failures = 0
+        subagent_rate_limit_failures = 0
         for kind, call, decision_or_result in precomputed:
             item_id = next_item_id()
             emit(
@@ -213,11 +293,13 @@ class TurnRuntime:
                 )
             )
             emit_raw(
-                {
+                self._with_runtime_meta(
+                    {
                     "type": "stream.tool.started",
                     "tool_name": call.tool_name,
                     "call_id": call.call_id,
-                }
+                    }
+                )
             )
 
             if kind in ("invalid", "forbidden", "needs_approval"):
@@ -250,7 +332,7 @@ class TurnRuntime:
                     invocation=call,
                     tools=self._tools,
                     ctx=ctx,
-                    is_mutating=tool_is_mutating(call.tool_name),
+                    is_mutating=tool_is_mutating(call.tool_name, call.arguments),
                     approval_cache=self._approval_cache,
                 )
                 result = orchestration.result
@@ -267,7 +349,8 @@ class TurnRuntime:
             if result is None:
                 result = self._invalid_invocation_result(call, "Batch execution failed")
             emit_raw(
-                {
+                self._with_runtime_meta(
+                    {
                     "type": "tool.decision",
                     "tool_name": call.tool_name,
                     "call_id": call.call_id,
@@ -276,19 +359,26 @@ class TurnRuntime:
                     "source": decision_source,
                     "approval_outcome": approval_outcome,
                     "recoverable": decision_kind != PolicyDecisionKind.FORBIDDEN.value,
-                }
+                    }
+                )
             )
             emit_raw(
-                {
+                self._with_runtime_meta(
+                    {
                     "type": "policy.evaluation",
                     "tool_name": call.tool_name,
                     "call_id": call.call_id,
                     "evaluation": policy_eval,
                     "fallback": policy_eval is None,
-                }
+                    }
+                )
             )
 
-            output = middle_out_truncate(result.output, max_tokens=self._max_output_tokens)
+            output = _truncate_tool_output(
+                result.output,
+                tool_name=call.tool_name,
+                max_output_tokens=self._tool_output_max_tokens,
+            )
             emit(
                 ItemCompletedEvent(
                     item=make_command_execution_item(
@@ -301,26 +391,42 @@ class TurnRuntime:
                 )
             )
             emit_raw(
-                {
+                self._with_runtime_meta(
+                    {
                     "type": "stream.tool.completed",
                     "tool_name": call.tool_name,
                     "call_id": call.call_id,
                     "success": result.success,
                     "retried_without_guards": retried_without_guards,
                     "fatal": abort_turn,
-                }
+                    }
+                )
             )
             emit_raw(
-                {
+                self._with_runtime_meta(
+                    {
                     "type": "tool.escalation",
                     "tool_name": call.tool_name,
                     "call_id": call.call_id,
                     "attempt": 2 if retried_without_guards else 1,
                     "retried_without_guards": retried_without_guards,
-                }
+                    }
+                )
             )
             if retried_without_guards:
                 guard_escalations += 1
+            if call.tool_name == "spawn_subagent" and kind == "run" and not result.success:
+                error_text = f"{result.error or ''} {result.output or ''}".lower()
+                is_rate_limited = "rate_limit" in error_text or "429" in error_text
+                is_runtime_failure = (
+                    "error_code=" in (result.output or "")
+                    or "subagent error" in (result.error or "").lower()
+                    or is_rate_limited
+                )
+                if is_runtime_failure:
+                    subagent_failures += 1
+                    if is_rate_limited:
+                        subagent_rate_limit_failures += 1
 
             if result.inject_content:
                 updated_messages.append(
@@ -352,6 +458,8 @@ class TurnRuntime:
                     parallel_batch_count_delta=1 if can_batch else 0,
                     approval_denials_delta=approval_denials,
                     guard_escalations_delta=guard_escalations,
+                    subagent_failures_delta=subagent_failures,
+                    subagent_rate_limit_failures_delta=subagent_rate_limit_failures,
                 )
 
         return TurnRuntimeResult(
@@ -364,9 +472,26 @@ class TurnRuntime:
             parallel_batch_count_delta=1 if can_batch else 0,
             approval_denials_delta=approval_denials,
             guard_escalations_delta=guard_escalations,
+            subagent_failures_delta=subagent_failures,
+            subagent_rate_limit_failures_delta=subagent_rate_limit_failures,
         )
 
     @staticmethod
     def _invalid_invocation_result(_call: Any, message: str) -> ToolResult:
         return ToolResult.fail(error=message, output=message)
+
+    def _with_runtime_meta(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Attach trace + budget metadata to emitted runtime events."""
+        out = dict(payload)
+        if self._trace_context:
+            out.update(self._trace_context)
+        if self._budget is not None:
+            snap = self._budget.snapshot()
+            out["budget"] = {
+                "max_cost": snap.max_cost,
+                "consumed_cost": round(snap.consumed_cost, 6),
+                "reserved_cost": round(snap.reserved_cost, 6),
+                "remaining_cost": round(snap.remaining_cost, 6),
+            }
+        return out
 

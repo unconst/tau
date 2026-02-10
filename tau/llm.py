@@ -118,6 +118,50 @@ def _get_cached_tool_registry(cwd: str, *, register_tau: bool = False):
         return tools
 
 
+def setup_ask_user_callback(tools, chat_id: int) -> None:
+    """Wire up the ask_user tool to send questions via Telegram.
+
+    The callback sends the question to Telegram, then blocks until the
+    user replies (via inline keyboard or text reply).
+    """
+    import threading as _th
+
+    def _ask_user_cb(question: str, options: list[str] | None, request_id: str) -> str:
+        from tau.telegram import send_question_with_options, bot
+
+        # Register pending input
+        answer_event = _th.Event()
+        answer_state = {"event": answer_event, "answer": "", "chat_id": chat_id, "options": options or []}
+
+        # Import the lock from tau.__init__ at call time to avoid circular
+        try:
+            from tau import _pending_user_inputs, _user_input_lock
+            with _user_input_lock:
+                _pending_user_inputs[request_id] = answer_state
+        except ImportError:
+            pass
+
+        send_question_with_options(chat_id, question, options=options)
+
+        # Wait up to 5 minutes
+        answer_event.wait(timeout=300)
+
+        try:
+            from tau import _pending_user_inputs, _user_input_lock
+            with _user_input_lock:
+                _pending_user_inputs.pop(request_id, None)
+        except ImportError:
+            pass
+
+        answer = answer_state.get("answer", "")
+        if not answer:
+            return "(no response — user did not reply within 5 minutes)"
+        return answer
+
+    if hasattr(tools, "set_ask_user_callback"):
+        tools.set_ask_user_callback(_ask_user_cb)
+
+
 def _make_config(readonly: bool = False, chat_mode: bool = False) -> Dict[str, Any]:
     """Build the config dict consumed by ``run_agent_loop``.
 
@@ -728,6 +772,8 @@ def run_baseagent_streaming(
     event_queue: queue.Queue | None = None,
     timeout_seconds: int = 3600,
     chat_mode: bool = False,
+    plan_first: bool = False,
+    plan_approval_callback=None,
 ) -> threading.Thread:
     """Run the baseagent loop in a background thread.
 
@@ -736,11 +782,18 @@ def run_baseagent_streaming(
 
     When *chat_mode* is True, the config is tuned for conversational
     Telegram messages (fewer iterations, no initial filesystem state).
+
+    When *plan_first* is True, the agent generates a plan before executing.
+    If *plan_approval_callback* is provided, it's called with the plan text
+    and must return True to approve or False to reject.
     """
     if event_queue is None:
         raise ValueError("event_queue is required")
 
     _ensure_agent_on_path()
+
+    # Capture chat_id from the caller context for ask_user callback
+    _ask_user_chat_id = getattr(plan_approval_callback, "_chat_id", None)
 
     def _worker():
         from src.core.loop import run_agent_loop  # type: ignore[import-untyped]
@@ -750,6 +803,11 @@ def run_baseagent_streaming(
         effective_model = model or (CHAT_MODEL if readonly else AGENT_MODEL)
         effective_cwd = cwd or WORKSPACE
         config = _make_config(readonly=readonly, chat_mode=chat_mode)
+
+        if plan_first:
+            config["plan_first"] = True
+            if plan_approval_callback is not None:
+                config["plan_approval_callback"] = plan_approval_callback
 
         llm = _get_cached_llm_client(effective_model, timeout=300.0)
         tools = _get_cached_tool_registry(effective_cwd, register_tau=not readonly)
@@ -852,6 +910,30 @@ def parse_event(event: dict[str, Any]) -> dict[str, Any] | None:
         if item_type == "error":
             return {"kind": "error", "text": item.get("message", item.get("text", "Unknown error")), "tool_name": None, "tool_detail": None, "item_type": item_type}
         return {"kind": "tool_done", "text": None, "tool_name": item_type, "tool_detail": None, "item_type": item_type}
+
+    # -- Plan events --
+    if etype == "plan.proposed":
+        return {"kind": "plan_proposed", "text": event.get("plan", ""), "tool_name": None, "tool_detail": None, "item_type": None}
+
+    if etype == "plan.approved":
+        return {"kind": "plan_approved", "text": event.get("plan", ""), "tool_name": None, "tool_detail": None, "item_type": None}
+
+    if etype == "plan.rejected":
+        return {"kind": "plan_rejected", "text": "", "tool_name": None, "tool_detail": None, "item_type": None}
+
+    if etype == "plan.updated":
+        return {"kind": "plan_updated", "text": "", "tool_name": None, "tool_detail": None, "item_type": None}
+
+    # -- User input events --
+    if etype == "user_input.requested":
+        return {
+            "kind": "user_input_requested",
+            "text": event.get("question", ""),
+            "tool_name": None,
+            "tool_detail": json.dumps(event.get("options")) if event.get("options") else None,
+            "item_type": None,
+            "request_id": event.get("request_id", ""),
+        }
 
     # -- Turn events --
     if etype == "turn.completed":

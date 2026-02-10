@@ -28,8 +28,10 @@ if TYPE_CHECKING:
 # Constants (matching OpenCode)
 # =============================================================================
 
-# Context limits
-MODEL_CONTEXT_LIMIT = 200_000  # Claude Opus 4.5 context window
+# Default context limits — used when no per-model metadata is available.
+# Callers should pass ``context_window`` / ``output_reserve`` / ``auto_compact_threshold``
+# from ``ModelTier`` to override these.
+MODEL_CONTEXT_LIMIT = 200_000  # Generous default; real value comes from ModelTier
 OUTPUT_TOKEN_MAX = 32_000  # Max output tokens to reserve
 AUTO_COMPACT_THRESHOLD = 0.85  # Trigger compaction at 85% of usable context
 
@@ -173,21 +175,33 @@ def get_working_set() -> WorkingSet:
 # =============================================================================
 
 
-def get_usable_context() -> int:
+def get_usable_context(
+    context_window: int = MODEL_CONTEXT_LIMIT,
+    output_reserve: int = OUTPUT_TOKEN_MAX,
+) -> int:
     """Get usable context window (total - reserved for output)."""
-    return MODEL_CONTEXT_LIMIT - OUTPUT_TOKEN_MAX
+    return context_window - output_reserve
 
 
-def is_overflow(total_tokens: int, threshold: float = AUTO_COMPACT_THRESHOLD) -> bool:
+def is_overflow(
+    total_tokens: int,
+    threshold: float = AUTO_COMPACT_THRESHOLD,
+    context_window: int = MODEL_CONTEXT_LIMIT,
+    output_reserve: int = OUTPUT_TOKEN_MAX,
+) -> bool:
     """Check if context is overflowing based on token count."""
-    usable = get_usable_context()
+    usable = get_usable_context(context_window, output_reserve)
     return total_tokens > usable * threshold
 
 
-def needs_compaction(messages: List[Dict[str, Any]]) -> bool:
+def needs_compaction(
+    messages: List[Dict[str, Any]],
+    context_window: int = MODEL_CONTEXT_LIMIT,
+    output_reserve: int = OUTPUT_TOKEN_MAX,
+) -> bool:
     """Check if messages need compaction."""
     total_tokens = estimate_total_tokens(messages)
-    return is_overflow(total_tokens)
+    return is_overflow(total_tokens, context_window=context_window, output_reserve=output_reserve)
 
 
 # =============================================================================
@@ -463,6 +477,9 @@ def manage_context(
     llm: "LLMClient",
     force_compaction: bool = False,
     _token_budget: Optional["_TokenBudget"] = None,
+    context_window: int = MODEL_CONTEXT_LIMIT,
+    output_reserve: int = OUTPUT_TOKEN_MAX,
+    auto_compact_threshold: float = AUTO_COMPACT_THRESHOLD,
 ) -> List[Dict[str, Any]]:
     """
     Main context management function.
@@ -481,21 +498,29 @@ def manage_context(
         llm: LLM client (for compaction)
         force_compaction: Force compaction even if under threshold
         _token_budget: Optional incremental token tracker (avoids re-counting)
+        context_window: Model's total context window (from ModelTier).
+        output_reserve: Tokens to reserve for output (from ModelTier).
+        auto_compact_threshold: Fraction threshold for compaction trigger.
 
     Returns:
         Managed message list (possibly compacted)
     """
+    _is_over = lambda t: is_overflow(
+        t, threshold=auto_compact_threshold,
+        context_window=context_window, output_reserve=output_reserve,
+    )
+
     if _token_budget is not None:
         total_tokens = _token_budget.update(messages)
     else:
         total_tokens = estimate_total_tokens(messages)
 
-    usable = get_usable_context()
-    usage_pct = (total_tokens / usable) * 100
+    usable = get_usable_context(context_window, output_reserve)
+    usage_pct = (total_tokens / usable) * 100 if usable else 100.0
 
     _log(f"Context: {total_tokens} tokens ({usage_pct:.1f}% of {usable})")
 
-    if not force_compaction and not is_overflow(total_tokens):
+    if not force_compaction and not _is_over(total_tokens):
         return messages
 
     _log("Context overflow detected, managing...")
@@ -504,9 +529,8 @@ def manage_context(
     pruned = prune_old_tool_outputs(messages)
     pruned_tokens = estimate_total_tokens(pruned)
 
-    if not is_overflow(pruned_tokens) and not force_compaction:
+    if not _is_over(pruned_tokens) and not force_compaction:
         _log(f"Pruning sufficient: {total_tokens} -> {pruned_tokens} tokens")
-        # Reset budget after compaction
         if _token_budget is not None:
             _token_budget.reset(pruned)
         return pruned
@@ -516,7 +540,7 @@ def manage_context(
     system_message = pruned[0] if preserve_system else None
     trimmed = pruned
     trim_attempts = 0
-    while is_overflow(estimate_total_tokens(trimmed)) and len(trimmed) > 2 and trim_attempts < 12:
+    while _is_over(estimate_total_tokens(trimmed)) and len(trimmed) > 2 and trim_attempts < 12:
         trimmed = HistoryManager.remove_first_item(
             trimmed,
             preserve_system_prompt=preserve_system,
@@ -530,7 +554,7 @@ def manage_context(
         _log(f"Pair-aware trimming removed {trim_attempts} oldest items")
 
     # Step 3: Run AI compaction if needed
-    if not is_overflow(estimate_total_tokens(trimmed)) and not force_compaction:
+    if not _is_over(estimate_total_tokens(trimmed)) and not force_compaction:
         _log("Pair-aware trimming was sufficient")
         if _token_budget is not None:
             _token_budget.reset(trimmed)
@@ -542,7 +566,6 @@ def manage_context(
 
     _log(f"Compaction result: {total_tokens} -> {compacted_tokens} tokens")
 
-    # Reset budget after compaction
     if _token_budget is not None:
         _token_budget.reset(compacted)
 

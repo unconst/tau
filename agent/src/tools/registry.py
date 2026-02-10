@@ -6,7 +6,9 @@ import hashlib
 import json
 import re
 import subprocess
+import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from src.tools.base import ToolResult
 from src.tools.guards import GuardConfig, GuardError, PathGuards
-from src.tools.specs import get_all_tools, tool_is_mutating
+from src.tools.specs import get_all_tools, tool_is_mutating, tool_supports_parallel
 
 if TYPE_CHECKING:
     pass  # AgentContext is duck-typed (has shell(), cwd, etc.)
@@ -93,6 +95,52 @@ class ExecutorStats:
         return self.total_duration_ms / self.total_executions
 
 
+class _RWLock:
+    """A simple read-write lock for tool execution.
+
+    - Multiple readers (parallel-safe tools) can hold the lock simultaneously.
+    - A writer (mutating tool) gets exclusive access — blocks until all
+      readers release, and blocks new readers until it's done.
+
+    This prevents race conditions where e.g. two concurrent shell_command
+    calls write to the same file.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._readers = 0
+        self._read_ok = threading.Condition(self._lock)
+        self._write_ok = threading.Condition(self._lock)
+        self._writers_waiting = 0
+        self._writer_active = False
+
+    def acquire_read(self) -> None:
+        with self._lock:
+            while self._writer_active or self._writers_waiting > 0:
+                self._read_ok.wait()
+            self._readers += 1
+
+    def release_read(self) -> None:
+        with self._lock:
+            self._readers -= 1
+            if self._readers == 0:
+                self._write_ok.notify_all()
+
+    def acquire_write(self) -> None:
+        with self._lock:
+            self._writers_waiting += 1
+            while self._writer_active or self._readers > 0:
+                self._write_ok.wait()
+            self._writers_waiting -= 1
+            self._writer_active = True
+
+    def release_write(self) -> None:
+        with self._lock:
+            self._writer_active = False
+            self._read_ok.notify_all()
+            self._write_ok.notify_all()
+
+
 class ToolRegistry:
     """Registry for managing and dispatching tool calls.
 
@@ -104,6 +152,8 @@ class ToolRegistry:
         self,
         cwd: Optional[Path] = None,
         config: Optional[ExecutorConfig] = None,
+        allowed_tools: Optional[set[str]] = None,
+        allow_subagent_spawn: bool = True,
     ):
         """Initialize the registry.
 
@@ -117,8 +167,16 @@ class ToolRegistry:
         self._cache: Dict[str, CachedResult] = {}
         self._stats = ExecutorStats()
         self._guards = PathGuards(GuardConfig.from_paths(self.cwd))
+        self._allowed_tools = set(allowed_tools) if allowed_tools is not None else None
+        self._allow_subagent_spawn = allow_subagent_spawn
         # Custom tools registered at runtime (name -> (spec_dict, handler_callable))
         self._custom_tools: Dict[str, tuple[Dict[str, Any], Callable[..., ToolResult]]] = {}
+        # Read/write lock — parallel-safe tools take a read lock;
+        # mutating tools take a write lock (exclusive).
+        self._rwlock = _RWLock()
+        # ask_user callback and pending responses (instance-level to avoid sharing)
+        self._ask_user_callback: Optional[Callable] = None
+        self._pending_asks: Dict[str, Dict[str, Any]] = {}
 
     # -----------------------------------------------------------------
     # Custom tool registration
@@ -171,7 +229,7 @@ class ToolRegistry:
         cwd = Path(ctx.cwd) if hasattr(ctx, "cwd") else self.cwd
 
         try:
-            max_attempts = 1 if tool_is_mutating(name) else 3
+            max_attempts = 1 if tool_is_mutating(name, arguments) else 3
             timeout_seconds = self._config.default_timeout
             if name == "shell_command":
                 timeout_seconds = max(
@@ -192,9 +250,14 @@ class ToolRegistry:
                 except FuturesTimeoutError:
                     last_error_text = "execution timed out"
                     if attempt >= max_attempts:
-                        result = ToolResult.fail(
-                            f"Tool {name} timed out after {timeout_seconds:.1f}s"
-                        )
+                        timeout_msg = f"Tool {name} timed out after {timeout_seconds:.1f}s"
+                        if name == "spawn_subagent":
+                            result = ToolResult.fail(
+                                timeout_msg,
+                                output=f"error_code=tool_timeout timeout_seconds={timeout_seconds:.1f}",
+                            )
+                        else:
+                            result = ToolResult.fail(timeout_msg)
                         break
                 except Exception as e:
                     last_error_text = str(e).lower()
@@ -231,6 +294,10 @@ class ToolRegistry:
         enforce_guards: bool,
     ) -> ToolResult:
         """Execute one tool call with timeout handling."""
+        if self._allowed_tools is not None and name not in self._allowed_tools:
+            return ToolResult.fail(f"Tool '{name}' is not available in this runtime.")
+        if name == "spawn_subagent" and not self._allow_subagent_spawn:
+            return ToolResult.fail("Nested subagents are not allowed.")
         if name in self._custom_tools:
             _, handler = self._custom_tools[name]
             return self._run_with_timeout(lambda: handler(arguments), self._config.default_timeout)
@@ -277,9 +344,19 @@ class ToolRegistry:
                 self._config.default_timeout,
             )
         if name == "spawn_subagent":
+            requested = float(arguments.get("timeout_seconds", 0) or 0)
+            effective_timeout = max(self._config.default_timeout, requested + 10.0) if requested > 0 else self._config.default_timeout
             return self._run_with_timeout(
                 lambda: self._execute_subagent(ctx, cwd, arguments),
-                self._config.default_timeout,
+                effective_timeout,
+            )
+        if name == "spawn_comparison":
+            # Comparison runs multiple subagents — allow generous timeout
+            num_approaches = len(arguments.get("approaches", []))
+            effective_timeout = max(self._config.default_timeout, 150.0 * num_approaches)
+            return self._run_with_timeout(
+                lambda: self._execute_comparison(ctx, cwd, arguments),
+                effective_timeout,
             )
         if name == "str_replace":
             return self._run_with_timeout(
@@ -295,6 +372,12 @@ class ToolRegistry:
             return self._run_with_timeout(
                 lambda: self._execute_lint(cwd, arguments, enforce_guards),
                 self._config.default_timeout,
+            )
+        if name == "ask_user":
+            # ask_user blocks for up to 5 minutes waiting for user reply
+            return self._run_with_timeout(
+                lambda: self._execute_ask_user(arguments),
+                timeout_seconds=310.0,  # slightly more than the 5min wait
             )
         return ToolResult.fail(f"Unknown tool: {name}")
 
@@ -704,6 +787,13 @@ class ToolRegistry:
 
         self._plan = normalized_steps
 
+        # Emit plan update as a JSONL event for progress tracking
+        from src.output.jsonl import emit_raw
+        emit_raw({
+            "type": "plan.updated",
+            "steps": normalized_steps,
+        })
+
         # Format plan for output
         lines = ["Plan updated:"]
         for i, step in enumerate(normalized_steps, 1):
@@ -750,19 +840,93 @@ class ToolRegistry:
         task = args.get("task", "")
         subagent_type = args.get("type", "explore")
         sub_cwd = args.get("cwd", str(cwd))
+        requested_overall_timeout = int(args.get("timeout_seconds", 0) or 0)
+        requested_llm_timeout = int(args.get("llm_timeout_seconds", 0) or 0)
+        requested_tool_timeout = int(args.get("tool_timeout_seconds", 0) or 0)
 
         if not task:
             return ToolResult.fail("No task provided for subagent")
 
         if subagent_type not in ("explore", "execute"):
             return ToolResult.fail(f"Invalid subagent type: {subagent_type}. Use 'explore' or 'execute'.")
+        constraints = getattr(ctx, "runtime_constraints", {}) or {}
+        readonly_parent = bool(constraints.get("readonly", False))
+        depth = int(constraints.get("depth", 0) or 0)
+        max_depth = int(constraints.get("max_subagent_depth", 1) or 1)
+        if depth >= max_depth:
+            return ToolResult.fail(
+                f"Subagent depth limit exceeded ({depth} >= {max_depth}). Nested subagents are not allowed."
+            )
+        if readonly_parent and subagent_type == "execute":
+            return ToolResult.fail("readonly parent cannot spawn execute subagent")
+        budget = getattr(ctx, "agent_budget", None)
+        reservation_amount = 0.05 if subagent_type == "explore" else 0.25
+        reservation_key = f"subagent:{uuid.uuid4().hex[:10]}"
+        if budget is not None and not budget.reserve(reservation_key, reservation_amount):
+            snap = budget.snapshot()
+            return ToolResult.fail(
+                "Insufficient shared budget for subagent spawn",
+                output=(
+                    f"remaining_cost={snap.remaining_cost:.4f}, "
+                    f"required_reservation={reservation_amount:.4f}"
+                ),
+            )
 
         from src.tools.subagent import run_subagent
 
-        return run_subagent(
+        try:
+            return run_subagent(
+                task=task,
+                subagent_type=subagent_type,
+                cwd=sub_cwd,
+                parent_constraints=constraints,
+                budget=budget,
+                timeout_seconds=requested_overall_timeout if requested_overall_timeout > 0 else None,
+                llm_timeout_seconds=requested_llm_timeout if requested_llm_timeout > 0 else None,
+                tool_timeout_seconds=requested_tool_timeout if requested_tool_timeout > 0 else None,
+                budget_reservation_key=reservation_key,
+            )
+        finally:
+            if budget is not None:
+                budget.release(reservation_key)
+
+    # -------------------------------------------------------------------------
+    # Comparison execution
+    # -------------------------------------------------------------------------
+
+    def _execute_comparison(
+        self,
+        ctx: "AgentContext",
+        cwd: Path,
+        args: dict[str, Any],
+    ) -> ToolResult:
+        """Spawn multiple subagents to compare approaches."""
+        task = args.get("task", "")
+        approaches = args.get("approaches", [])
+        sub_cwd = args.get("cwd", str(cwd))
+
+        if not task:
+            return ToolResult.fail("No task provided for comparison")
+        if not approaches or not isinstance(approaches, list):
+            return ToolResult.fail("No approaches provided for comparison")
+        if len(approaches) > 3:
+            return ToolResult.fail("Maximum 3 approaches allowed")
+
+        constraints = getattr(ctx, "runtime_constraints", {}) or {}
+        depth = int(constraints.get("depth", 0) or 0)
+        max_depth = int(constraints.get("max_subagent_depth", 1) or 1)
+        if depth >= max_depth:
+            return ToolResult.fail("Subagent depth limit exceeded for comparison")
+
+        budget = getattr(ctx, "agent_budget", None)
+
+        from src.tools.subagent import run_comparison
+        return run_comparison(
             task=task,
-            subagent_type=subagent_type,
+            approaches=approaches,
             cwd=sub_cwd,
+            parent_constraints=constraints,
+            budget=budget,
         )
 
     # -------------------------------------------------------------------------
@@ -958,6 +1122,78 @@ class ToolRegistry:
             return ToolResult.fail(f"Lint failed: {e}")
 
     # -------------------------------------------------------------------------
+    # ask_user execution
+    # -------------------------------------------------------------------------
+
+    def set_ask_user_callback(
+        self,
+        callback: Optional[Callable[[str, Optional[list[str]], str], str]],
+    ) -> None:
+        """Register a callback for the ask_user tool.
+
+        The callback signature is:
+            callback(question: str, options: list[str] | None, request_id: str) -> str
+
+        It should block until the user responds and return the answer text.
+        If no callback is registered, ask_user will emit a JSONL event and
+        wait for the answer to be pushed via :meth:`push_user_answer`.
+        """
+        self._ask_user_callback = callback
+
+    def push_user_answer(self, request_id: str, answer: str) -> None:
+        """Push a user answer for a pending ask_user request."""
+        pending = self._pending_asks.get(request_id)
+        if pending:
+            pending["answer"] = answer
+            pending["event"].set()
+
+    def _execute_ask_user(self, args: dict[str, Any]) -> ToolResult:
+        """Ask the user a question and wait for a response."""
+        question = args.get("question", "")
+        options = args.get("options")
+
+        if not question:
+            return ToolResult.fail("No question provided")
+
+        request_id = f"ask_{uuid.uuid4().hex[:8]}"
+
+        # If a callback is registered (e.g., from Telegram), use it directly
+        if self._ask_user_callback is not None:
+            try:
+                answer = self._ask_user_callback(question, options, request_id)
+                return ToolResult.ok(f"User answered: {answer}")
+            except Exception as e:
+                return ToolResult.fail(f"ask_user callback failed: {e}")
+
+        # Otherwise, emit event and wait for push_user_answer()
+        from src.output.jsonl import emit, UserInputRequestedEvent
+
+        wait_event = threading.Event()
+        self._pending_asks[request_id] = {
+            "event": wait_event,
+            "answer": "",
+        }
+
+        emit(UserInputRequestedEvent(
+            question=question,
+            options=options,
+            request_id=request_id,
+        ))
+
+        # Wait up to 5 minutes for user response
+        answered = wait_event.wait(timeout=300)
+        pending = self._pending_asks.pop(request_id, {})
+
+        if not answered:
+            return ToolResult.fail(
+                "User did not respond within 5 minutes. "
+                "Make a reasonable decision and proceed."
+            )
+
+        answer = pending.get("answer", "")
+        return ToolResult.ok(f"User answered: {answer}")
+
+    # -------------------------------------------------------------------------
     # Caching methods
     # -------------------------------------------------------------------------
 
@@ -1038,12 +1274,36 @@ class ToolRegistry:
     # Batch execution
     # -------------------------------------------------------------------------
 
+    def _execute_with_lock(
+        self,
+        ctx: "AgentContext",
+        name: str,
+        args: dict[str, Any],
+    ) -> ToolResult:
+        """Execute a tool with the appropriate read or write lock."""
+        is_write = tool_is_mutating(name, args)
+        if is_write:
+            self._rwlock.acquire_write()
+        else:
+            self._rwlock.acquire_read()
+        try:
+            return self.execute(ctx, name, args)
+        finally:
+            if is_write:
+                self._rwlock.release_write()
+            else:
+                self._rwlock.release_read()
+
     def execute_batch(
         self,
         ctx: "AgentContext",
         calls: List[Tuple[str, dict]],
     ) -> List[ToolResult]:
-        """Execute multiple tool calls in parallel.
+        """Execute multiple tool calls with read/write locking.
+
+        Parallel-safe (read-only) tools run concurrently under a shared read
+        lock.  Mutating tools acquire an exclusive write lock, blocking until
+        all concurrent reads finish and preventing new reads until done.
 
         Args:
             ctx: Agent context with shell() method
@@ -1055,17 +1315,17 @@ class ToolRegistry:
         if not calls:
             return []
 
-        # For single call, just execute directly
+        # For single call, just execute directly (still use lock)
         if len(calls) == 1:
             name, args = calls[0]
-            return [self.execute(ctx, name, args)]
+            return [self._execute_with_lock(ctx, name, args)]
 
-        # Execute in parallel using ThreadPoolExecutor
+        # Execute in parallel using ThreadPoolExecutor with RW locking
         results: List[Optional[ToolResult]] = [None] * len(calls)
 
         with ThreadPoolExecutor(max_workers=self._config.max_concurrent) as executor:
             future_to_index = {
-                executor.submit(self.execute, ctx, name, args): i
+                executor.submit(self._execute_with_lock, ctx, name, args): i
                 for i, (name, args) in enumerate(calls)
             }
 
@@ -1112,6 +1372,10 @@ class ToolRegistry:
         tools = []
 
         for spec in specs:
+            if self._allowed_tools is not None and spec["name"] not in self._allowed_tools:
+                continue
+            if spec["name"] == "spawn_subagent" and not self._allow_subagent_spawn:
+                continue
             tools.append(
                 {
                     "name": spec["name"],

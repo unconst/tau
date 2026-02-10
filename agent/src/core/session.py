@@ -64,10 +64,27 @@ class SimpleAgentContext:
     in multiple places.
     """
 
-    def __init__(self, instruction: str, cwd: str | None = None):
+    def __init__(
+        self,
+        instruction: str,
+        cwd: str | None = None,
+        *,
+        depth: int = 0,
+        max_subagent_depth: int = 1,
+        trace_id: str | None = None,
+        parent_trace_id: str | None = None,
+        subagent_id: str | None = None,
+    ):
         self.instruction = instruction
         self.cwd = cwd or str(Path.cwd())
         self.is_done = False
+        self.depth = depth
+        self.max_subagent_depth = max_subagent_depth
+        self.trace_id = trace_id
+        self.parent_trace_id = parent_trace_id
+        self.subagent_id = subagent_id
+        self.runtime_constraints: dict[str, Any] = {}
+        self.agent_budget: Any = None
 
     def shell(self, cmd: str, timeout: int = 120) -> ShellResult:
         r = subprocess.run(

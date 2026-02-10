@@ -8,6 +8,10 @@ heuristics about the current task's complexity:
 - **complex** tasks (multi-file changes, long context) use the strongest model
 
 Callers can also override per-call (e.g. cheap model for verification steps).
+
+Each ``ModelTier`` now carries per-model metadata (context window, capabilities,
+truncation policy) so the rest of the system can adapt behavior per model
+instead of using hardcoded global constants.
 """
 
 from __future__ import annotations
@@ -28,12 +32,46 @@ class TaskComplexity(Enum):
 
 @dataclass
 class ModelTier:
-    """A model configuration for a specific tier."""
+    """A model configuration for a specific tier.
+
+    Attributes:
+        model: Model identifier string.
+        max_tokens: Maximum output tokens to request.
+        temperature: Sampling temperature (0.0 = deterministic).
+        reasoning_effort: Reasoning effort hint ("none", "low", "medium", "high").
+        context_window: Total context window size in tokens.
+        output_reserve: Tokens to reserve for the model's output.
+        auto_compact_threshold: Fraction of usable context that triggers compaction.
+        supports_reasoning: Whether the model supports extended reasoning.
+        supports_parallel_tools: Whether the model can emit parallel tool calls.
+        supports_temperature: Whether the model accepts a temperature parameter.
+        tool_output_max_tokens: Max tokens per tool output before truncation at
+            execution time (0 = no execution-time truncation).
+    """
 
     model: str
     max_tokens: int = 16384
     temperature: float = 0.0
     reasoning_effort: str = "none"
+
+    # Per-model context / capability metadata
+    context_window: int = 200_000
+    output_reserve: int = 32_000
+    auto_compact_threshold: float = 0.85
+    supports_reasoning: bool = False
+    supports_parallel_tools: bool = True
+    supports_temperature: bool = True
+    tool_output_max_tokens: int = 0  # 0 = defer to compaction
+
+    @property
+    def usable_context(self) -> int:
+        """Context window minus output reserve."""
+        return self.context_window - self.output_reserve
+
+    @property
+    def compact_trigger(self) -> int:
+        """Token count at which compaction should trigger."""
+        return int(self.usable_context * self.auto_compact_threshold)
 
 
 @dataclass
@@ -44,15 +82,34 @@ class RouterConfig:
     fast: ModelTier = field(default_factory=lambda: ModelTier(
         model=os.environ.get("TAU_FAST_MODEL", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"),
         max_tokens=8192,
+        context_window=32_768,
+        output_reserve=4_096,
+        supports_reasoning=False,
+        supports_parallel_tools=True,
+        supports_temperature=True,
+        tool_output_max_tokens=4_000,
     ))
     default: ModelTier = field(default_factory=lambda: ModelTier(
         model=os.environ.get("TAU_AGENT_MODEL", os.environ.get("LLM_MODEL", "zai-org/GLM-4.7-TEE")),
         max_tokens=16384,
+        context_window=131_072,
+        output_reserve=16_384,
+        supports_reasoning=False,
+        supports_parallel_tools=True,
+        supports_temperature=True,
+        tool_output_max_tokens=8_000,
     ))
     strong: ModelTier = field(default_factory=lambda: ModelTier(
         model=os.environ.get("TAU_STRONG_MODEL", os.environ.get("LLM_MODEL", "deepseek-ai/DeepSeek-R1-0528-TEE")),
         max_tokens=16384,
         reasoning_effort="high",
+        context_window=131_072,
+        output_reserve=32_000,
+        auto_compact_threshold=0.80,
+        supports_reasoning=True,
+        supports_parallel_tools=False,
+        supports_temperature=False,
+        tool_output_max_tokens=8_000,
     ))
 
     # Enable/disable routing (when disabled, always use default)
