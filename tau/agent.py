@@ -294,7 +294,7 @@ Original:
 Output ONLY the compressed summary, no preamble."""
 
     try:
-        from .codex import llm_chat
+        from .llm import llm_chat
         result = llm_chat(compress_prompt, timeout=120.0)
         return result[:target_chars + 100]  # Allow slight overage
     except Exception:
@@ -316,7 +316,7 @@ Return a bullet list of core facts (each starting with "- "), or "NONE" if no ne
 Be very selective - only truly persistent information that would be useful months later."""
 
     try:
-        from .codex import llm_chat
+        from .llm import llm_chat
         facts = llm_chat(extract_prompt, timeout=120.0)
         if "NONE" in facts.upper() or not facts:
             return []
@@ -586,7 +586,7 @@ def run_agent(prompt: str) -> str:
     memory, tasks) is passed as part of the instruction since the caller
     already constructs the full prompt from ``PROMPT_TEMPLATE``.
     """
-    from .codex import run_baseagent
+    from .llm import run_baseagent
 
     try:
         return run_baseagent(prompt, cwd=WORKSPACE)

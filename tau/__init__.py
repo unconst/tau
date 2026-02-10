@@ -560,7 +560,7 @@ Rules:
 
 Output ONLY the updated summary, no preamble or explanation."""
 
-    from .codex import llm_chat
+    from .llm import llm_chat
     try:
         return llm_chat(prompt, timeout=300.0)
     except Exception:
@@ -642,7 +642,7 @@ The summary should be:
 
 Output ONLY the summary content, no preamble or explanation."""
 
-                from .codex import llm_chat
+                from .llm import llm_chat
                 try:
                     summary = llm_chat(summary_prompt, timeout=300.0)
                 except Exception:
@@ -759,7 +759,7 @@ CRON JOB PROMPT (runs every {job['interval_seconds']}s):
 
 Please execute this scheduled task. Provide a fresh update based on the current state or by using your tools. Do not simply repeat previous messages."""
 
-                from .codex import run_baseagent
+                from .llm import run_baseagent
                 response = run_baseagent(prompt_with_context)
                 if response:
                     # Send result to user
@@ -1074,7 +1074,7 @@ def run_adapt_streaming(
         min_chars_delta=15,  # More responsive updates
     )
 
-    from .codex import run_baseagent_streaming, parse_event, format_tool_update
+    from .llm import run_baseagent_streaming, parse_event, format_tool_update
 
     start_time = time.time()
     thinking_updates: list[str] = []
@@ -1359,7 +1359,7 @@ The plan should be self-contained so someone can follow it without additional co
 
 Output ONLY the plan content, no preamble or meta-commentary."""
 
-    from .codex import run_baseagent_streaming, parse_event
+    from .llm import run_baseagent_streaming, parse_event
 
     start_time = time.time()
     thinking_updates: list[str] = []
@@ -1706,7 +1706,7 @@ Please respond to the user's message above, considering the full context of our 
         
         # Process transcribed text as normal message
         try:
-            from .codex import CHAT_MODEL
+            from .llm import CHAT_MODEL
             backend = (os.getenv("TAU_CHAT_BACKEND") or "baseagent").strip().lower()
             openai_model = os.getenv("TAU_OPENAI_CHAT_MODEL", "gpt-4o-mini")
             agent_model = os.getenv("TAU_CHAT_MODEL", CHAT_MODEL)
@@ -1797,7 +1797,7 @@ def run_agent_ask_streaming(
     - End with just the final answer
     """
     if model is None:
-        from .codex import CHAT_MODEL
+        from .llm import CHAT_MODEL
         model = CHAT_MODEL
     stream = TelegramStreamingMessage(
         chat_id,
@@ -1808,7 +1808,7 @@ def run_agent_ask_streaming(
         min_chars_delta=15,  # More responsive updates
     )
 
-    from .codex import run_baseagent_streaming, parse_event, format_tool_update
+    from .llm import run_baseagent_streaming, parse_event, format_tool_update
 
     start_time = time.time()
     raw_output = ""
@@ -2199,7 +2199,7 @@ def handle_message(message):
     # - default: use agent in-process for normal chat
     # - set TAU_CHAT_BACKEND=openai to use OpenAI directly
     # - set TAU_CHAT_BACKEND=auto to use OpenAI when OPENAI_API_KEY is available
-    from .codex import CHAT_MODEL
+    from .llm import CHAT_MODEL
     backend = (os.getenv("TAU_CHAT_BACKEND") or "baseagent").strip().lower()
     openai_model = os.getenv("TAU_OPENAI_CHAT_MODEL", "gpt-4o-mini")
     agent_model = os.getenv("TAU_CHAT_MODEL", CHAT_MODEL)

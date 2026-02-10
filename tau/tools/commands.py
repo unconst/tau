@@ -135,7 +135,7 @@ Use the workspace context above to inform your plan.
 
 Output ONLY the plan content, no preamble."""
 
-    from tau.codex import llm_chat
+    from tau.llm import llm_chat
     
     try:
         plan_content = llm_chat(plan_prompt, timeout=600.0)
@@ -233,7 +233,7 @@ def cmd_adapt(prompt: str) -> str:
     if not prompt:
         return "Error: Adaptation prompt is required"
     
-    from tau.codex import run_baseagent
+    from tau.llm import run_baseagent
     
     try:
         output = run_baseagent(prompt)
