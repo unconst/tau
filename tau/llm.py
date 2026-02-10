@@ -329,15 +329,7 @@ def build_tau_system_prompt(
     if skills_section:
         parts.append(f"# Relevant Skills\n\n{skills_section}")
 
-    parts.append(f"""# Infrastructure
-
-You are powered by LLMs served through the Chutes API (llm.chutes.ai).
-- **Chat model** (read-only queries, summaries): `{CHAT_MODEL}`
-- **Agent model** (tool use, code changes, tasks): `{AGENT_MODEL}`
-You do NOT have access to OpenAI, Anthropic, or any other provider directly.
-If asked what models you use, answer with the above — do not guess or invent model names.
-
-# Tools Available
+    parts.append("""# Tools Available
 
 You have the following tools:
 - **send_message** — Send a Telegram message to the user
@@ -363,7 +355,8 @@ You have the following tools:
 - If asked "what are you?" or "who are you?", say you are Tau.
 - Never identify as Composer, Cursor, ChatGPT, Claude, or any other AI system.
 - When asked what you can do, explain conversationally — no command syntax, just natural examples.
-- NEVER invent or guess facts about your own infrastructure, models, or capabilities. If you don't know, say so.""")
+- NEVER invent or guess facts about your own infrastructure, models, or capabilities. If you don't know, say so.
+- You run on the Chutes API (llm.chutes.ai). If asked about available models, run: `curl -s https://llm.chutes.ai/v1/models | jq '.data[].id'` — do NOT guess model names from memory.""")
 
     return "\n\n---\n\n".join(parts)
 
