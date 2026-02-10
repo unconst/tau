@@ -95,7 +95,7 @@ def _pingpong() -> BrailleSpinner:
     for cell in range(WIDTH):
         for dot in _DOTS:
             fwd.append(_frame({cell: dot}))
-    return BrailleSpinner("ping_pong", _bounce(fwd), 6.0)
+    return BrailleSpinner("ping_pong", _bounce(fwd), 3.0)
 
 
 # ── 2. Scanner bar ──────────────────────────────────────────────────
@@ -106,7 +106,7 @@ def _scanner() -> BrailleSpinner:
     for cell in range(WIDTH):
         for phase in _SCAN:
             fwd.append(_frame({cell: phase}))
-    return BrailleSpinner("scanner", _bounce(fwd), 6.0)
+    return BrailleSpinner("scanner", _bounce(fwd), 3.0)
 
 
 # ── 3. Comet with tail ──────────────────────────────────────────────
@@ -133,7 +133,7 @@ def _comet() -> BrailleSpinner:
                 f[t] = tp
         bwd.append(_frame(f))
 
-    return BrailleSpinner("comet", fwd + bwd, 4.0)
+    return BrailleSpinner("comet", fwd + bwd, 2.0)
 
 
 # ── 4. Elastic bounce ───────────────────────────────────────────────
@@ -158,7 +158,7 @@ def _elastic() -> BrailleSpinner:
             if cell < WIDTH - 1:
                 f[cell + 1] = 0x01
         frames.append(_frame(f))
-    return BrailleSpinner("elastic", frames, 5.0)
+    return BrailleSpinner("elastic", frames, 2.5)
 
 
 # ── 5. Dual particles ───────────────────────────────────────────────
@@ -185,7 +185,7 @@ def _dual() -> BrailleSpinner:
         left, right = step, WIDTH - 1 - step
         frames.append(_frame({left: 0x80, right: 0x01}))
 
-    return BrailleSpinner("dual_particles", frames, 4.0)
+    return BrailleSpinner("dual_particles", frames, 2.0)
 
 
 # ── 6. Wave sweep ───────────────────────────────────────────────────
@@ -204,7 +204,7 @@ def _wave() -> BrailleSpinner:
                 f[c] = bp
         fwd.append(_frame(f))
 
-    return BrailleSpinner("wave_sweep", _bounce(fwd), 4.0)
+    return BrailleSpinner("wave_sweep", _bounce(fwd), 2.0)
 
 
 # ── 7. Fill-and-drain oscillator ─────────────────────────────────────
@@ -231,7 +231,7 @@ def _fill_drain() -> BrailleSpinner:
             f[cell] = p
             frames.append(_frame(f))
 
-    return BrailleSpinner("fill_drain", frames, 8.0)
+    return BrailleSpinner("fill_drain", frames, 4.0)
 
 
 # ── 8. Pendulum ─────────────────────────────────────────────────────
@@ -254,7 +254,7 @@ def _pendulum() -> BrailleSpinner:
         elif angle < -0.1 and cell < WIDTH - 1:
             f[cell + 1] = 0x01
         frames.append(_frame(f))
-    return BrailleSpinner("pendulum", frames, 4.0)
+    return BrailleSpinner("pendulum", frames, 2.0)
 
 
 # ── 9. Phase-shifted spinner (liquid motion) ────────────────────────
@@ -266,7 +266,7 @@ def _liquid() -> BrailleSpinner:
     for shift in range(np):
         row = "".join(_b(_SPIN[(cell + shift) % np]) for cell in range(WIDTH))
         frames.append(row)
-    return BrailleSpinner("liquid", frames, 3.0)
+    return BrailleSpinner("liquid", frames, 1.5)
 
 
 # ── 10. Heartbeat ───────────────────────────────────────────────────
@@ -302,7 +302,7 @@ def _heartbeat() -> BrailleSpinner:
                 f[c] = _FILL[bright]
         frames.append(_frame(f))
 
-    return BrailleSpinner("heartbeat", frames, 3.0)
+    return BrailleSpinner("heartbeat", frames, 1.5)
 
 
 # ── Public API ───────────────────────────────────────────────────────
