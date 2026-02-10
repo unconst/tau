@@ -100,6 +100,12 @@ If no task can be safely advanced, ask the user instead of guessing.
 TOOLS:
 - send_message: source .venv/bin/activate && python -m tau.tools.send_message "message"
 - send_voice: source .venv/bin/activate && python -m tau.tools.send_voice "message"
+- generate_video: source .venv/bin/activate && python -m tau.tools.generate_video --prompt "description of motion" --image /path/to/image.jpg
+  (Generate a video from an image + text prompt using the WAN 2.2 I2V model)
+  Examples:
+    - python -m tau.tools.generate_video --prompt "A cat walking forward" --image /tmp/cat.jpg
+    - python -m tau.tools.generate_video --prompt "Ocean waves crashing" --image "https://example.com/ocean.jpg" --frames 81
+    - python -m tau.tools.generate_video --prompt "Flowers blooming" --image /tmp/flower.jpg --output /tmp/video.mp4
 - search_skills: source .venv/bin/activate && python -m tau.tools.search_skills "query"
   (Search for creative AI skills - image/video/audio generation, social media posting, etc.)
   Examples:

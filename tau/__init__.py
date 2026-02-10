@@ -1746,7 +1746,167 @@ Please respond to the user's message above, considering the full context of our 
                 pass
 
 
-@bot.message_handler(content_types=['photo', 'document', 'sticker', 'video', 'audio', 'animation', 'video_note', 'contact', 'location', 'venue', 'poll'])
+@bot.message_handler(content_types=['photo'])
+def handle_photo(message):
+    """Handle photo messages — support video generation from images.
+
+    If the user sends a photo with a caption, treat the caption as a video
+    generation prompt (or as a general message about the image).
+    If no caption, ask what they'd like to do with the image.
+    """
+    save_chat_metadata(message)
+    if not authorize(message):
+        return
+    save_chat_id(message.chat.id)
+
+    caption = (message.caption or "").strip()
+    append_chat_history("user", f"[photo]{': ' + caption if caption else ''}", chat_id=message.chat.id)
+
+    # Check if caption explicitly asks for video generation
+    video_keywords = [
+        "video", "animate", "animation", "motion", "move", "moving",
+        "make it move", "bring to life", "come to life", "i2v",
+        "generate video", "create video", "make video",
+    ]
+    wants_video = caption and any(kw in caption.lower() for kw in video_keywords)
+
+    if wants_video:
+        # Extract the prompt — remove the video-trigger keywords for a cleaner prompt
+        prompt = caption
+        # Remove common trigger phrases to get the actual motion description
+        for phrase in ["generate a video of", "generate video of", "create a video of",
+                       "create video of", "make a video of", "make video of",
+                       "animate this:", "animate:", "video:", "make it move:",
+                       "bring to life:", "animate this", "make a video",
+                       "generate a video", "generate video", "create a video",
+                       "create video", "make video"]:
+            if prompt.lower().startswith(phrase):
+                prompt = prompt[len(phrase):].strip()
+                break
+
+        if not prompt:
+            prompt = "Smooth natural motion, cinematic quality"
+
+        processing_msg = bot.reply_to(message, "🎬 Generating video... this may take a minute or two.")
+
+        photo_path = None
+        try:
+            # Download the highest resolution photo
+            file_id = message.photo[-1].file_id
+            file_info = bot.get_file(file_id)
+            downloaded = bot.download_file(file_info.file_path)
+
+            # Save to temp file
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+                tmp.write(downloaded)
+                photo_path = tmp.name
+
+            from tau.tools.generate_video import send_video_message
+            result = send_video_message(
+                message.chat.id,
+                prompt,
+                photo_path,
+                reply_to_message_id=message.message_id,
+            )
+
+            # Update the processing message
+            try:
+                bot.edit_message_text(
+                    f"✅ Video generated: {prompt[:100]}",
+                    message.chat.id,
+                    processing_msg.message_id,
+                )
+            except Exception:
+                pass
+
+            append_chat_history("assistant", f"[video generated]: {prompt}", chat_id=message.chat.id)
+
+        except Exception as e:
+            error_msg = f"Video generation failed: {str(e)}"
+            try:
+                bot.edit_message_text(error_msg, message.chat.id, processing_msg.message_id)
+            except Exception:
+                bot.reply_to(message, error_msg)
+            append_chat_history("assistant", error_msg, chat_id=message.chat.id)
+        finally:
+            if photo_path and os.path.exists(photo_path):
+                try:
+                    os.unlink(photo_path)
+                except Exception:
+                    pass
+    elif caption:
+        # Photo with a non-video caption — process as a regular message with image context
+        # Save the photo temporarily and pass to the agent
+        photo_path = None
+        try:
+            file_id = message.photo[-1].file_id
+            file_info = bot.get_file(file_id)
+            downloaded = bot.download_file(file_info.file_path)
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+                tmp.write(downloaded)
+                photo_path = tmp.name
+
+            # Let the agent handle it with image context
+            from .llm import CHAT_MODEL, build_tau_system_prompt
+            agent_model = os.getenv("TAU_CHAT_MODEL", CHAT_MODEL)
+            tau_system_prompt = build_tau_system_prompt(
+                chat_id=message.chat.id,
+                user_message=caption,
+            )
+
+            prompt_with_context = (
+                f"The user sent a photo (saved at {photo_path}) with caption: {caption}\n\n"
+                f"If they want a video from this image, use the generate_video tool with "
+                f"the image path and an appropriate prompt.\n"
+                f"Otherwise, respond to their caption normally."
+            )
+
+            typing_stop = threading.Event()
+            typing_thread = threading.Thread(
+                target=send_typing_action,
+                args=(message.chat.id, typing_stop),
+                daemon=True,
+            )
+            typing_thread.start()
+
+            try:
+                response = run_agent_ask_streaming(
+                    prompt_with_context,
+                    chat_id=message.chat.id,
+                    reply_to_message_id=message.message_id,
+                    initial_text="🤔",
+                    model=agent_model,
+                    timeout_seconds=300,
+                    system_prompt_override=tau_system_prompt,
+                    readonly=False,
+                )
+                append_chat_history("assistant", response, chat_id=message.chat.id)
+            finally:
+                typing_stop.set()
+
+        except Exception as e:
+            error_msg = f"Error: {str(e)}"
+            bot.reply_to(message, error_msg)
+            append_chat_history("assistant", error_msg, chat_id=message.chat.id)
+        finally:
+            if photo_path and os.path.exists(photo_path):
+                try:
+                    os.unlink(photo_path)
+                except Exception:
+                    pass
+    else:
+        # Photo with no caption — tell the user what they can do
+        response = (
+            "📷 Got your photo! You can:\n"
+            "• Send it again with a caption like \"animate this — a bird flying\" to generate a video\n"
+            "• Or just describe what you'd like me to do with it"
+        )
+        bot.reply_to(message, response)
+        append_chat_history("assistant", response, chat_id=message.chat.id)
+
+
+@bot.message_handler(content_types=['document', 'sticker', 'video', 'audio', 'animation', 'video_note', 'contact', 'location', 'venue', 'poll'])
 def handle_other_content(message):
     """Handle non-text content types with a confirmation."""
     save_chat_metadata(message)
@@ -1756,7 +1916,7 @@ def handle_other_content(message):
     
     # Determine content type for the confirmation message
     content_type = message.content_type
-    response = f"📨 Received {content_type}. I can process text and voice messages."
+    response = f"📨 Received {content_type}. I can process text, voice, and photo messages."
     bot.reply_to(message, response)
     append_chat_history("user", f"[{content_type}]", chat_id=message.chat.id)
     append_chat_history("assistant", response, chat_id=message.chat.id)

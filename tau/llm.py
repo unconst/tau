@@ -171,6 +171,8 @@ _SKILL_KEYWORDS: Dict[str, str] = {
     "creative": "eve-skills.md",
     "art": "eve-skills.md",
     "image": "eve-skills.md",
+    "video": "eve-skills.md",
+    "animate": "eve-skills.md",
     "agent": "agent.md",
     "cursor": "agent.md",
     "cli": "agent.md",
@@ -334,6 +336,7 @@ def build_tau_system_prompt(
 You have the following tools:
 - **send_message** — Send a Telegram message to the user
 - **send_voice** — Send a TTS voice message
+- **generate_video** — Generate a video from an image + prompt (WAN 2.2 I2V model). Requires an image (path/URL/base64) and a text prompt describing the desired motion.
 - **create_task** — Create a task for yourself to process later
 - **schedule_message** — Schedule a future message (--in '2h', --at '14:00', --cron '0 9 * * *')
 - **search_skills** — Search the creative AI skills catalog
@@ -549,6 +552,48 @@ def _register_tau_tools(tools) -> None:
             },
         },
         _handle_schedule_message,
+    )
+
+    # ------------------------------------------------------------------
+    # generate_video  (in-process: tau.tools.generate_video)
+    # ------------------------------------------------------------------
+    def _handle_generate_video(args: dict) -> ToolResult:
+        try:
+            from tau.tools.generate_video import send_video_message
+            from tau.telegram import get_chat_id
+            chat_id = get_chat_id()
+            if not chat_id:
+                return ToolResult(success=False, output="No chat ID found.")
+            prompt = args.get("prompt", "")
+            image = args.get("image", "")
+            if not prompt or not image:
+                return ToolResult(success=False, output="Both 'prompt' and 'image' are required.")
+            frames = args.get("frames", 81)
+            result = send_video_message(chat_id, prompt, image, frames=frames)
+            return ToolResult(success=True, output=result)
+        except Exception as e:
+            return ToolResult(success=False, output=str(e))
+
+    tools.register_tool(
+        "generate_video",
+        {
+            "name": "generate_video",
+            "description": (
+                "Generate a video from an image + text prompt using the WAN 2.2 I2V model. "
+                "Requires an image (file path, URL, or base64) and a prompt describing the desired motion/content. "
+                "Sends the generated video to the owner via Telegram."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "Text description of the desired video motion/content."},
+                    "image": {"type": "string", "description": "Image source — local file path, URL, or base64 string."},
+                    "frames": {"type": "integer", "description": "Number of frames to generate (default 81 ≈ 3.4s at 24fps)."},
+                },
+                "required": ["prompt", "image"],
+            },
+        },
+        _handle_generate_video,
     )
 
     # ------------------------------------------------------------------
