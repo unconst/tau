@@ -27,6 +27,7 @@ from src.core.compaction import (
     manage_context,
 )
 from src.llm.client import CostLimitExceeded, LLMError
+from src.llm.router import ModelRouter
 from src.output.jsonl import (
     ItemCompletedEvent,
     ItemStartedEvent,
@@ -163,6 +164,7 @@ def run_agent_loop(
     tools: "ToolRegistry",
     ctx: Any,
     config: Dict[str, Any],
+    system_prompt: str | None = None,
 ) -> None:
     """
     Run the main agent loop.
@@ -172,6 +174,9 @@ def run_agent_loop(
         tools: Tool registry with available tools
         ctx: Agent context with instruction, shell(), done()
         config: Configuration dictionary
+        system_prompt: Optional system prompt override. When provided, this
+            replaces the default system prompt entirely, eliminating the
+            need for monkey-patching ``get_system_prompt``.
     """
     # Reset item counter for fresh session
     reset_item_counter()
@@ -187,25 +192,27 @@ def run_agent_loop(
 
     # 3. Build initial messages
     cwd = Path(ctx.cwd)
-    system_prompt = get_system_prompt(cwd=cwd)
+    if system_prompt is None:
+        system_prompt = get_system_prompt(cwd=cwd)
 
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": ctx.instruction},
     ]
 
-    # 4. Get initial terminal state
-    _log("Getting initial state...")
-    initial_result = ctx.shell("pwd && ls -la")
+    # 4. Get initial terminal state (skip in chat mode to save tokens/latency)
     max_output_tokens = config.get("max_output_tokens", 2500)
-    initial_state = middle_out_truncate(initial_result.output, max_tokens=max_output_tokens)
+    if not config.get("skip_initial_state", False):
+        _log("Getting initial state...")
+        initial_result = ctx.shell("pwd && ls -la")
+        initial_state = middle_out_truncate(initial_result.output, max_tokens=max_output_tokens)
 
-    messages.append(
-        {
-            "role": "user",
-            "content": f"Current directory and files:\n```\n{initial_state}\n```",
-        }
-    )
+        messages.append(
+            {
+                "role": "user",
+                "content": f"Current directory and files:\n```\n{initial_state}\n```",
+            }
+        )
 
     # 5. Initialize tracking
     total_input_tokens = 0
@@ -213,9 +220,14 @@ def run_agent_loop(
     total_cached_tokens = 0
     pending_completion = False
     last_agent_message = ""
+    tool_call_count = 0
 
     max_iterations = config.get("max_iterations", 200)
     cache_enabled = config.get("cache_enabled", True)
+    use_streaming = config.get("streaming", True)
+
+    # Model router for dynamic model selection
+    router = ModelRouter()
 
     # 6. Main loop
     iteration = 0
@@ -248,22 +260,41 @@ def run_agent_loop(
             tool_specs = tools.get_tools_for_llm()
 
             # ================================================================
-            # Call LLM with retry logic
+            # Call LLM with retry logic + model routing
             # ================================================================
             max_retries = 5
             response = None
             last_error = None
 
+            # Select model tier via router
+            is_verification = pending_completion
+            tier = router.select(
+                messages=cached_messages,
+                iteration=iteration,
+                tool_count=tool_call_count,
+                is_verification=is_verification,
+            )
+
             for attempt in range(1, max_retries + 1):
                 try:
-                    response = llm.chat(
-                        cached_messages,
+                    call_kwargs = dict(
+                        messages=cached_messages,
                         tools=tool_specs,
-                        max_tokens=config.get("max_tokens", 16384),
+                        max_tokens=config.get("max_tokens", tier.max_tokens),
+                        model=tier.model,
                         extra_body={
-                            "reasoning": {"effort": config.get("reasoning_effort", "xhigh")},
+                            "reasoning": {"effort": config.get("reasoning_effort", tier.reasoning_effort)},
                         },
                     )
+
+                    # Use streaming if available and enabled
+                    if use_streaming and hasattr(llm, "chat_stream"):
+                        def _on_stream_text(delta: str) -> None:
+                            pass  # Future: emit streaming text events
+
+                        response = llm.chat_stream(**call_kwargs, on_text=_on_stream_text)
+                    else:
+                        response = llm.chat(**call_kwargs)
 
                     # Track token usage from response
                     if hasattr(response, "tokens") and response.tokens:
@@ -446,27 +477,36 @@ Proceed with verification now.
 
         messages.append(assistant_msg)
 
-        # Execute each tool call
-        for call in response.function_calls:
-            tool_name = call.name
-            tool_args = call.arguments if isinstance(call.arguments, dict) else {}
+        # Execute tool calls in parallel (batch)
+        tool_call_count += len(response.function_calls)
+        calls_list = response.function_calls
+        call_tuples = [
+            (call.name, call.arguments if isinstance(call.arguments, dict) else {})
+            for call in calls_list
+        ]
 
-            _log(f"Executing tool: {tool_name}")
-
-            # Emit item.started
+        # Emit item.started for all calls
+        call_item_ids = []
+        for call in calls_list:
             item_id = next_item_id()
+            call_item_ids.append(item_id)
+            _log(f"Executing tool: {call.name}")
             emit(
                 ItemStartedEvent(
                     item=make_command_execution_item(
                         item_id=item_id,
-                        command=f"{tool_name}({tool_args})",
+                        command=f"{call.name}({call.arguments})",
                         status="in_progress",
                     )
                 )
             )
 
-            # Execute tool
-            result = tools.execute(ctx, tool_name, tool_args)
+        # Parallel execution via ToolRegistry.execute_batch
+        results = tools.execute_batch(ctx, call_tuples)
+
+        # Process results in order
+        for call, result, item_id in zip(calls_list, results, call_item_ids):
+            tool_name = call.name
 
             # Truncate output using middle-out (keeps beginning and end)
             output = middle_out_truncate(result.output, max_tokens=max_output_tokens)
@@ -486,7 +526,6 @@ Proceed with verification now.
 
             # Handle image injection
             if result.inject_content:
-                # Add image to next user message
                 messages.append(
                     {
                         "role": "user",

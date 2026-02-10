@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from src.tools.subagent import SUBAGENT_SPEC
 from src.tools.web_search import WEB_SEARCH_SPEC
 
 # Shell command tool
@@ -230,6 +231,87 @@ Each step should be 5-7 words maximum.""",
     },
 }
 
+# String replace tool
+STR_REPLACE_SPEC: dict[str, Any] = {
+    "name": "str_replace",
+    "description": """Performs exact string replacement in a file.
+Use this for targeted edits — more reliable than apply_patch for single changes.
+The old_string must match the file content exactly (including whitespace and indentation).
+The edit will FAIL if old_string is not unique in the file unless replace_all is true.""",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "file_path": {
+                "type": "string",
+                "description": "Path to the file to modify",
+            },
+            "old_string": {
+                "type": "string",
+                "description": "The exact text to find and replace (must match file content exactly)",
+            },
+            "new_string": {
+                "type": "string",
+                "description": "The replacement text",
+            },
+            "replace_all": {
+                "type": "boolean",
+                "description": "If true, replace all occurrences. Default false (requires unique match).",
+            },
+        },
+        "required": ["file_path", "old_string", "new_string"],
+    },
+}
+
+# Glob files tool
+GLOB_FILES_SPEC: dict[str, Any] = {
+    "name": "glob_files",
+    "description": """Find files matching a glob pattern.
+Returns matching file paths sorted by modification time (most recent first).
+Patterns not starting with '**/' are automatically prepended with '**/' for recursive search.
+Examples: '*.py', '*.{ts,tsx}', 'test_*.py', '**/components/**/*.tsx'""",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "description": "Glob pattern to match files (e.g. '*.py', '*.{ts,tsx}')",
+            },
+            "path": {
+                "type": "string",
+                "description": "Directory to search in (defaults to working directory)",
+            },
+            "limit": {
+                "type": "number",
+                "description": "Maximum number of files to return (default: 100)",
+            },
+        },
+        "required": ["pattern"],
+    },
+}
+
+# Lint tool
+LINT_SPEC: dict[str, Any] = {
+    "name": "lint",
+    "description": """Run linter on specified files and return diagnostics.
+Auto-detects the linter (ruff for Python, eslint for JS/TS) or you can specify one.
+Use after editing files to check for errors you may have introduced.""",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "files": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "List of file paths to lint",
+            },
+            "linter": {
+                "type": "string",
+                "description": "Linter to use (auto-detected if not specified). Options: ruff, eslint, flake8",
+            },
+        },
+        "required": ["files"],
+    },
+}
+
 # All tool specs
 TOOL_SPECS: dict[str, dict[str, Any]] = {
     "shell_command": SHELL_COMMAND_SPEC,
@@ -241,6 +323,10 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
     "view_image": VIEW_IMAGE_SPEC,
     "update_plan": UPDATE_PLAN_SPEC,
     "web_search": WEB_SEARCH_SPEC,
+    "spawn_subagent": SUBAGENT_SPEC,
+    "str_replace": STR_REPLACE_SPEC,
+    "glob_files": GLOB_FILES_SPEC,
+    "lint": LINT_SPEC,
 }
 
 

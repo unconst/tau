@@ -189,6 +189,14 @@ class ToolRegistry:
                 result = self._execute_update_plan(arguments)
             elif name == "web_search":
                 result = self._execute_web_search(arguments)
+            elif name == "spawn_subagent":
+                result = self._execute_subagent(ctx, cwd, arguments)
+            elif name == "str_replace":
+                result = self._execute_str_replace(cwd, arguments)
+            elif name == "glob_files":
+                result = self._execute_glob_files(cwd, arguments)
+            elif name == "lint":
+                result = self._execute_lint(cwd, arguments)
             else:
                 result = ToolResult.fail(f"Unknown tool: {name}")
 
@@ -491,6 +499,201 @@ class ToolRegistry:
         """Execute a web search."""
         from src.tools.web_search import web_search
         return web_search(args)
+
+    # -------------------------------------------------------------------------
+    # Subagent execution
+    # -------------------------------------------------------------------------
+
+    def _execute_subagent(
+        self,
+        ctx: "AgentContext",
+        cwd: Path,
+        args: dict[str, Any],
+    ) -> ToolResult:
+        """Spawn a subagent for task delegation."""
+        task = args.get("task", "")
+        subagent_type = args.get("type", "explore")
+        sub_cwd = args.get("cwd", str(cwd))
+
+        if not task:
+            return ToolResult.fail("No task provided for subagent")
+
+        if subagent_type not in ("explore", "execute"):
+            return ToolResult.fail(f"Invalid subagent type: {subagent_type}. Use 'explore' or 'execute'.")
+
+        from src.tools.subagent import run_subagent
+
+        return run_subagent(
+            task=task,
+            subagent_type=subagent_type,
+            cwd=sub_cwd,
+        )
+
+    # -------------------------------------------------------------------------
+    # str_replace execution
+    # -------------------------------------------------------------------------
+
+    def _execute_str_replace(self, cwd: Path, args: dict[str, Any]) -> ToolResult:
+        """Targeted find-and-replace in a file."""
+        file_path = args.get("file_path", "")
+        old_string = args.get("old_string", "")
+        new_string = args.get("new_string", "")
+        replace_all = args.get("replace_all", False)
+
+        if not file_path:
+            return ToolResult.fail("No file_path provided")
+        if not old_string:
+            return ToolResult.fail("No old_string provided")
+
+        path = Path(file_path)
+        if not path.is_absolute():
+            path = cwd / path
+
+        if not path.exists():
+            return ToolResult.fail(f"File not found: {path}")
+
+        try:
+            content = path.read_text(encoding="utf-8")
+        except Exception as e:
+            return ToolResult.fail(f"Failed to read file: {e}")
+
+        count = content.count(old_string)
+        if count == 0:
+            return ToolResult.fail(
+                f"old_string not found in {file_path}. Make sure it matches the file content exactly."
+            )
+
+        if count > 1 and not replace_all:
+            return ToolResult.fail(
+                f"old_string found {count} times in {file_path}. "
+                f"Provide more context to make it unique, or set replace_all=true."
+            )
+
+        if replace_all:
+            new_content = content.replace(old_string, new_string)
+            replaced = count
+        else:
+            new_content = content.replace(old_string, new_string, 1)
+            replaced = 1
+
+        try:
+            path.write_text(new_content, encoding="utf-8")
+        except Exception as e:
+            return ToolResult.fail(f"Failed to write file: {e}")
+
+        return ToolResult.ok(
+            f"Replaced {replaced} occurrence(s) in {file_path}"
+        )
+
+    # -------------------------------------------------------------------------
+    # glob_files execution
+    # -------------------------------------------------------------------------
+
+    def _execute_glob_files(self, cwd: Path, args: dict[str, Any]) -> ToolResult:
+        """Find files matching a glob pattern."""
+        pattern = args.get("pattern", "")
+        path = args.get("path", ".")
+        limit = args.get("limit", 100)
+
+        if not pattern:
+            return ToolResult.fail("No pattern provided")
+
+        search_path = Path(path)
+        if not search_path.is_absolute():
+            search_path = cwd / search_path
+
+        if not search_path.exists():
+            return ToolResult.fail(f"Path not found: {search_path}")
+
+        try:
+            # Prepend **/ if the pattern doesn't start with it (for recursive search)
+            effective_pattern = pattern
+            if not pattern.startswith("**/"):
+                effective_pattern = f"**/{pattern}"
+
+            matches = sorted(
+                search_path.glob(effective_pattern),
+                key=lambda p: p.stat().st_mtime if p.exists() else 0,
+                reverse=True,
+            )
+
+            # Filter to files only
+            files = [str(m.relative_to(search_path)) for m in matches if m.is_file()]
+
+            if not files:
+                return ToolResult.ok("No files matched the pattern.")
+
+            output = "\n".join(files[:limit])
+            if len(files) > limit:
+                output += f"\n\n[... {len(files) - limit} more files ...]"
+
+            return ToolResult.ok(output)
+
+        except Exception as e:
+            return ToolResult.fail(f"Glob search failed: {e}")
+
+    # -------------------------------------------------------------------------
+    # lint execution
+    # -------------------------------------------------------------------------
+
+    def _execute_lint(self, cwd: Path, args: dict[str, Any]) -> ToolResult:
+        """Run linter on specified files and return diagnostics."""
+        files = args.get("files", [])
+        linter = args.get("linter")  # auto-detect if not specified
+
+        if not files:
+            return ToolResult.fail("No files provided. Pass a list of file paths to lint.")
+
+        # Auto-detect linter if not specified
+        if not linter:
+            if (cwd / "pyproject.toml").exists() or (cwd / "ruff.toml").exists():
+                linter = "ruff"
+            elif (cwd / ".eslintrc.json").exists() or (cwd / "eslint.config.js").exists():
+                linter = "eslint"
+            elif (cwd / "setup.cfg").exists() or (cwd / ".flake8").exists():
+                linter = "flake8"
+            else:
+                # Default to ruff for Python, eslint for JS/TS
+                ext = Path(files[0]).suffix if files else ""
+                if ext in (".py",):
+                    linter = "ruff"
+                elif ext in (".js", ".ts", ".jsx", ".tsx"):
+                    linter = "eslint"
+                else:
+                    linter = "ruff"  # fallback
+
+        file_args = " ".join(f'"{f}"' for f in files)
+
+        if linter == "ruff":
+            cmd = f"ruff check --output-format=text {file_args}"
+        elif linter == "eslint":
+            cmd = f"npx eslint --format=compact {file_args}"
+        elif linter == "flake8":
+            cmd = f"flake8 {file_args}"
+        else:
+            cmd = f"{linter} {file_args}"
+
+        try:
+            result = subprocess.run(
+                ["sh", "-c", cmd],
+                cwd=str(cwd),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            output = result.stdout.strip()
+            if result.stderr.strip():
+                output += f"\n{result.stderr.strip()}"
+
+            if not output:
+                return ToolResult.ok("No linter errors found.")
+
+            return ToolResult.ok(output)
+
+        except subprocess.TimeoutExpired:
+            return ToolResult.fail("Lint timed out after 60s")
+        except Exception as e:
+            return ToolResult.fail(f"Lint failed: {e}")
 
     # -------------------------------------------------------------------------
     # Caching methods

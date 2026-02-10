@@ -1,11 +1,16 @@
-"""LLM Client using httpx for Chutes API (OpenAI-compatible)."""
+"""LLM Client using httpx for Chutes API (OpenAI-compatible).
+
+Supports both blocking and streaming modes.  The streaming path
+(``chat_stream``) yields ``StreamChunk`` objects as SSE events arrive,
+enabling real-time text output and early tool-call dispatch.
+"""
 
 from __future__ import annotations
 
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, Generator, List, Optional
 
 import httpx
 
@@ -70,8 +75,28 @@ class LLMResponse:
         return len(self.function_calls) > 0
 
 
+@dataclass
+class StreamChunk:
+    """A single chunk from a streaming LLM response.
+
+    Exactly one of the content fields will be non-None per chunk.
+    """
+
+    # Text delta (partial assistant message)
+    text_delta: Optional[str] = None
+    # A fully-parsed tool call (emitted once arguments JSON is complete)
+    tool_call: Optional[FunctionCall] = None
+    # Token usage (emitted with the final chunk)
+    tokens: Optional[Dict[str, int]] = None
+    # Finish reason (emitted with the final chunk)
+    finish_reason: Optional[str] = None
+
+
 class LLMClient:
-    """LLM Client using httpx for Chutes API (OpenAI-compatible format)."""
+    """LLM Client using httpx for Chutes API (OpenAI-compatible format).
+
+    Supports both blocking (``chat``) and streaming (``chat_stream``) modes.
+    """
 
     # Default Chutes API configuration
     DEFAULT_BASE_URL = "https://llm.chutes.ai/v1"
@@ -281,6 +306,185 @@ class LLMClient:
                         )
                     )
 
+        return result
+
+    # -----------------------------------------------------------------
+    # Streaming API
+    # -----------------------------------------------------------------
+
+    def chat_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        max_tokens: Optional[int] = None,
+        extra_body: Optional[Dict[str, Any]] = None,
+        model: Optional[str] = None,
+        on_text: Optional[Callable[[str], None]] = None,
+        on_tool_call: Optional[Callable[[FunctionCall], None]] = None,
+    ) -> LLMResponse:
+        """Stream a chat response via SSE, returning the assembled result.
+
+        This is the preferred method for interactive use.  Text deltas are
+        emitted via callbacks as they arrive and complete tool calls are
+        dispatched as soon as their argument JSON is fully received.
+
+        Args:
+            messages: Conversation messages.
+            tools: Tool specifications (OpenAI format).
+            max_tokens: Max output tokens.
+            extra_body: Extra payload keys (e.g. reasoning effort).
+            model: Model override.
+            on_text: Callback fired for each text delta.
+            on_tool_call: Callback fired when a tool call is complete.
+
+        Returns:
+            The fully-assembled LLMResponse (same shape as ``chat``).
+        """
+        if self._total_cost >= self.cost_limit:
+            raise CostLimitExceeded(
+                f"Cost limit exceeded: ${self._total_cost:.4f} >= ${self.cost_limit:.4f}",
+                used=self._total_cost,
+                limit=self.cost_limit,
+            )
+
+        payload: Dict[str, Any] = {
+            "model": model or self.model,
+            "messages": self._prepare_messages(messages),
+            "max_tokens": max_tokens or self.max_tokens,
+            "stream": True,
+        }
+
+        if self._supports_temperature(payload["model"]) and self.temperature is not None:
+            payload["temperature"] = self.temperature
+
+        if tools:
+            payload["tools"] = self._build_tools(tools)
+            payload["tool_choice"] = "auto"
+
+        if extra_body:
+            payload.update(extra_body)
+
+        # Accumulators for incremental parsing
+        text_parts: List[str] = []
+        # tool_call index -> {id, name, arguments_parts}
+        tc_accum: Dict[int, Dict[str, Any]] = {}
+        finish_reason = ""
+        usage: Dict[str, Any] = {}
+
+        try:
+            with self._client.stream("POST", "/chat/completions", json=payload) as resp:
+                self._request_count += 1
+                if resp.status_code != 200:
+                    # Read full body for error
+                    body_bytes = resp.read()
+                    error_body = body_bytes.decode("utf-8", errors="replace")
+                    try:
+                        error_json = json.loads(error_body)
+                        error_msg = error_json.get("error", {}).get("message", error_body)
+                    except (json.JSONDecodeError, KeyError):
+                        error_msg = error_body
+                    if resp.status_code == 401:
+                        raise LLMError(error_msg, code="authentication_error")
+                    elif resp.status_code == 429:
+                        raise LLMError(error_msg, code="rate_limit")
+                    elif resp.status_code >= 500:
+                        raise LLMError(error_msg, code="server_error")
+                    else:
+                        raise LLMError(f"HTTP {resp.status_code}: {error_msg}", code="api_error")
+
+                for raw_line in resp.iter_lines():
+                    line = raw_line.strip()
+                    if not line or not line.startswith("data: "):
+                        continue
+                    data_str = line[6:]
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    # Extract usage if present (some providers send it on the last chunk)
+                    if "usage" in chunk and chunk["usage"]:
+                        usage = chunk["usage"]
+
+                    choices = chunk.get("choices", [])
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta", {})
+                    fr = choices[0].get("finish_reason")
+                    if fr:
+                        finish_reason = fr
+
+                    # --- Text delta ---
+                    content = delta.get("content")
+                    if content:
+                        text_parts.append(content)
+                        if on_text:
+                            on_text(content)
+
+                    # --- Tool call deltas ---
+                    tc_deltas = delta.get("tool_calls", [])
+                    for tcd in tc_deltas:
+                        idx = tcd.get("index", 0)
+                        if idx not in tc_accum:
+                            tc_accum[idx] = {
+                                "id": tcd.get("id", ""),
+                                "name": tcd.get("function", {}).get("name", ""),
+                                "arguments_parts": [],
+                            }
+                        acc = tc_accum[idx]
+                        # Update id/name if provided (first chunk)
+                        if tcd.get("id"):
+                            acc["id"] = tcd["id"]
+                        fn = tcd.get("function", {})
+                        if fn.get("name"):
+                            acc["name"] = fn["name"]
+                        if fn.get("arguments"):
+                            acc["arguments_parts"].append(fn["arguments"])
+
+        except httpx.TimeoutException as e:
+            raise LLMError(f"Request timed out: {e}", code="timeout")
+        except httpx.ConnectError as e:
+            raise LLMError(f"Connection error: {e}", code="connection_error")
+        except httpx.HTTPError as e:
+            raise LLMError(f"HTTP error: {e}", code="api_error")
+
+        # --- Assemble final LLMResponse ---
+        result = LLMResponse()
+        result.text = "".join(text_parts)
+        result.finish_reason = finish_reason
+
+        # Parse accumulated tool calls
+        for idx in sorted(tc_accum.keys()):
+            acc = tc_accum[idx]
+            args_str = "".join(acc["arguments_parts"])
+            try:
+                args = json.loads(args_str) if args_str else {}
+            except json.JSONDecodeError:
+                args = {"raw": args_str}
+            fc = FunctionCall(id=acc["id"], name=acc["name"], arguments=args)
+            result.function_calls.append(fc)
+            if on_tool_call:
+                on_tool_call(fc)
+
+        # Track tokens
+        if usage:
+            input_tokens = usage.get("prompt_tokens", 0) or 0
+            output_tokens = usage.get("completion_tokens", 0) or 0
+            cached_tokens = 0
+            prompt_details = usage.get("prompt_tokens_details", {})
+            if prompt_details:
+                cached_tokens = prompt_details.get("cached_tokens", 0) or 0
+            self._input_tokens += input_tokens
+            self._output_tokens += output_tokens
+            self._cached_tokens += cached_tokens
+            self._total_tokens += input_tokens + output_tokens
+            result.tokens = {"input": input_tokens, "output": output_tokens, "cached": cached_tokens}
+            cost = (input_tokens * 3.0 / 1_000_000) + (output_tokens * 15.0 / 1_000_000)
+            self._total_cost += cost
+
+        result.model = model or self.model
         return result
 
     def _prepare_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

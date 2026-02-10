@@ -1,14 +1,87 @@
-"""Session management for SuperAgent."""
+"""Session management for SuperAgent.
+
+Defines the ``AgentContext`` protocol that callers must implement,
+and the ``Session`` class that tracks conversation state.
+"""
 
 from __future__ import annotations
 
+import subprocess
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Protocol, runtime_checkable
 
 from src.config.models import AgentConfig
+
+
+# =============================================================================
+# AgentContext Protocol
+# =============================================================================
+
+
+class ShellResult:
+    """Result from a shell command execution."""
+
+    __slots__ = ("output", "exit_code", "stdout", "stderr")
+
+    def __init__(
+        self,
+        output: str,
+        exit_code: int,
+        stdout: str = "",
+        stderr: str = "",
+    ):
+        self.output = output
+        self.exit_code = exit_code
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+@runtime_checkable
+class AgentContext(Protocol):
+    """Protocol that callers must implement to drive the agent loop.
+
+    Any object that has these attributes/methods can be passed to
+    ``run_agent_loop()`` without duck-typing hacks.
+    """
+
+    instruction: str
+    cwd: str
+    is_done: bool
+
+    def shell(self, cmd: str, timeout: int = 120) -> ShellResult: ...
+
+    def done(self) -> None: ...
+
+
+class SimpleAgentContext:
+    """Concrete implementation of AgentContext for standalone use.
+
+    Replaces the ad-hoc ``_Ctx`` classes that were previously duplicated
+    in multiple places.
+    """
+
+    def __init__(self, instruction: str, cwd: str | None = None):
+        self.instruction = instruction
+        self.cwd = cwd or str(Path.cwd())
+        self.is_done = False
+
+    def shell(self, cmd: str, timeout: int = 120) -> ShellResult:
+        r = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True,
+            timeout=timeout, cwd=self.cwd,
+        )
+        return ShellResult(
+            output=r.stdout + r.stderr,
+            exit_code=r.returncode,
+            stdout=r.stdout,
+            stderr=r.stderr,
+        )
+
+    def done(self) -> None:
+        self.is_done = True
 
 
 @dataclass

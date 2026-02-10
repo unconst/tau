@@ -79,13 +79,31 @@ def _make_llm_client(model: str, timeout: float = 300.0):
     )
 
 
-def _make_config(readonly: bool = False) -> Dict[str, Any]:
+def _make_config(readonly: bool = False, chat_mode: bool = False) -> Dict[str, Any]:
     """Build the config dict consumed by ``run_agent_loop``.
 
     Only keys actually read by ``loop.py`` are included here.
     Context-management constants (model_context_limit, prune thresholds,
     etc.) live in ``agent/src/core/compaction.py`` as module-level defaults.
+
+    When *chat_mode* is True, the config is tuned for conversational
+    Telegram messages: fewer iterations, skip filesystem state injection,
+    and streaming enabled.
     """
+    if chat_mode:
+        return {
+            "model": AGENT_MODEL,
+            "provider": "chutes",
+            "reasoning_effort": "none",
+            "max_tokens": 16384,
+            "temperature": 0.0,
+            "max_iterations": 30,
+            "max_output_tokens": 2500,
+            "shell_timeout": 60,
+            "cache_enabled": True,
+            "skip_initial_state": True,
+            "streaming": True,
+        }
     return {
         "model": AGENT_MODEL,
         "provider": "chutes",
@@ -97,6 +115,190 @@ def _make_config(readonly: bool = False) -> Dict[str, Any]:
         "shell_timeout": 60,
         "cache_enabled": True,
     }
+
+
+# ---------------------------------------------------------------------------
+# Skill loader — keyword-match skill files from context/skills/
+# ---------------------------------------------------------------------------
+
+# Keyword → skill file mapping (ported from .cursor/rules/context-system.mdc)
+_SKILL_KEYWORDS: Dict[str, str] = {
+    "lium": "lium-skills.md",
+    "gpu": "lium-skills.md",
+    "rent": "lium-skills.md",
+    "instance": "lium-skills.md",
+    "eve": "eve-skills.md",
+    "creative": "eve-skills.md",
+    "art": "eve-skills.md",
+    "image": "eve-skills.md",
+    "agent": "agent.md",
+    "cursor": "agent.md",
+    "cli": "agent.md",
+    "basilica": "basilica.md",
+    "targon": "targon.md",
+    "remind": "self-scheduling.md",
+    "reminder": "self-scheduling.md",
+    "schedule": "self-scheduling.md",
+    "cron": "self-scheduling.md",
+    "later": "self-scheduling.md",
+    "task": "self-scheduling.md",
+    "self-message": "self-scheduling.md",
+    "follow-up": "self-scheduling.md",
+    "checkpoint": "self-scheduling.md",
+    "defer": "self-scheduling.md",
+}
+
+
+def _load_skills_for_message(message: str) -> str:
+    """Return concatenated skill file contents matching keywords in *message*.
+
+    Uses the same keyword-to-skill mapping as ``.cursor/rules/context-system.mdc``
+    but works at runtime (outside of Cursor IDE).
+    """
+    skills_dir = os.path.join(WORKSPACE, "context", "skills")
+    if not os.path.isdir(skills_dir):
+        return ""
+
+    message_lower = message.lower()
+    matched_files: set[str] = set()
+
+    for keyword, filename in _SKILL_KEYWORDS.items():
+        if keyword in message_lower:
+            matched_files.add(filename)
+
+    if not matched_files:
+        return ""
+
+    parts: list[str] = []
+    for filename in sorted(matched_files):
+        filepath = os.path.join(skills_dir, filename)
+        if os.path.isfile(filepath):
+            try:
+                content = Path(filepath).read_text(encoding="utf-8").strip()
+                if content:
+                    parts.append(f"## Skill: {filename}\n\n{content}")
+            except Exception:
+                pass
+
+    return "\n\n---\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Tau system prompt builder
+# ---------------------------------------------------------------------------
+
+def _read_context_file(relative_path: str, max_lines: int | None = None) -> str:
+    """Read a file relative to the workspace root, returning '' on error."""
+    filepath = os.path.join(WORKSPACE, relative_path)
+    try:
+        text = Path(filepath).read_text(encoding="utf-8").strip()
+        if max_lines is not None:
+            lines = text.split("\n")
+            text = "\n".join(lines[-max_lines:])
+        return text
+    except Exception:
+        return ""
+
+
+def build_tau_system_prompt(
+    chat_id: int | str | None = None,
+    user_message: str = "",
+    chat_lines: int = 50,
+) -> str:
+    """Build a Tau-aware system prompt for conversational Telegram use.
+
+    Loads identity, chat summary, recent chat history, core memory,
+    and any skills matched by the user's message.
+
+    Args:
+        chat_id: Telegram chat ID (for per-chat history). None uses default.
+        user_message: The user's raw message text (for skill matching).
+        chat_lines: How many lines of recent chat to include.
+
+    Returns:
+        Complete system prompt string.
+    """
+    # --- Identity ---
+    identity = _read_context_file("context/IDENTITY.md")
+
+    # --- Chat summary (hourly auto-updated) ---
+    chat_summary = _read_context_file("context/CHAT_SUMMARY.md")
+
+    # --- Recent chat history ---
+    recent_chat = ""
+    try:
+        from tau.telegram import get_chat_history
+        if chat_id is not None:
+            recent_chat = get_chat_history(chat_id=chat_id, max_lines=chat_lines)
+        else:
+            recent_chat = get_chat_history(max_lines=chat_lines)
+    except Exception:
+        pass
+
+    # --- Core memory ---
+    core_memory = _read_context_file("context/memory/CORE_MEMORY.md", max_lines=30)
+
+    # --- Mid-term memory ---
+    mid_term = _read_context_file("context/memory/MID_TERM.md", max_lines=20)
+
+    # --- Skills (keyword-matched) ---
+    skills_section = _load_skills_for_message(user_message) if user_message else ""
+
+    # --- Assemble ---
+    parts: list[str] = []
+
+    parts.append(
+        "You are Tau, an autonomous AI assistant running as a Telegram bot.\n"
+        "You are NOT a generic LLM. You are Tau — a specific agent with persistent "
+        "state, memory, skills, and the ability to take real actions."
+    )
+
+    if identity:
+        parts.append(identity)
+
+    if chat_summary:
+        parts.append(f"# Conversation Summary (auto-updated hourly)\n\n{chat_summary}")
+
+    if core_memory:
+        parts.append(f"# Core Memory (persistent facts)\n\n{core_memory}")
+
+    if mid_term:
+        parts.append(f"# Mid-Term Memory (recent weeks)\n\n{mid_term}")
+
+    if recent_chat:
+        parts.append(f"# Recent Chat History\n\n{recent_chat}")
+
+    if skills_section:
+        parts.append(f"# Relevant Skills\n\n{skills_section}")
+
+    parts.append("""# Tools Available
+
+You have the following tools:
+- **send_message** — Send a Telegram message to the user
+- **send_voice** — Send a TTS voice message
+- **create_task** — Create a task for yourself to process later
+- **schedule_message** — Schedule a future message (--in '2h', --at '14:00', --cron '0 9 * * *')
+- **search_skills** — Search the creative AI skills catalog
+- **commands** — Execute any bot command (task, plan, status, adapt, cron, etc.)
+- **shell_command** — Run shell commands
+- **read_file** / **write_file** / **apply_patch** — File operations
+- **grep_files** / **glob_files** / **list_dir** — Search and explore files
+- **web_search** — Search the web for information
+
+# Guidelines
+
+- Answer directly, be concise. No preamble, no filler.
+- For simple questions (factual, conversational), just answer — don't run shell commands unnecessarily.
+- When the user asks for actions (reminders, tasks, searches, code changes), use the appropriate tools.
+- For coding tasks, use your full file editing capability.
+- Do NOT say "Is there anything else..." or similar closing phrases.
+- Do NOT explain your thinking process in the response.
+- Strip any <think>...</think> blocks from your output.
+- If asked "what are you?" or "who are you?", say you are Tau.
+- Never identify as Composer, Cursor, ChatGPT, Claude, or any other AI system.
+- When asked what you can do, explain conversationally — no command syntax, just natural examples.""")
+
+    return "\n\n---\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +512,7 @@ def run_baseagent(
     """
     _ensure_agent_on_path()
     from src.core.loop import run_agent_loop  # type: ignore[import-untyped]
+    from src.core.session import SimpleAgentContext  # type: ignore[import-untyped]
     from src.llm.client import LLMClient  # type: ignore[import-untyped]
     from src.tools.registry import ToolRegistry  # type: ignore[import-untyped]
     from src.output.jsonl import set_event_callback  # type: ignore[import-untyped]
@@ -329,41 +532,8 @@ def run_baseagent(
     if not readonly:
         _register_tau_tools(tools)
 
-    # Minimal AgentContext (duck-typed for run_agent_loop)
-    class _Ctx:
-        def __init__(self):
-            self.instruction = prompt
-            self.cwd = effective_cwd
-            self.is_done = False
-            self._start = time.time()
-
-        @property
-        def elapsed_secs(self):
-            return time.time() - self._start
-
-        def shell(self, cmd, timeout=120):
-            r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                               timeout=timeout, cwd=self.cwd)
-            class _R:
-                def __init__(self, out, rc, stdout="", stderr=""):
-                    self.output = out
-                    self.exit_code = rc
-                    self.stdout = stdout
-                    self.stderr = stderr
-            return _R(r.stdout + r.stderr, r.returncode, r.stdout, r.stderr)
-
-        def done(self):
-            self.is_done = True
-
-    ctx = _Ctx()
-
-    # If a custom system prompt was given, monkey-patch get_system_prompt
-    # in the loop's import namespace so it uses ours.
-    _orig_get_system_prompt = None
-    if system_prompt_override:
-        import src.core.loop as _loop_mod  # type: ignore[import-untyped]
-        _orig_get_system_prompt = _loop_mod.get_system_prompt
-        _loop_mod.get_system_prompt = lambda cwd=None, shell=None, **kw: system_prompt_override
+    # Use the proper AgentContext from the agent package
+    ctx = SimpleAgentContext(instruction=prompt, cwd=effective_cwd)
 
     # Capture the last agent message from events
     captured_messages: list[str] = []
@@ -377,15 +547,18 @@ def run_baseagent(
     set_event_callback(_capture)
 
     try:
-        run_agent_loop(llm=llm, tools=tools, ctx=ctx, config=config)
+        run_agent_loop(
+            llm=llm,
+            tools=tools,
+            ctx=ctx,
+            config=config,
+            system_prompt=system_prompt_override,
+        )
     except Exception as e:
         return f"Error: {e}"
     finally:
         set_event_callback(None)
         llm.close()
-        if _orig_get_system_prompt is not None:
-            import src.core.loop as _loop_mod  # type: ignore[import-untyped]
-            _loop_mod.get_system_prompt = _orig_get_system_prompt
 
     final = captured_messages[-1] if captured_messages else ""
     return strip_think_tags(final)
@@ -404,11 +577,15 @@ def run_baseagent_streaming(
     system_prompt_override: str | None = None,
     event_queue: queue.Queue | None = None,
     timeout_seconds: int = 3600,
+    chat_mode: bool = False,
 ) -> threading.Thread:
     """Run the baseagent loop in a background thread.
 
     JSONL event dicts are pushed to *event_queue*.  A ``None`` sentinel is
     pushed when the loop finishes.  Returns the started ``Thread``.
+
+    When *chat_mode* is True, the config is tuned for conversational
+    Telegram messages (fewer iterations, no initial filesystem state).
     """
     if event_queue is None:
         raise ValueError("event_queue is required")
@@ -417,13 +594,14 @@ def run_baseagent_streaming(
 
     def _worker():
         from src.core.loop import run_agent_loop  # type: ignore[import-untyped]
+        from src.core.session import SimpleAgentContext  # type: ignore[import-untyped]
         from src.llm.client import LLMClient  # type: ignore[import-untyped]
         from src.tools.registry import ToolRegistry  # type: ignore[import-untyped]
         from src.output.jsonl import set_event_callback  # type: ignore[import-untyped]
 
         effective_model = model or (CHAT_MODEL if readonly else AGENT_MODEL)
         effective_cwd = cwd or WORKSPACE
-        config = _make_config(readonly=readonly)
+        config = _make_config(readonly=readonly, chat_mode=chat_mode)
 
         llm = LLMClient(
             model=effective_model,
@@ -436,39 +614,7 @@ def run_baseagent_streaming(
         if not readonly:
             _register_tau_tools(tools)
 
-        class _Ctx:
-            def __init__(self):
-                self.instruction = prompt
-                self.cwd = effective_cwd
-                self.is_done = False
-                self._start = time.time()
-
-            @property
-            def elapsed_secs(self):
-                return time.time() - self._start
-
-            def shell(self, cmd, timeout=120):
-                r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                                   timeout=timeout, cwd=self.cwd)
-                class _R:
-                    def __init__(self, out, rc, stdout="", stderr=""):
-                        self.output = out
-                        self.exit_code = rc
-                        self.stdout = stdout
-                        self.stderr = stderr
-                return _R(r.stdout + r.stderr, r.returncode, r.stdout, r.stderr)
-
-            def done(self):
-                self.is_done = True
-
-        ctx = _Ctx()
-
-        # Monkey-patch system prompt if override given
-        _orig = None
-        if system_prompt_override:
-            import src.core.loop as _lm  # type: ignore[import-untyped]
-            _orig = _lm.get_system_prompt
-            _lm.get_system_prompt = lambda cwd=None, shell=None, **kw: system_prompt_override
+        ctx = SimpleAgentContext(instruction=prompt, cwd=effective_cwd)
 
         def _emit_to_queue(event_dict):
             event_queue.put(event_dict)
@@ -476,15 +622,18 @@ def run_baseagent_streaming(
         set_event_callback(_emit_to_queue)
 
         try:
-            run_agent_loop(llm=llm, tools=tools, ctx=ctx, config=config)
+            run_agent_loop(
+                llm=llm,
+                tools=tools,
+                ctx=ctx,
+                config=config,
+                system_prompt=system_prompt_override,
+            )
         except Exception as e:
             event_queue.put({"type": "error", "message": str(e)})
         finally:
             set_event_callback(None)
             llm.close()
-            if _orig is not None:
-                import src.core.loop as _lm  # type: ignore[import-untyped]
-                _lm.get_system_prompt = _orig
             event_queue.put(None)  # sentinel
 
     t = threading.Thread(target=_worker, daemon=True, name="BaseAgentWorker")

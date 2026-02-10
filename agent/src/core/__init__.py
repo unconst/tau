@@ -8,9 +8,11 @@ from src.core.compaction import (
     PRUNE_MARKER,
     PRUNE_MINIMUM,
     PRUNE_PROTECT,
+    WorkingSet,
     estimate_message_tokens,
     estimate_tokens,
     estimate_total_tokens,
+    get_working_set,
     is_overflow,
     manage_context,
     needs_compaction,
@@ -27,6 +29,9 @@ from src.core.executor import (
 # Import run_agent_loop
 from src.core.loop import run_agent_loop
 
+# Session management
+from src.core.session import AgentContext, Session, ShellResult, SimpleAgentContext, TokenUsage
+
 __all__ = [
     # Executor
     "AgentExecutor",
@@ -35,6 +40,8 @@ __all__ = [
     "SandboxPolicy",
     # Compaction
     "manage_context",
+    "WorkingSet",
+    "get_working_set",
     "estimate_tokens",
     "estimate_message_tokens",
     "estimate_total_tokens",
@@ -50,4 +57,10 @@ __all__ = [
     "PRUNE_MARKER",
     # Loop
     "run_agent_loop",
+    # Session
+    "AgentContext",
+    "SimpleAgentContext",
+    "ShellResult",
+    "Session",
+    "TokenUsage",
 ]

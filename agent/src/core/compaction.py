@@ -2,18 +2,23 @@
 Context compaction system for SuperAgent.
 
 Implements intelligent context management:
-1. Token-based overflow detection
-2. Tool output pruning (clear old outputs, keep recent)
-3. AI-powered conversation compaction (summarization)
+1. Token-based overflow detection (tiktoken when available)
+2. Relevance-aware tool output pruning
+3. Working-set protection (files the agent is actively editing)
+4. Smart output compression (keep errors, trim listings)
+5. AI-powered conversation compaction (summarization)
 
 This replaces naive sliding window truncation which breaks cache.
 """
 
 from __future__ import annotations
 
+import re
 import sys
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
+
+from src.utils.tokens import estimate_tokens
 
 if TYPE_CHECKING:
     from src.llm.client import LLMClient
@@ -21,9 +26,6 @@ if TYPE_CHECKING:
 # =============================================================================
 # Constants (matching OpenCode)
 # =============================================================================
-
-# Token estimation
-APPROX_CHARS_PER_TOKEN = 4
 
 # Context limits
 MODEL_CONTEXT_LIMIT = 200_000  # Claude Opus 4.5 context window
@@ -34,6 +36,21 @@ AUTO_COMPACT_THRESHOLD = 0.85  # Trigger compaction at 85% of usable context
 PRUNE_PROTECT = 40_000  # Protect this many tokens of recent tool output
 PRUNE_MINIMUM = 20_000  # Only prune if we can recover at least this many tokens
 PRUNE_MARKER = "[Old tool result content cleared]"
+
+# Relevance scores for tool output types (higher = more important to keep)
+RELEVANCE_SCORES: Dict[str, float] = {
+    "error": 1.0,           # Always keep errors
+    "write_file": 0.9,      # File modification results
+    "apply_patch": 0.9,     # Patch results
+    "str_replace": 0.9,     # Edit results
+    "shell_command": 0.7,   # Command output (depends on content)
+    "grep_files": 0.5,      # Search results
+    "read_file": 0.4,       # File contents (can re-read)
+    "list_dir": 0.3,        # Directory listings (least important)
+    "glob_files": 0.3,      # File listings
+    "web_search": 0.6,      # Web results
+    "spawn_subagent": 0.8,  # Subagent results
+}
 
 # Compaction prompts
 COMPACTION_PROMPT = """You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
@@ -60,16 +77,10 @@ Here is the summary from the previous context:
 # =============================================================================
 
 
-def estimate_tokens(text: str) -> int:
-    """Estimate tokens from text length (4 chars per token heuristic)."""
-    return max(0, len(text or "") // APPROX_CHARS_PER_TOKEN)
-
-
 def estimate_message_tokens(msg: Dict[str, Any]) -> int:
     """Estimate tokens for a single message."""
     tokens = 0
 
-    # Content tokens
     content = msg.get("content")
     if isinstance(content, str):
         tokens += estimate_tokens(content)
@@ -77,11 +88,9 @@ def estimate_message_tokens(msg: Dict[str, Any]) -> int:
         for part in content:
             if isinstance(part, dict):
                 tokens += estimate_tokens(part.get("text", ""))
-                # Images count as ~1000 tokens roughly
                 if part.get("type") == "image_url":
                     tokens += 1000
 
-    # Tool calls tokens (function name + arguments)
     tool_calls = msg.get("tool_calls", [])
     for tc in tool_calls:
         func = tc.get("function", {})
@@ -97,6 +106,65 @@ def estimate_message_tokens(msg: Dict[str, Any]) -> int:
 def estimate_total_tokens(messages: List[Dict[str, Any]]) -> int:
     """Estimate total tokens for all messages."""
     return sum(estimate_message_tokens(m) for m in messages)
+
+
+# =============================================================================
+# Working Set Tracking
+# =============================================================================
+
+
+class WorkingSet:
+    """Tracks files the agent is actively working on.
+
+    Files in the working set get their tool outputs protected from pruning
+    for longer, since the agent is likely to reference them again.
+    """
+
+    def __init__(self):
+        self._files: Dict[str, float] = {}  # path -> last_access_time
+        self._max_age = 600.0  # 10 minutes
+
+    def touch(self, path: str) -> None:
+        """Mark a file as recently accessed."""
+        self._files[path] = time.time()
+
+    def is_active(self, path: str) -> bool:
+        """Check if a file is in the active working set."""
+        if path not in self._files:
+            return False
+        age = time.time() - self._files[path]
+        if age > self._max_age:
+            del self._files[path]
+            return False
+        return True
+
+    def extract_paths_from_message(self, msg: Dict[str, Any]) -> Set[str]:
+        """Extract file paths mentioned in a message."""
+        paths = set()
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            # Match common file path patterns
+            for match in re.finditer(r'[\w./\-]+\.\w{1,10}', content):
+                paths.add(match.group())
+        return paths
+
+    def update_from_messages(self, messages: List[Dict[str, Any]]) -> None:
+        """Scan recent messages to update the working set."""
+        # Look at last 10 messages for file paths
+        for msg in messages[-10:]:
+            role = msg.get("role", "")
+            if role in ("assistant", "tool"):
+                for path in self.extract_paths_from_message(msg):
+                    self.touch(path)
+
+
+# Global working set instance
+_working_set = WorkingSet()
+
+
+def get_working_set() -> WorkingSet:
+    """Get the global working set tracker."""
+    return _working_set
 
 
 # =============================================================================
@@ -122,6 +190,80 @@ def needs_compaction(messages: List[Dict[str, Any]]) -> bool:
 
 
 # =============================================================================
+# Smart Output Compression
+# =============================================================================
+
+
+def _get_tool_name_for_message(messages: List[Dict[str, Any]], msg_index: int) -> str:
+    """Try to determine which tool produced a tool result message.
+
+    Looks at the preceding assistant message's tool_calls to match by tool_call_id.
+    """
+    msg = messages[msg_index]
+    tool_call_id = msg.get("tool_call_id", "")
+
+    # Search backward for the assistant message with matching tool_calls
+    for i in range(msg_index - 1, -1, -1):
+        prev = messages[i]
+        if prev.get("role") == "assistant":
+            for tc in prev.get("tool_calls", []):
+                if tc.get("id") == tool_call_id:
+                    return tc.get("function", {}).get("name", "unknown")
+            break
+
+    return "unknown"
+
+
+def compress_tool_output(content: str, tool_name: str) -> str:
+    """Compress a tool output based on its type.
+
+    - Errors: keep fully
+    - Shell commands: keep exit code + last 50 lines
+    - File reads: keep first 20 + last 20 lines
+    - Directory listings: keep first 30 entries
+    - Search results: keep first 30 matches
+    """
+    if not content or len(content) < 500:
+        return content
+
+    lines = content.split("\n")
+
+    # Always keep error content fully
+    if any(kw in content[:200].lower() for kw in ["error", "failed", "exception", "traceback"]):
+        return content
+
+    if tool_name in ("shell_command",):
+        # Keep exit code line + last 50 lines
+        if len(lines) > 60:
+            exit_lines = [l for l in lines[-5:] if "exit code" in l.lower()]
+            kept = lines[:5] + [f"\n[... {len(lines) - 55} lines trimmed ...]"] + lines[-50:]
+            if exit_lines:
+                kept.extend(exit_lines)
+            return "\n".join(kept)
+
+    elif tool_name in ("read_file",):
+        # Keep first 20 + last 20 lines
+        if len(lines) > 50:
+            return "\n".join(
+                lines[:20]
+                + [f"\n[... {len(lines) - 40} lines trimmed ...]"]
+                + lines[-20:]
+            )
+
+    elif tool_name in ("list_dir", "glob_files"):
+        # Keep first 30 entries
+        if len(lines) > 35:
+            return "\n".join(lines[:30] + [f"\n[... {len(lines) - 30} more entries ...]"])
+
+    elif tool_name in ("grep_files",):
+        # Keep first 30 results
+        if len(lines) > 35:
+            return "\n".join(lines[:30] + [f"\n[... {len(lines) - 30} more matches ...]"])
+
+    return content
+
+
+# =============================================================================
 # Tool Output Pruning
 # =============================================================================
 
@@ -137,80 +279,104 @@ def prune_old_tool_outputs(
     protect_last_turns: int = 2,
 ) -> List[Dict[str, Any]]:
     """
-    Prune old tool outputs to save tokens.
+    Prune old tool outputs with relevance awareness.
 
-    Strategy (exactly like OpenCode compaction.ts lines 49-89):
+    Strategy:
     1. Go backwards through messages
     2. Skip first 2 user turns (most recent)
-    3. Accumulate tool output tokens
-    4. Once we've accumulated PRUNE_PROTECT (40K) tokens, start marking for prune
-    5. Only actually prune if we can recover > PRUNE_MINIMUM (20K) tokens
+    3. Accumulate tool output tokens weighted by relevance
+    4. Protect outputs for files in the working set
+    5. Compress outputs before pruning entirely
+    6. Only fully prune if we can recover > PRUNE_MINIMUM tokens
 
     Args:
         messages: List of messages
-        protect_last_turns: Number of recent user turns to skip (default: 2)
+        protect_last_turns: Number of recent user turns to skip
 
     Returns:
-        Messages with old tool outputs pruned (content replaced with PRUNE_MARKER)
+        Messages with old tool outputs pruned/compressed
     """
     if not messages:
         return messages
 
-    total = 0  # Total tool output tokens seen (going backwards)
-    pruned = 0  # Tokens that will be pruned
-    to_prune: List[int] = []  # Indices to prune
-    turns = 0  # User turn counter
+    # Update working set from recent context
+    _working_set.update_from_messages(messages)
 
-    # Go backwards through messages (like OpenCode)
+    total = 0
+    pruned = 0
+    to_prune: List[int] = []
+    to_compress: List[int] = []
+    turns = 0
+
     for msg_index in range(len(messages) - 1, -1, -1):
         msg = messages[msg_index]
 
-        # Count user turns
         if msg.get("role") == "user":
             turns += 1
 
-        # Skip the first N user turns (most recent)
         if turns < protect_last_turns:
             continue
 
-        # Process tool messages
         if msg.get("role") == "tool":
             content = msg.get("content", "")
 
-            # Skip already pruned
             if content == PRUNE_MARKER:
-                # Already compacted, stop here (like OpenCode: break loop)
                 break
 
             estimate = estimate_tokens(content)
             total += estimate
 
-            # Once we've accumulated more than PRUNE_PROTECT tokens,
-            # start marking older outputs for pruning
-            if total > PRUNE_PROTECT:
-                pruned += estimate
-                to_prune.append(msg_index)
+            # Get tool name for relevance scoring
+            tool_name = _get_tool_name_for_message(messages, msg_index)
+            relevance = RELEVANCE_SCORES.get(tool_name, 0.5)
 
-    _log(f"Prune scan: {total} total tokens, {pruned} prunable")
+            # Check if any file in working set is mentioned
+            paths_in_content = _working_set.extract_paths_from_message(msg)
+            is_working_set = any(_working_set.is_active(p) for p in paths_in_content)
 
-    # Only prune if we can recover enough tokens
+            # Protect working set outputs and high-relevance outputs longer
+            effective_protect = PRUNE_PROTECT
+            if is_working_set:
+                effective_protect = PRUNE_PROTECT * 2  # Double protection
+            elif relevance >= 0.8:
+                effective_protect = int(PRUNE_PROTECT * 1.5)
+
+            if total > effective_protect:
+                # Low relevance: prune entirely
+                if relevance < 0.5:
+                    pruned += estimate
+                    to_prune.append(msg_index)
+                # Medium relevance: compress first
+                elif relevance < 0.8:
+                    to_compress.append(msg_index)
+                    # Estimate compression savings (~50%)
+                    pruned += estimate // 2
+                else:
+                    # High relevance: only prune if very old
+                    if total > effective_protect * 2:
+                        to_compress.append(msg_index)
+                        pruned += estimate // 3
+
+    _log(f"Prune scan: {total} total tokens, {pruned} recoverable, "
+         f"{len(to_prune)} prune + {len(to_compress)} compress")
+
     if pruned <= PRUNE_MINIMUM:
         _log(f"Prune skipped: only {pruned} tokens recoverable (min: {PRUNE_MINIMUM})")
         return messages
 
-    _log(f"Pruning {len(to_prune)} tool outputs, recovering ~{pruned} tokens")
+    _log(f"Pruning {len(to_prune)} + compressing {len(to_compress)} tool outputs")
 
-    # Create new messages with pruned content
     indices_to_prune = set(to_prune)
+    indices_to_compress = set(to_compress)
     result = []
+
     for i, msg in enumerate(messages):
         if i in indices_to_prune:
-            result.append(
-                {
-                    **msg,
-                    "content": PRUNE_MARKER,
-                }
-            )
+            result.append({**msg, "content": PRUNE_MARKER})
+        elif i in indices_to_compress:
+            tool_name = _get_tool_name_for_message(messages, i)
+            compressed = compress_tool_output(msg.get("content", ""), tool_name)
+            result.append({**msg, "content": compressed})
         else:
             result.append(msg)
 
@@ -250,21 +416,14 @@ def run_compaction(
     """
     _log("Starting AI compaction...")
 
-    # Build compaction request
     compaction_messages = messages.copy()
-    compaction_messages.append(
-        {
-            "role": "user",
-            "content": COMPACTION_PROMPT,
-        }
-    )
+    compaction_messages.append({"role": "user", "content": COMPACTION_PROMPT})
 
     try:
-        # Call LLM for summary (no tools, just text)
         response = llm.chat(
             compaction_messages,
             model=model,
-            max_tokens=4096,  # Summary should be concise
+            max_tokens=4096,
         )
 
         summary = response.text or ""
@@ -276,7 +435,6 @@ def run_compaction(
         summary_tokens = estimate_tokens(summary)
         _log(f"Compaction complete: {summary_tokens} token summary")
 
-        # Build new message list
         compacted = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": SUMMARY_PREFIX + summary},
@@ -286,7 +444,6 @@ def run_compaction(
 
     except Exception as e:
         _log(f"Compaction failed: {e}")
-        # Return original messages if compaction fails
         return messages
 
 
@@ -309,7 +466,7 @@ def manage_context(
     Strategy:
     1. Estimate current token usage
     2. If under threshold, return as-is
-    3. Try pruning old tool outputs first
+    3. Try smart pruning + compression first
     4. If still over threshold, run AI compaction
 
     Args:
@@ -327,13 +484,12 @@ def manage_context(
 
     _log(f"Context: {total_tokens} tokens ({usage_pct:.1f}% of {usable})")
 
-    # Check if we need to do anything
     if not force_compaction and not is_overflow(total_tokens):
         return messages
 
     _log("Context overflow detected, managing...")
 
-    # Step 1: Try pruning old tool outputs
+    # Step 1: Try smart pruning + compression
     pruned = prune_old_tool_outputs(messages)
     pruned_tokens = estimate_total_tokens(pruned)
 

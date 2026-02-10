@@ -1788,6 +1788,8 @@ def run_agent_ask_streaming(
     initial_text: str = "🤔 Thinking...",
     model: str | None = None,
     timeout_seconds: int = 600,
+    system_prompt_override: str | None = None,
+    readonly: bool = True,
 ) -> str:
     """Run the agent and stream JSONL output by editing one Telegram message.
     
@@ -1856,13 +1858,18 @@ def run_agent_ask_streaming(
 
     q: queue.Queue = queue.Queue()
 
+    # Enable chat_mode when a Tau system prompt is provided (conversational use)
+    is_chat_mode = system_prompt_override is not None
+
     try:
         agent_thread = run_baseagent_streaming(
             prompt_with_context,
             model=model,
-            readonly=True,
+            readonly=readonly,
             event_queue=q,
             timeout_seconds=timeout_seconds,
+            system_prompt_override=system_prompt_override,
+            chat_mode=is_chat_mode,
         )
     except Exception as e:
         err = f"Error: {str(e)}"
@@ -2185,63 +2192,34 @@ def handle_message(message):
     if is_private_chat(message):
         save_chat_id(message.chat.id)
 
-    # Get chat history BEFORE appending current message (so current message only appears once)
-    from .telegram import get_chat_history
-    chat_history = get_chat_history(chat_id=message.chat.id)
-    logger.info(f"Chat history loaded: {len(chat_history)} chars")
-    
-    # Build prompt with minimal context for simple questions
-    # Only include last 20 lines of chat for continuity, not the full history
-    chat_lines = chat_history.strip().split('\n')
-    recent_chat = '\n'.join(chat_lines[-20:]) if len(chat_lines) > 20 else chat_history
-    
     # Backend + model selection:
     # - default: use agent in-process for normal chat
     # - set TAU_CHAT_BACKEND=openai to use OpenAI directly
     # - set TAU_CHAT_BACKEND=auto to use OpenAI when OPENAI_API_KEY is available
-    from .llm import CHAT_MODEL
+    from .llm import CHAT_MODEL, build_tau_system_prompt
     backend = (os.getenv("TAU_CHAT_BACKEND") or "baseagent").strip().lower()
     openai_model = os.getenv("TAU_OPENAI_CHAT_MODEL", "gpt-4o-mini")
     agent_model = os.getenv("TAU_CHAT_MODEL", CHAT_MODEL)
     use_openai = backend in ("openai", "oa") or (backend == "auto" and openai_client is not None)
 
-    # OpenAI prompt: keep it small for speed
-    openai_prompt = f"""RECENT CONTEXT (for continuity):
+    if use_openai:
+        # OpenAI path: keep prompt small for speed (no system prompt override)
+        from .telegram import get_chat_history
+        chat_history = get_chat_history(chat_id=message.chat.id)
+        chat_lines = chat_history.strip().split('\n')
+        recent_chat = '\n'.join(chat_lines[-20:]) if len(chat_lines) > 20 else chat_history
+        openai_prompt = f"""RECENT CONTEXT (for continuity):
 {recent_chat}
 
 USER: {message.text}"""
-
-    # Agent prompt
-    prompt_with_context = f"""You are Tau, an autonomous AI assistant running as a Telegram bot. Answer the user's question directly and concisely.
-
-YOUR CAPABILITIES (share when asked how to use you):
-Just talk to me like you would a friend. I understand natural language, so you don't need special commands.
-
-• Ask me anything - questions, explanations, help with problems
-• Set reminders - "remind me to call mom at 5pm" or "in 2 hours check if the server is up"
-• Recurring tasks - "every morning send me the weather" or "every Monday remind me about the team meeting"
-• Background work - "research this topic and get back to me" or "analyze this data when you have time"
-• Code changes - "add a feature to do X" or "make the bot respond faster"
-• Tools & web - I can search, run code, access APIs, and more
-
-RECENT CONTEXT (for continuity):
-{recent_chat}
-
-USER: {message.text}
-
-INSTRUCTIONS:
-- Answer directly without preamble
-- Be concise - just give the answer
-- Do NOT say "Is there anything else..." or similar closing phrases
-- Do NOT explain your thinking process in the response
-- If the question is simple (like factual questions), give a short direct answer
-- If asked how to use you, explain conversationally - no command syntax, just natural examples"""
-    
-    logger.info(f"Total prompt size: {len(prompt_with_context)} chars")
-    if use_openai:
-        logger.info(f"Using OpenAI fast chat model={openai_model}")
+        logger.info(f"Using OpenAI fast chat model={openai_model}, prompt={len(openai_prompt)} chars")
     else:
-        logger.info(f"Using agent model={agent_model}")
+        # Agent path: build a Tau-aware system prompt with full context
+        tau_system_prompt = build_tau_system_prompt(
+            chat_id=message.chat.id,
+            user_message=message.text,
+        )
+        logger.info(f"Using agent model={agent_model}, system_prompt={len(tau_system_prompt)} chars")
     
     # Start typing indicator in background
     typing_stop = threading.Event()
@@ -2267,13 +2245,16 @@ INSTRUCTIONS:
                 max_tokens=400,
             )
         else:
+            # Pass user's raw message as instruction; system prompt has all context
             response = run_agent_ask_streaming(
-                prompt_with_context,
+                message.text,
                 chat_id=message.chat.id,
                 reply_to_message_id=message.message_id,
                 initial_text="🤔 Thinking...",
                 model=agent_model,
                 timeout_seconds=300,
+                system_prompt_override=tau_system_prompt,
+                readonly=False,
             )
         elapsed = (datetime.now() - start_time).total_seconds()
         logger.info(f"Response completed in {elapsed:.1f}s (streamed)")

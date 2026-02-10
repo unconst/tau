@@ -14,6 +14,7 @@ from src.tools.registry import (
 )
 from src.tools.search_files import SearchFilesTool
 from src.tools.specs import TOOL_SPECS, get_all_tools, get_tool_spec
+from src.tools.subagent import SUBAGENT_SPEC, run_subagent
 from src.tools.view_image import view_image
 from src.tools.write_file import WriteFileTool
 
@@ -39,4 +40,6 @@ __all__ = [
     "ListDirTool",
     "SearchFilesTool",
     "view_image",
+    "run_subagent",
+    "SUBAGENT_SPEC",
 ]
