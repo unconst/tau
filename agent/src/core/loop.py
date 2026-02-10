@@ -17,6 +17,7 @@ Context management strategy:
 
 from __future__ import annotations
 
+import json
 import sys
 import time
 from pathlib import Path
@@ -432,7 +433,7 @@ Proceed with verification now.
                     "function": {
                         "name": call.name,
                         "arguments": (
-                            str(call.arguments)
+                            json.dumps(call.arguments)
                             if isinstance(call.arguments, dict)
                             else call.arguments
                         ),
