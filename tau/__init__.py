@@ -17,6 +17,7 @@ from .telegram import (
     TelegramStreamingMessage, authorize, is_owner, is_private_chat,
     is_group_chat, save_chat_metadata, list_chats, get_chat_history_for,
     send_to_chat, send_plan_approval, send_question_with_options,
+    send_thinking_gif, delete_thinking_gif,
 )
 from .agent import run_loop, TASKS_DIR, get_all_tasks, git_commit_changes, set_debug_mode, read_file, run_memory_maintenance
 from .tools.commands import run_command
@@ -1224,13 +1225,12 @@ def run_adapt_streaming(
     
     Streams minor updates during the process, then sends a final summary of what was done.
     """
-    from .spinners import get_random_spinner
-    spinner = get_random_spinner()
+    gif_msg_id = send_thinking_gif(chat_id, reply_to_message_id=reply_to_message_id)
 
     stream = TelegramStreamingMessage(
         chat_id,
         reply_to_message_id=reply_to_message_id,
-        initial_text=spinner.frame_at(0),
+        initial_text="...",
         min_edit_interval_seconds=0.9,  # Fast updates for responsive feel
         min_chars_delta=10,  # Lower threshold to show progress sooner
     )
@@ -1262,8 +1262,7 @@ def run_adapt_streaming(
     
     def build_display():
         """Build the display message showing current thinking and actions."""
-        elapsed = time.time() - start_time
-        lines = [spinner.frame_at(elapsed) + "\n"]
+        lines = []
         
         # Show current thinking or the last complete snippet
         display_thinking = ""
@@ -1283,10 +1282,9 @@ def run_adapt_streaming(
             lines.append(f"💭 {display_thinking}\n")
         
         if thinking_updates:
-            lines.append("")
             lines.extend(thinking_updates[-6:])
         
-        return "\n".join(lines)
+        return "\n".join(lines) if lines else "..."
 
     last_display_update = start_time
     
@@ -1309,6 +1307,13 @@ def run_adapt_streaming(
             if event is None:
                 # Sentinel — agent thread finished
                 break
+
+            # Refresh display periodically even during rapid unrecognised
+            # events (e.g. stream.text.delta) so the timer never freezes.
+            now = time.time()
+            if now - last_display_update >= 1.5:
+                stream.set_text(build_display())
+                last_display_update = now
 
             parsed = parse_event(event)
             if parsed is None:
@@ -1378,6 +1383,7 @@ def run_adapt_streaming(
                     final_result_text = f"Error: {err_text}"
 
     finally:
+        delete_thinking_gif(chat_id, gif_msg_id)
         stream.finalize()
 
     if timed_out:
@@ -1477,13 +1483,12 @@ def run_plan_generation(
     Returns:
         Tuple of (plan_content, plan_filename)
     """
-    from .spinners import get_random_spinner
-    spinner = get_random_spinner()
+    gif_msg_id = send_thinking_gif(chat_id, reply_to_message_id=reply_to_message_id)
 
     stream = TelegramStreamingMessage(
         chat_id,
         reply_to_message_id=reply_to_message_id,
-        initial_text=spinner.frame_at(0),
+        initial_text="...",
         min_edit_interval_seconds=0.9,
         min_chars_delta=10,
     )
@@ -1520,8 +1525,7 @@ Output ONLY the plan content, no preamble or meta-commentary."""
     last_thinking_snippet: str = ""
 
     def build_display():
-        elapsed = time.time() - start_time
-        lines = [spinner.frame_at(elapsed) + "\n"]
+        lines = []
         
         if thinking_text_buffer.strip():
             cleaned = thinking_text_buffer.strip().replace("\n", " ")
@@ -1531,10 +1535,9 @@ Output ONLY the plan content, no preamble or meta-commentary."""
             lines.append(f"💭 {display_thinking}\n")
         
         if thinking_updates:
-            lines.append("")
             lines.extend(thinking_updates[-6:])
         
-        return "\n".join(lines)
+        return "\n".join(lines) if lines else "..."
 
     q: queue.Queue = queue.Queue()
 
@@ -1571,6 +1574,13 @@ Output ONLY the plan content, no preamble or meta-commentary."""
 
             if event is None:
                 break
+
+            # Refresh display periodically even during rapid unrecognised
+            # events (e.g. stream.text.delta) so the timer never freezes.
+            now = time.time()
+            if now - last_display_update >= 1.5:
+                stream.set_text(build_display())
+                last_display_update = now
 
             parsed = parse_event(event)
             if parsed is None:
@@ -1619,6 +1629,7 @@ Output ONLY the plan content, no preamble or meta-commentary."""
                     final_result_text = f"Error: {err_text}"
 
     finally:
+        delete_thinking_gif(chat_id, gif_msg_id)
         stream.finalize()
 
     if timed_out:
@@ -2092,14 +2103,13 @@ def run_agent_ask_streaming(
         from .llm import CHAT_MODEL
         model = CHAT_MODEL
 
-    from .spinners import get_random_spinner
-    spinner = get_random_spinner()
+    gif_msg_id = send_thinking_gif(chat_id, reply_to_message_id=reply_to_message_id)
 
     stream = TelegramStreamingMessage(
         chat_id,
         reply_to_message_id=reply_to_message_id,
         existing_message_id=existing_message_id,
-        initial_text=spinner.frame_at(0),
+        initial_text="...",
         min_edit_interval_seconds=0.9,  # Fast updates for responsive feel
         min_chars_delta=10,  # Lower threshold to show progress sooner
     )
@@ -2118,6 +2128,9 @@ def run_agent_ask_streaming(
     tool_call_count = 0
     iteration_count = 0
     cost_estimate = 0.0
+    context_tokens = 0
+    output_tokens_total = 0
+    cached_tokens_total = 0
     
     def _format_elapsed(seconds: float) -> str:
         if seconds < 60:
@@ -2128,7 +2141,7 @@ def run_agent_ask_streaming(
 
     def build_display():
         elapsed = time.time() - start_time
-        lines = [spinner.frame_at(elapsed) + "\n"]
+        lines = []
 
         # Show plan progress if we have a plan
         if current_plan_steps:
@@ -2158,18 +2171,24 @@ def run_agent_ask_streaming(
             lines.append(f"💭 {display_thinking}\n")
         
         if thinking_updates:
-            lines.append("")
             lines.extend(thinking_updates[-6:])
 
-        # Footer: elapsed time and tool count
+        # Footer: elapsed time, tool count, context, cost
         footer_parts = [f"⏱ {_format_elapsed(elapsed)}"]
         if tool_call_count > 0:
             footer_parts.append(f"🔧 {tool_call_count} tools")
+        if context_tokens > 0:
+            # Show context size in k tokens (input = context sent to LLM)
+            ctx_k = context_tokens / 1000
+            if ctx_k >= 100:
+                footer_parts.append(f"📐 {ctx_k:.0f}k ctx")
+            else:
+                footer_parts.append(f"📐 {ctx_k:.1f}k ctx")
         if cost_estimate > 0:
             footer_parts.append(f"💰 ${cost_estimate:.4f}")
         lines.append("\n" + " · ".join(footer_parts))
         
-        return "\n".join(lines)
+        return "\n".join(lines) if lines else "..."
 
     q: queue.Queue = queue.Queue()
 
@@ -2246,6 +2265,17 @@ def run_agent_ask_streaming(
                 cost_data = event.get("budget", {})
                 cost_estimate = cost_data.get("consumed_cost", 0.0)
                 iteration_count = event.get("iterations", 0)
+            if etype == "stream.usage":
+                context_tokens = event.get("input_tokens", 0)
+                output_tokens_total = event.get("output_tokens", 0)
+                cached_tokens_total = event.get("cached_tokens", 0)
+
+            # Refresh display periodically even during rapid unrecognised
+            # events (e.g. stream.text.delta) so the timer never freezes.
+            now = time.time()
+            if now - last_display_update >= 1.5:
+                stream.set_text(build_display())
+                last_display_update = now
 
             parsed = parse_event(event)
             if parsed is None:
@@ -2348,6 +2378,7 @@ def run_agent_ask_streaming(
                     final_result_text = f"Error: {err_text}"
 
     finally:
+        delete_thinking_gif(chat_id, gif_msg_id)
         stream.finalize()
 
     if timed_out:

@@ -599,6 +599,14 @@ Proceed with verification now.
                             total_output_tokens += tokens.get("output", 0)
                             total_cached_tokens += tokens.get("cached", 0)
 
+                    # Emit live usage so the Telegram UI can show context size
+                    emit_raw({
+                        "type": "stream.usage",
+                        "input_tokens": total_input_tokens,
+                        "output_tokens": total_output_tokens,
+                        "cached_tokens": total_cached_tokens,
+                    })
+
                     consecutive_failures = 0
                     break  # Success, exit retry loop
 

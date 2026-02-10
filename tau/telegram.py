@@ -331,6 +331,33 @@ class TelegramStreamingMessage:
                 return
 
 
+NINJA_GIF = os.path.join(os.path.dirname(__file__), "assets", "ninja.gif")
+
+
+def send_thinking_gif(chat_id: int, reply_to_message_id: int | None = None) -> int | None:
+    """Send the ninja.gif as a thinking indicator. Returns the message_id."""
+    try:
+        with open(NINJA_GIF, "rb") as f:
+            msg = bot.send_animation(
+                chat_id,
+                f,
+                reply_to_message_id=reply_to_message_id,
+            )
+        return msg.message_id
+    except Exception:
+        return None
+
+
+def delete_thinking_gif(chat_id: int, message_id: int | None):
+    """Delete the thinking gif message."""
+    if message_id is None:
+        return
+    try:
+        bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
+
+
 def notify(msg: str):
     """Send a notification to Telegram (no emoji prefix).
     
