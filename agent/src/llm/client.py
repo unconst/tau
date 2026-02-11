@@ -267,7 +267,7 @@ class LLMClient:
         cost_limit: Optional[float] = None,
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
-        timeout: float = 120.0,
+        timeout: Optional[float] = None,
         budget: Optional[AgentBudget] = None,
         budget_reservation_key: Optional[str] = None,
     ):
@@ -316,7 +316,7 @@ class LLMClient:
                 "Authorization": f"Bearer {self._api_key}",
                 "Content-Type": "application/json",
             },
-            timeout=httpx.Timeout(timeout, connect=30.0),
+            timeout=httpx.Timeout(timeout=self.timeout, connect=30.0),
         )
 
     @staticmethod
@@ -624,7 +624,7 @@ class LLMClient:
             try:
                 # Use a per-stream timeout for idle detection
                 stream_timeout = httpx.Timeout(
-                    self.timeout,
+                    timeout=None,
                     connect=30.0,
                     read=self.stream_idle_timeout,
                 )

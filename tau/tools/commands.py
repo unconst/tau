@@ -138,7 +138,7 @@ Output ONLY the plan content, no preamble."""
     from tau.llm import llm_chat
     
     try:
-        plan_content = llm_chat(plan_prompt, timeout=600.0)
+        plan_content = llm_chat(plan_prompt)
         
         if not plan_content:
             return "Error: Failed to generate plan content"

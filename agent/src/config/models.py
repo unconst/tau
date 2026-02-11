@@ -102,7 +102,7 @@ class AgentConfig(BaseModel):
     model: str = Field(default="zai-org/GLM-4.7-TEE", description="Model to use")
     provider: Provider = Field(default=Provider.CHUTES, description="LLM provider")
     max_iterations: int = Field(default=50, description="Maximum iterations")
-    timeout: int = Field(default=120, description="Timeout per LLM call in seconds")
+    timeout: int | None = Field(default=None, description="Timeout per LLM call in seconds (None = no timeout)")
     temperature: float = Field(default=0.7, description="Generation temperature")
     max_tokens: int = Field(default=16384, description="Maximum tokens for response")
 

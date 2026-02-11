@@ -131,12 +131,25 @@ class ListDirTool(BaseTool):
         return items
 
     def _list_recursive(
-        self, path: Path, include_hidden: bool, ignore_patterns: List[str], prefix: str = ""
+        self,
+        path: Path,
+        include_hidden: bool,
+        ignore_patterns: List[str],
+        prefix: str = "",
+        depth: int = 0,
+        max_depth: int = 3,
+        max_entries: int = 200,
     ) -> List[tuple[str, str, int]]:
-        """List directory contents recursively."""
+        """List directory contents recursively with depth/count limits."""
         items = []
 
+        if depth > max_depth:
+            return items
+
         for entry in path.iterdir():
+            if len(items) >= max_entries:
+                break
+
             if self._should_ignore(entry.name, include_hidden, ignore_patterns):
                 continue
 
@@ -145,10 +158,15 @@ class ListDirTool(BaseTool):
             item_size = 0 if entry.is_dir() else entry.stat().st_size
             items.append((relative_name, item_type, item_size))
 
-            if entry.is_dir():
-                # Recurse into subdirectory
+            if entry.is_dir() and len(items) < max_entries:
                 sub_items = self._list_recursive(
-                    entry, include_hidden, ignore_patterns, prefix=f"{relative_name}/"
+                    entry,
+                    include_hidden,
+                    ignore_patterns,
+                    prefix=f"{relative_name}/",
+                    depth=depth + 1,
+                    max_depth=max_depth,
+                    max_entries=max_entries - len(items),
                 )
                 items.extend(sub_items)
 

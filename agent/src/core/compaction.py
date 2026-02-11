@@ -28,16 +28,17 @@ if TYPE_CHECKING:
 # Constants (matching OpenCode)
 # =============================================================================
 
-# Default context limits — used when no per-model metadata is available.
-# Callers should pass ``context_window`` / ``output_reserve`` / ``auto_compact_threshold``
-# from ``ModelTier`` to override these.
-MODEL_CONTEXT_LIMIT = 200_000  # Generous default; real value comes from ModelTier
-OUTPUT_TOKEN_MAX = 32_000  # Max output tokens to reserve
-AUTO_COMPACT_THRESHOLD = 0.85  # Trigger compaction at 85% of usable context
+# Fallback context limits — used ONLY when no per-model metadata is available.
+# In normal operation, callers pass ``context_window`` / ``output_reserve`` /
+# ``auto_compact_threshold`` from ``ModelTier`` (see llm/router.py).
+# These fallbacks match the default ModelTier values.
+MODEL_CONTEXT_LIMIT = 131_072  # Match default ModelTier
+OUTPUT_TOKEN_MAX = 16_384      # Match default ModelTier
+AUTO_COMPACT_THRESHOLD = 0.75  # Match default ModelTier
 
-# Pruning constants (from OpenCode)
-PRUNE_PROTECT = 40_000  # Protect this many tokens of recent tool output
-PRUNE_MINIMUM = 20_000  # Only prune if we can recover at least this many tokens
+# Pruning constants — tuned for lean context
+PRUNE_PROTECT = 20_000  # Protect this many tokens of recent tool output
+PRUNE_MINIMUM = 8_000   # Only prune if we can recover at least this many tokens
 PRUNE_MARKER = "[Old tool result content cleared]"
 
 # Relevance scores for tool output types (higher = more important to keep)
@@ -232,13 +233,14 @@ def _get_tool_name_for_message(messages: List[Dict[str, Any]], msg_index: int) -
 def compress_tool_output(content: str, tool_name: str) -> str:
     """Compress a tool output based on its type.
 
+    Aggressive compression for context efficiency:
     - Errors: keep fully
-    - Shell commands: keep exit code + last 50 lines
-    - File reads: keep first 20 + last 20 lines
-    - Directory listings: keep first 30 entries
-    - Search results: keep first 30 matches
+    - Shell commands: keep first 5 + last 20 lines
+    - File reads: keep first 10 + last 10 lines
+    - Directory listings: keep first 15 entries
+    - Search results: keep first 15 matches
     """
-    if not content or len(content) < 500:
+    if not content or len(content) < 300:
         return content
 
     lines = content.split("\n")
@@ -248,32 +250,36 @@ def compress_tool_output(content: str, tool_name: str) -> str:
         return content
 
     if tool_name in ("shell_command",):
-        # Keep exit code line + last 50 lines
-        if len(lines) > 60:
+        if len(lines) > 30:
             exit_lines = [l for l in lines[-5:] if "exit code" in l.lower()]
-            kept = lines[:5] + [f"\n[... {len(lines) - 55} lines trimmed ...]"] + lines[-50:]
+            kept = lines[:5] + [f"\n[... {len(lines) - 25} lines trimmed ...]"] + lines[-20:]
             if exit_lines:
                 kept.extend(exit_lines)
             return "\n".join(kept)
 
     elif tool_name in ("read_file",):
-        # Keep first 20 + last 20 lines
-        if len(lines) > 50:
+        if len(lines) > 25:
             return "\n".join(
-                lines[:20]
-                + [f"\n[... {len(lines) - 40} lines trimmed ...]"]
-                + lines[-20:]
+                lines[:10]
+                + [f"\n[... {len(lines) - 20} lines trimmed ...]"]
+                + lines[-10:]
             )
 
     elif tool_name in ("list_dir", "glob_files"):
-        # Keep first 30 entries
-        if len(lines) > 35:
-            return "\n".join(lines[:30] + [f"\n[... {len(lines) - 30} more entries ...]"])
+        if len(lines) > 20:
+            return "\n".join(lines[:15] + [f"\n[... {len(lines) - 15} more entries ...]"])
 
     elif tool_name in ("grep_files",):
-        # Keep first 30 results
-        if len(lines) > 35:
-            return "\n".join(lines[:30] + [f"\n[... {len(lines) - 30} more matches ...]"])
+        if len(lines) > 20:
+            return "\n".join(lines[:15] + [f"\n[... {len(lines) - 15} more matches ...]"])
+
+    elif tool_name in ("spawn_subagent",):
+        if len(lines) > 40:
+            return "\n".join(
+                lines[:15]
+                + [f"\n[... {len(lines) - 30} lines trimmed ...]"]
+                + lines[-15:]
+            )
 
     return content
 
@@ -352,9 +358,9 @@ def prune_old_tool_outputs(
             # Protect working set outputs and high-relevance outputs longer
             effective_protect = PRUNE_PROTECT
             if is_working_set:
-                effective_protect = PRUNE_PROTECT * 2  # Double protection
+                effective_protect = int(PRUNE_PROTECT * 1.3)  # Modest protection boost
             elif relevance >= 0.8:
-                effective_protect = int(PRUNE_PROTECT * 1.5)
+                effective_protect = int(PRUNE_PROTECT * 1.2)
 
             if total > effective_protect:
                 # Low relevance: prune entirely
@@ -521,6 +527,14 @@ def manage_context(
     _log(f"Context: {total_tokens} tokens ({usage_pct:.1f}% of {usable})")
 
     if not force_compaction and not _is_over(total_tokens):
+        # Even under token threshold, prune if message count is excessive
+        if len(messages) > 60:
+            _log(f"Message count high ({len(messages)}), pruning old tool outputs...")
+            pruned = prune_old_tool_outputs(messages)
+            if len(pruned) < len(messages):
+                if _token_budget is not None:
+                    _token_budget.reset(pruned)
+                return pruned
         return messages
 
     _log("Context overflow detected, managing...")
@@ -540,7 +554,7 @@ def manage_context(
     system_message = pruned[0] if preserve_system else None
     trimmed = pruned
     trim_attempts = 0
-    while _is_over(estimate_total_tokens(trimmed)) and len(trimmed) > 2 and trim_attempts < 12:
+    while _is_over(estimate_total_tokens(trimmed)) and len(trimmed) > 2 and trim_attempts < 20:
         trimmed = HistoryManager.remove_first_item(
             trimmed,
             preserve_system_prompt=preserve_system,

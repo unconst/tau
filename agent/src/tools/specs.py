@@ -57,7 +57,7 @@ Supports reading specific ranges with offset and limit parameters.""",
             },
             "limit": {
                 "type": "number",
-                "description": "The maximum number of lines to return (default: 2000)",
+                "description": "The maximum number of lines to return (default: 500). Use offset+limit to read specific sections of large files.",
             },
         },
         "required": ["file_path"],

@@ -486,7 +486,7 @@ class ToolRegistry:
         """Read file contents."""
         file_path = args.get("file_path", "")
         offset = args.get("offset", 1)
-        limit = args.get("limit", 2000)
+        limit = args.get("limit", 500)
 
         if not file_path:
             return ToolResult.fail("No file_path provided")
@@ -504,6 +504,25 @@ class ToolRegistry:
             return ToolResult.fail(f"Not a file: {path}")
 
         try:
+            file_size = path.stat().st_size
+
+            # Guard: very large files get metadata + preview unless specific range requested
+            if file_size > 100_000 and offset <= 1 and limit >= 500:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    all_lines = f.readlines()
+                total = len(all_lines)
+                head = all_lines[:100]
+                tail = all_lines[-50:] if total > 150 else []
+                output_lines = [f"[File: {path} | {file_size:,} bytes | {total} lines]"]
+                output_lines.append(f"[Showing first 100 and last {len(tail)} lines. Use offset/limit for specific sections.]\n")
+                for i, line in enumerate(head, start=1):
+                    output_lines.append(f"L{i}: {line.rstrip()}")
+                if tail:
+                    output_lines.append(f"\n[... {total - 100 - len(tail)} lines omitted ...]\n")
+                    for i, line in enumerate(tail, start=total - len(tail) + 1):
+                        output_lines.append(f"L{i}: {line.rstrip()}")
+                return ToolResult.ok("\n".join(output_lines))
+
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()
 

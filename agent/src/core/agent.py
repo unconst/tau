@@ -67,7 +67,6 @@ class Agent:
             model=effective_model,
             temperature=0.0,
             max_tokens=self.config.max_tokens,
-            timeout=300.0,
         )
 
         tools = ToolRegistry(cwd=self.cwd)

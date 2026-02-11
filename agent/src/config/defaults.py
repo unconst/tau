@@ -36,15 +36,10 @@ CONFIG: Dict[str, Any] = {
     # ==========================================================================
     # Context Management
     # ==========================================================================
-    # Model context window (200K for most large models)
-    "model_context_limit": 200_000,
-    # Reserved tokens for output
-    "output_token_max": 32_000,
-    # Trigger compaction at this % of usable context (85%)
-    "auto_compact_threshold": 0.85,
-    # Tool output pruning constants (from OpenCode)
-    "prune_protect": 40_000,  # Protect this many tokens of recent tool output
-    "prune_minimum": 20_000,  # Only prune if we can recover at least this many
+    # NOTE: Context window, output reserve, compaction threshold, and pruning
+    # constants are now defined per-model in ModelTier (see llm/router.py).
+    # Do NOT add model_context_limit, output_token_max, auto_compact_threshold,
+    # prune_protect, or prune_minimum here — they must flow from ModelTier.
     # ==========================================================================
     # Prompt Caching
     # ==========================================================================

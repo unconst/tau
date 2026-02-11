@@ -301,7 +301,7 @@ Output ONLY the compressed summary, no preamble."""
 
     try:
         from .llm import llm_chat
-        result = llm_chat(compress_prompt, timeout=120.0)
+        result = llm_chat(compress_prompt)
         return result[:target_chars + 100]  # Allow slight overage
     except Exception:
         return content[:target_chars]  # Fallback to truncation
@@ -323,7 +323,7 @@ Be very selective - only truly persistent information that would be useful month
 
     try:
         from .llm import llm_chat
-        facts = llm_chat(extract_prompt, timeout=120.0)
+        facts = llm_chat(extract_prompt)
         if "NONE" in facts.upper() or not facts:
             return []
         

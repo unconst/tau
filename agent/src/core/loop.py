@@ -346,7 +346,7 @@ def run_agent_loop(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": ctx.instruction},
         ]
-        if not config.get("skip_initial_state", False):
+        if config.get("include_initial_state", False):
             _log("Getting initial state...")
             initial_result = ctx.shell("pwd && ls -la")
             initial_state = middle_out_truncate(initial_result.output, max_tokens=max_output_tokens)
@@ -451,52 +451,20 @@ def run_agent_loop(
     # Incremental token budget — avoids O(n) recount every iteration
     token_budget = _TokenBudget()
 
-    verification_prompt = f"""<system-reminder>
-# Self-Verification Required - CRITICAL
-
-You indicated the task might be complete. Before finishing, you MUST perform a thorough self-verification.
-
-## Original Task (re-read carefully):
-{ctx.instruction}
-
-## Self-Verification Checklist:
-
-### 1. Requirements Analysis
-- Re-read the ENTIRE original task above word by word
-- List EVERY requirement, constraint, and expected outcome mentioned
-- Check if there are any implicit requirements you might have missed
-
-### 2. Work Verification
-- For EACH requirement identified, verify it was completed:
-  - Run commands to check file contents, test outputs, or verify state
-  - Do NOT assume something works - actually verify it
-  - If you created code, run it to confirm it works
-  - If you modified files, read them back to confirm changes are correct
-
-### 3. Edge Cases & Quality
-- Are there any edge cases the task mentioned that you haven't handled?
-- Did you follow any specific format/style requirements mentioned?
-- Are there any errors, warnings, or issues in your implementation?
-
-### 4. Final Decision
-After completing the above verification:
-- If EVERYTHING is verified and correct: Summarize what was done and confirm completion
-- If ANYTHING is missing or broken: Fix it now using the appropriate tools
-
-## CRITICAL REMINDERS:
-- You are running in HEADLESS mode - DO NOT ask questions to the user
-- DO NOT ask for confirmation or clarification - make reasonable decisions
-- If something is ambiguous, make the most reasonable choice and proceed
-- If you find issues during verification, FIX THEM before completing
-- Only complete if you have VERIFIED (not assumed) that everything works
-
-Proceed with verification now.
+    verification_prompt = """<system-reminder>
+Self-verification required. Re-read the original task (first user message). For each requirement:
+1. Verify it was completed — run commands, check outputs, don't assume
+2. If anything is missing or broken, fix it now
+3. If everything checks out, confirm completion with a brief summary
+Do NOT ask questions — make reasonable decisions and proceed.
 </system-reminder>"""
 
     # 6. Main loop
     iteration = int(restored.get("iteration", 0) or 0) if restored else 0
     checkpoint_every = max(1, int(config.get("checkpoint_every", 1) or 1))
     consecutive_failures = 0
+    _last_plan_hash = ""  # Cache plan context to avoid re-injecting unchanged plans
+    _recovery_msg_count = 0  # Track error recovery messages to cap accumulation
     llm_retry_count = 0
     compaction_count = 0
     parallel_batch_count = 0
@@ -534,12 +502,16 @@ Proceed with verification now.
             if hasattr(tools, "format_plan_for_context"):
                 plan_context = tools.format_plan_for_context()
                 if plan_context:
-                    request_messages.append(
-                        {
-                            "role": "system",
-                            "content": plan_context,
-                        }
-                    )
+                    import hashlib as _hl
+                    _plan_hash = _hl.md5(plan_context.encode()).hexdigest()
+                    if _plan_hash != _last_plan_hash:
+                        _last_plan_hash = _plan_hash
+                        request_messages.append(
+                            {
+                                "role": "system",
+                                "content": plan_context,
+                            }
+                        )
 
             # If compaction happened, update our messages reference
             if len(context_messages) < len(messages):
@@ -562,14 +534,8 @@ Proceed with verification now.
             response = None
             last_error = None
 
-            # Select model tier via router
-            is_verification = pending_completion
-            tier = router.select(
-                messages=cached_messages,
-                iteration=iteration,
-                tool_count=tool_call_count,
-                is_verification=is_verification,
-            )
+            # Reuse tier from context management (avoid double selection)
+            tier = _tier
 
             for attempt in range(1, max_retries + 1):
                 try:
@@ -816,6 +782,14 @@ Proceed with verification now.
                 )
                 ctx.done()
                 return
+            # Cap recovery messages to prevent context bloat (max 2)
+            if _recovery_msg_count >= 2:
+                # Remove the oldest recovery message
+                for ri, rm in enumerate(messages):
+                    if rm.get("role") == "user" and "System note:" in rm.get("content", ""):
+                        messages.pop(ri)
+                        _recovery_msg_count -= 1
+                        break
             messages.append(
                 {
                     "role": "user",
@@ -825,6 +799,7 @@ Proceed with verification now.
                     ),
                 }
             )
+            _recovery_msg_count += 1
             continue
 
         except Exception as e:
@@ -863,6 +838,13 @@ Proceed with verification now.
                 )
                 ctx.done()
                 return
+            # Cap recovery messages to prevent context bloat (max 2)
+            if _recovery_msg_count >= 2:
+                for ri, rm in enumerate(messages):
+                    if rm.get("role") == "user" and "System note:" in rm.get("content", ""):
+                        messages.pop(ri)
+                        _recovery_msg_count -= 1
+                        break
             messages.append(
                 {
                     "role": "user",
@@ -872,6 +854,7 @@ Proceed with verification now.
                     ),
                 }
             )
+            _recovery_msg_count += 1
             continue
 
         runtime = TurnRuntime(

@@ -57,7 +57,7 @@ class ModelTier:
     # Per-model context / capability metadata
     context_window: int = 200_000
     output_reserve: int = 32_000
-    auto_compact_threshold: float = 0.85
+    auto_compact_threshold: float = 0.75
     supports_reasoning: bool = False
     supports_parallel_tools: bool = True
     supports_temperature: bool = True
@@ -94,6 +94,7 @@ class RouterConfig:
         max_tokens=16384,
         context_window=131_072,
         output_reserve=16_384,
+        auto_compact_threshold=0.75,
         supports_reasoning=False,
         supports_parallel_tools=True,
         supports_temperature=True,
@@ -105,7 +106,7 @@ class RouterConfig:
         reasoning_effort="high",
         context_window=131_072,
         output_reserve=32_000,
-        auto_compact_threshold=0.80,
+        auto_compact_threshold=0.75,
         supports_reasoning=True,
         supports_parallel_tools=False,
         supports_temperature=False,

@@ -578,7 +578,7 @@ Output ONLY the updated summary, no preamble or explanation."""
 
     from .llm import llm_chat
     try:
-        return llm_chat(prompt, timeout=300.0)
+        return llm_chat(prompt)
     except Exception:
         return ""
 
@@ -660,7 +660,7 @@ Output ONLY the summary content, no preamble or explanation."""
 
                 from .llm import llm_chat
                 try:
-                    summary = llm_chat(summary_prompt, timeout=300.0)
+                    summary = llm_chat(summary_prompt)
                 except Exception:
                     logger.error("Chat summary timed out or failed")
                     time.sleep(SUMMARY_INTERVAL)
@@ -1097,7 +1097,7 @@ Rules:
 Output ONLY the summary."""
 
         from .llm import llm_chat
-        summary = llm_chat(summary_prompt, timeout=120.0)
+        summary = llm_chat(summary_prompt)
 
         if summary and len(summary) > 50:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")

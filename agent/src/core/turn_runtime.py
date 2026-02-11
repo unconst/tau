@@ -41,18 +41,18 @@ from src.utils.truncate import middle_out_truncate
 # ---------------------------------------------------------------------------
 
 _TOOL_MAX_LINES: Dict[str, int] = {
-    "shell_command": 200,   # keep first 10 + last 190
-    "read_file": 500,       # already limited by offset/limit, but guard
-    "list_dir": 200,
-    "grep_files": 150,
-    "glob_files": 150,
-    "web_search": 100,
-    "spawn_subagent": 300,
+    "shell_command": 100,   # keep first 10 + last 90
+    "read_file": 250,       # already limited by offset/limit, but guard
+    "list_dir": 80,
+    "grep_files": 80,
+    "glob_files": 80,
+    "web_search": 60,
+    "spawn_subagent": 150,
 }
 
-# Absolute byte limit before we truncate (64 KB) — catches binary blobs,
+# Absolute byte limit before we truncate (32 KB) — catches binary blobs,
 # accidental log dumps, etc.
-_TOOL_MAX_BYTES = 65_536
+_TOOL_MAX_BYTES = 32_768
 
 
 def _truncate_tool_output(

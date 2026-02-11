@@ -64,7 +64,7 @@ def _ensure_agent_on_path() -> None:
         sys.path.insert(0, agent_dir)
 
 
-def _make_llm_client(model: str, timeout: float = 300.0):
+def _make_llm_client(model: str, timeout: float | None = None):
     """Create an LLMClient from the agent package."""
     _ensure_agent_on_path()
     from src.llm.client import LLMClient  # type: ignore[import-untyped]
@@ -89,7 +89,7 @@ _tool_registry_lock = _threading.Lock()
 _tool_registry_cache: Dict[str, Any] = {}  # key -> ToolRegistry
 
 
-def _get_cached_llm_client(model: str, timeout: float = 300.0):
+def _get_cached_llm_client(model: str, timeout: float | None = None):
     """Return a cached LLMClient, creating one if needed.
 
     Reuses the underlying httpx connection pool to avoid
@@ -687,7 +687,7 @@ def _register_tau_tools(tools) -> None:
 # 1) llm_chat — simple text completion (no tools)
 # ---------------------------------------------------------------------------
 
-def llm_chat(prompt: str, *, model: str | None = None, timeout: float = 300.0) -> str:
+def llm_chat(prompt: str, *, model: str | None = None, timeout: float | None = None) -> str:
     """Run a simple text completion — no tools, no agent loop.
 
     Used for summaries, fact extraction, and other pure-LLM tasks.
@@ -731,7 +731,7 @@ def run_baseagent(
     effective_cwd = cwd or WORKSPACE
     config = _make_config(readonly=readonly)
 
-    llm = _get_cached_llm_client(effective_model, timeout=300.0)
+    llm = _get_cached_llm_client(effective_model)
     tools = _get_cached_tool_registry(effective_cwd, register_tau=not readonly)
 
     # Use the proper AgentContext from the agent package
@@ -817,7 +817,7 @@ def run_baseagent_streaming(
             if plan_approval_callback is not None:
                 config["plan_approval_callback"] = plan_approval_callback
 
-        llm = _get_cached_llm_client(effective_model, timeout=300.0)
+        llm = _get_cached_llm_client(effective_model)
         tools = _get_cached_tool_registry(effective_cwd, register_tau=not readonly)
 
         # Wire up ask_user callback if we have a chat_id (Telegram context)

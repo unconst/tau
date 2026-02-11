@@ -39,6 +39,11 @@ class ReadFileTool(BaseTool):
             return ToolResult.fail(f"Not a file: {file_path}")
 
         try:
+            file_size = resolved_path.stat().st_size
+        except Exception:
+            file_size = 0
+
+        try:
             content = resolved_path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             # Try reading as binary for non-text files
@@ -51,6 +56,37 @@ class ReadFileTool(BaseTool):
 
         lines = content.splitlines()
         total_lines = len(lines)
+
+        # Smart preview for large files when no specific range is requested
+        if total_lines > 500 and offset == 0 and limit is None:
+            head = lines[:50]
+            tail = lines[-30:] if total_lines > 80 else []
+            duration_ms = int((time.time() - start_time) * 1000)
+            preview_lines = [f"[File: {file_path} | {file_size:,} bytes | {total_lines} lines]"]
+            preview_lines.append("[Large file — showing first 50 lines. Use offset/limit to read specific sections.]\n")
+            for i, line in enumerate(head, start=1):
+                preview_lines.append(f"L{i}: {line}")
+            if tail:
+                preview_lines.append(f"\n[... {total_lines - 50 - len(tail)} lines omitted ...]\n")
+                for i, line in enumerate(tail, start=total_lines - len(tail) + 1):
+                    preview_lines.append(f"L{i}: {line}")
+            metadata = ToolMetadata(
+                duration_ms=duration_ms,
+                data={
+                    "path": str(resolved_path),
+                    "filename": resolved_path.name,
+                    "extension": resolved_path.suffix,
+                    "size": file_size,
+                    "total_lines": total_lines,
+                    "shown_lines": len(head) + len(tail),
+                    "offset": 0,
+                    "truncated": True,
+                    "empty": False,
+                    "preview": True,
+                },
+            )
+            result = ToolResult.ok("\n".join(preview_lines))
+            return result.with_metadata(metadata)
 
         # Handle empty file
         if total_lines == 0 or (total_lines == 1 and lines[0] == ""):
