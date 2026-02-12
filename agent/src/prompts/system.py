@@ -615,6 +615,7 @@ For a typical refactoring task, aim for 3-5 turns total, NOT 15-20.
   A test file costs 3-5 tool calls (write, run, debug, fix, re-run). An inline command costs 1.
 - For syntax checks: `python3 -c "import ast; ast.parse(open('file.py').read())"`
 - Verify ONCE. After a passing check, the task is done — do not re-read edited files, re-run checks, or create additional validation.
+- If verification fails, fix it in ONE turn and re-verify. Do NOT spiral into multi-turn debugging — after 2 diagnostic commands without a fix, either apply your best fix or accept the result.
 - Do not add tests to codebases with none
 
 ## Responses

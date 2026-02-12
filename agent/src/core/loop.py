@@ -530,9 +530,15 @@ Do NOT ask questions — make reasonable decisions and proceed.
     _plan_only_freebies_used = 0  # Plan-only turns forgiven (iteration not consumed)
     _max_plan_only_freebies = int(config.get("max_plan_only_freebies", 5) or 5)
     _total_plan_only_turns = 0  # Total plan-only turns observed
+    _has_made_edits_ever = False  # Whether any file edit has been made in this session
+    _consecutive_no_edit_turns = 0  # Consecutive turns with tool calls but no file edits
+    _investigation_nudge_count = 0  # Track investigation loop nudge messages
     llm_retry_count = 0
     compaction_count = 0
     parallel_batch_count = 0
+    # Track empty-response counts per model to deprioritize bad fallbacks.
+    _model_empty_counts: Dict[str, int] = {}
+    _MODEL_EMPTY_THRESHOLD = 3  # Skip model after this many empty responses
     approval_denials = 0
     guard_escalations = 0
     subagent_failures = 0
@@ -607,7 +613,11 @@ Do NOT ask questions — make reasonable decisions and proceed.
 
             # Build the ordered list of models to try: primary + fallbacks.
             # Exclude the primary model from fallbacks to avoid duplicates.
-            _fallbacks = [m for m in (tier.fallback_models or []) if m != tier.model]
+            # Also skip models that have produced too many empty responses.
+            _fallbacks = [
+                m for m in (tier.fallback_models or [])
+                if m != tier.model and _model_empty_counts.get(m, 0) < _MODEL_EMPTY_THRESHOLD
+            ]
             models_to_try = [tier.model] + _fallbacks
 
             model_succeeded = False
@@ -714,6 +724,12 @@ Do NOT ask questions — make reasonable decisions and proceed.
                         last_error = e
                         error_msg = str(e.message) if hasattr(e, "message") else str(e)
                         _log(f"LLM error (attempt {attempt}/{max_retries}, model={_current_model}): {e.code} - {error_msg}")
+
+                        # Track empty responses per model so we can skip bad fallbacks.
+                        if e.code == "empty_response":
+                            _model_empty_counts[_current_model] = _model_empty_counts.get(_current_model, 0) + 1
+                            if _model_empty_counts[_current_model] >= _MODEL_EMPTY_THRESHOLD:
+                                _log(f"Model '{_current_model}' has {_model_empty_counts[_current_model]} empty responses — will be skipped in future fallbacks")
 
                         # Don't retry authentication errors
                         if e.code in ("authentication_error", "invalid_api_key"):
@@ -1087,18 +1103,11 @@ Do NOT ask questions — make reasonable decisions and proceed.
         # ================================================================
         # Plan-only turn detection
         # ================================================================
-        # If the agent's only tool call(s) in a turn were update_plan, it
-        # wasted an entire LLM round-trip on bookkeeping.  Inject a nudge
-        # telling it to combine plan updates with productive actions.
-        _turn_tool_names: set[str] = set()
-        for _msg in reversed(messages):
-            if _msg.get("role") == "assistant" and _msg.get("tool_calls"):
-                _turn_tool_names = {
-                    tc.get("function", {}).get("name", "")
-                    for tc in _msg.get("tool_calls", [])
-                }
-                break
-        if _turn_tool_names and _turn_tool_names == {"update_plan"}:
+        # The TurnRuntime now detects plan-only turns early (before full
+        # tool execution) and injects a nudge directly into the tool result.
+        # We only need to handle the bookkeeping: iteration forgiveness,
+        # logging, and consecutive-turn tracking.
+        if runtime_result.plan_only_turn:
             _consecutive_plan_only_turns += 1
             _log(
                 f"Plan-only turn detected (consecutive: {_consecutive_plan_only_turns}) "
@@ -1108,25 +1117,6 @@ Do NOT ask questions — make reasonable decisions and proceed.
                 "type": "stream.plan_only_turn",
                 "consecutive_plan_only_turns": _consecutive_plan_only_turns,
             })
-            # Cap nudge messages (max 1 active)
-            if _plan_only_nudge_count >= 1:
-                for ri, rm in enumerate(messages):
-                    if rm.get("role") == "user" and "plan-only turn" in rm.get("content", ""):
-                        messages.pop(ri)
-                        _plan_only_nudge_count -= 1
-                        break
-            plan_only_nudge = (
-                "<system-reminder>\n"
-                "EFFICIENCY WARNING: You just spent a full turn only calling `update_plan` "
-                "with no productive tool calls. Each turn costs a full LLM round-trip.\n\n"
-                "NEVER issue `update_plan` as the only action. Always pair it with a "
-                "productive tool call (read_file, hashline_edit, grep_files, etc.).\n\n"
-                "On your next turn, take a REAL action toward completing the task. "
-                "If you need to update the plan, do it alongside a read or edit.\n"
-                "</system-reminder>"
-            )
-            messages.append({"role": "user", "content": plan_only_nudge})
-            _plan_only_nudge_count += 1
             _total_plan_only_turns += 1
             # Don't count plan-only turns against the iteration budget (up to cap)
             if _plan_only_freebies_used < _max_plan_only_freebies:
@@ -1134,8 +1124,68 @@ Do NOT ask questions — make reasonable decisions and proceed.
                 _plan_only_freebies_used += 1
                 _log(f"Plan-only turn forgiven ({_plan_only_freebies_used}/{_max_plan_only_freebies} freebies used)")
         else:
-            if _turn_tool_names:
-                _consecutive_plan_only_turns = 0
+            _consecutive_plan_only_turns = 0
+
+        # ================================================================
+        # Investigation loop detection
+        # ================================================================
+        # Track consecutive turns where the agent made tool calls but
+        # didn't edit any files (write_file, str_replace, hashline_edit,
+        # apply_patch).  This catches debugging/investigation spirals
+        # where the agent keeps running diagnostic commands without
+        # making progress toward the goal.
+        if runtime_result.made_edits:
+            _has_made_edits_ever = True
+            _consecutive_no_edit_turns = 0
+        elif (
+            _has_made_edits_ever
+            and runtime_result.tool_call_count_delta > 0
+            and not runtime_result.plan_only_turn
+        ):
+            _consecutive_no_edit_turns += 1
+
+        _investigation_loop_threshold = int(config.get("investigation_loop_threshold", 3) or 3)
+        if (
+            _consecutive_no_edit_turns > 0
+            and _consecutive_no_edit_turns >= _investigation_loop_threshold
+            and _consecutive_no_edit_turns % _investigation_loop_threshold == 0
+        ):
+            _log(
+                f"Investigation loop: {_consecutive_no_edit_turns} consecutive turns "
+                "without file edits after initial editing phase"
+            )
+            emit_raw({
+                "type": "stream.investigation_loop",
+                "consecutive_no_edit_turns": _consecutive_no_edit_turns,
+            })
+            # Cap nudge messages to prevent context bloat (max 1 active)
+            if _investigation_nudge_count >= 1:
+                for ri, rm in enumerate(messages):
+                    if (
+                        rm.get("role") == "user"
+                        and "without editing" in rm.get("content", "")
+                        and "investigation" in rm.get("content", "").lower()
+                    ):
+                        messages.pop(ri)
+                        _investigation_nudge_count -= 1
+                        break
+            investigation_nudge = (
+                "<system-reminder>\n"
+                f"WARNING: You have spent {_consecutive_no_edit_turns} consecutive turns "
+                "running commands and reading files without editing any files. "
+                "You are stuck in a debugging/investigation loop.\n\n"
+                "STOP investigating. Take ONE of these actions NOW:\n"
+                "1. If you know what to fix — apply the fix (write_file, str_replace, "
+                "or hashline_edit) and re-verify once\n"
+                "2. If the output is close enough (e.g. minor floating-point precision "
+                "differences) — the task is DONE, stop with no tool calls\n"
+                "3. If you truly cannot fix it — report what you found and stop\n\n"
+                "Your next response MUST include a file edit or be a completion "
+                "statement with no tool calls.\n"
+                "</system-reminder>"
+            )
+            messages.append({"role": "user", "content": investigation_nudge})
+            _investigation_nudge_count += 1
 
         # ================================================================
         # Consecutive tool failure loop detection
@@ -1334,6 +1384,8 @@ Do NOT ask questions — make reasonable decisions and proceed.
             "subagent_failures": subagent_failures,
             "subagent_rate_limit_failures": subagent_rate_limit_failures,
             "consecutive_tool_failure_turns": consecutive_tool_failure_turns,
+            "plan_only_turns": _total_plan_only_turns,
+            "plan_only_freebies_used": _plan_only_freebies_used,
             "completion_reason": completion_reason,
             "budget": {
                 "max_cost": budget.snapshot().max_cost,

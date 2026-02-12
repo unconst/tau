@@ -54,6 +54,10 @@ _TOOL_MAX_LINES: Dict[str, int] = {
 # accidental log dumps, etc.
 _TOOL_MAX_BYTES = 32_768
 
+# Tools that modify files — used to detect investigation loops
+# (consecutive turns with only read/diagnostic tools).
+_EDIT_TOOLS = frozenset({"write_file", "str_replace", "hashline_edit", "apply_patch"})
+
 
 def _truncate_tool_output(
     output: str,
@@ -114,6 +118,8 @@ class TurnRuntimeResult:
     subagent_rate_limit_failures_delta: int = 0
     tool_successes_delta: int = 0
     tool_failures_delta: int = 0
+    plan_only_turn: bool = False  # True when only update_plan was called (no productive tools)
+    made_edits: bool = False  # True when any file-modifying tool was called this turn
 
 
 class TurnRuntime:
@@ -229,6 +235,38 @@ class TurnRuntime:
 
         updated_messages = list(messages)
         updated_messages.append(assistant_msg)
+
+        # Early detection: if the only tool calls are update_plan, execute
+        # them but flag the turn as plan-only so the loop can avoid counting
+        # it as a real iteration.  This saves the full LLM round-trip that
+        # the post-hoc nudge in loop.py would otherwise cost.
+        _call_names = {c.tool_name for c in parsed_calls}
+        if _call_names and _call_names == {"update_plan"}:
+            # Execute the update_plan call(s) so the plan is updated
+            for call in parsed_calls:
+                result = self._tools.execute(ctx, call.tool_name, call.arguments)
+                plan_output = result.output if result.success else (result.error or "plan update failed")
+                updated_messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.call_id,
+                    "content": plan_output + (
+                        "\n\n[EFFICIENCY WARNING] You spent this entire turn on update_plan with "
+                        "NO productive tool call. Each turn costs a full LLM round-trip. "
+                        "On your NEXT response, you MUST include at least one productive "
+                        "tool call (read_file, hashline_edit, grep_files, shell_command, etc.) "
+                        "alongside any plan update."
+                    ),
+                })
+            return TurnRuntimeResult(
+                messages=updated_messages,
+                pending_completion=pending_completion,
+                last_agent_message=last_agent_message,
+                tool_call_count_delta=len(parsed_calls),
+                completed=False,
+                plan_only_turn=True,
+            )
+
+        _has_edit = any(c.tool_name in _EDIT_TOOLS for c in parsed_calls)
 
         precomputed: list[tuple[str, Any, Any]] = []
         for call in parsed_calls:
@@ -475,6 +513,7 @@ class TurnRuntime:
                     subagent_rate_limit_failures_delta=subagent_rate_limit_failures,
                     tool_successes_delta=tool_successes,
                     tool_failures_delta=tool_failures,
+                    made_edits=_has_edit,
                 )
 
         return TurnRuntimeResult(
@@ -491,6 +530,7 @@ class TurnRuntime:
             subagent_rate_limit_failures_delta=subagent_rate_limit_failures,
             tool_successes_delta=tool_successes,
             tool_failures_delta=tool_failures,
+            made_edits=_has_edit,
         )
 
     @staticmethod
