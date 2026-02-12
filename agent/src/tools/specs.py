@@ -101,7 +101,9 @@ GREP_FILES_SPEC: dict[str, Any] = {
     "description": """Finds files whose contents match the pattern.
 Uses ripgrep (rg) for fast searching.
 Returns matching lines with surrounding context, showing filepath:line_number:content.
-The limit parameter controls total match results (not files).""",
+The limit parameter controls total match results (not files).
+If no matches are found, returns a clear 'No matches found' message.
+Do NOT retry the same pattern — if you get no matches, verify the search path exists with list_dir or glob_files first.""",
     "parameters": {
         "type": "object",
         "properties": {

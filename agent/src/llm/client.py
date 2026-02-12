@@ -471,36 +471,84 @@ class LLMClient:
         if extra_body:
             payload.update(extra_body)
 
-        try:
-            response = self._client.post("/chat/completions", json=payload)
-            self._request_count += 1
+        # Non-streaming retry loop (mirrors the stream-level retry in chat_stream)
+        _CHAT_MAX_RETRIES = 3
+        _chat_retryable_codes = {"timeout", "rate_limit", "server_error", "api_error", "empty_response"}
+        last_chat_error: Optional[Exception] = None
+        data: Optional[Dict[str, Any]] = None
 
-            # Parse rate-limit headers from every response
-            rl_info = _parse_rate_limit_headers(response.headers)
-            if rl_info.remaining_requests is not None:
-                self._last_rate_limit = rl_info
+        for chat_attempt in range(1, _CHAT_MAX_RETRIES + 1):
+            try:
+                response = self._client.post("/chat/completions", json=payload)
+                self._request_count += 1
 
-            # Handle HTTP errors
-            if response.status_code != 200:
-                error_body = response.text
-                try:
-                    error_json = response.json()
-                    error_msg = error_json.get("error", {}).get("message", error_body)
-                except (json.JSONDecodeError, KeyError):
-                    error_msg = error_body
+                # Parse rate-limit headers from every response
+                rl_info = _parse_rate_limit_headers(response.headers)
+                if rl_info.remaining_requests is not None:
+                    self._last_rate_limit = rl_info
 
-                self._raise_http_error(response.status_code, error_msg, response.headers)
+                # Handle HTTP errors
+                if response.status_code != 200:
+                    error_body = response.text
+                    try:
+                        error_json = response.json()
+                        error_msg = error_json.get("error", {}).get("message", error_body)
+                    except (json.JSONDecodeError, KeyError):
+                        error_msg = error_body
 
-            data = response.json()
+                    self._raise_http_error(response.status_code, error_msg, response.headers)
 
-        except (CostLimitExceeded, LLMError, ContextWindowExceeded):
-            raise
-        except httpx.TimeoutException as e:
-            raise LLMError(f"Request timed out: {e}", code="timeout")
-        except httpx.ConnectError as e:
-            raise LLMError(f"Connection error: {e}", code="connection_error")
-        except httpx.HTTPError as e:
-            raise LLMError(f"HTTP error: {e}", code="api_error")
+                data = response.json()
+                break  # Success
+
+            except (CostLimitExceeded, ContextWindowExceeded):
+                raise  # Never retry these
+            except LLMError as e:
+                last_chat_error = e
+                # Don't retry auth errors
+                if e.code in ("authentication_error", "invalid_api_key", "context_window_exceeded"):
+                    raise
+                # Retry transient errors with backoff
+                if chat_attempt < _CHAT_MAX_RETRIES and e.code in _chat_retryable_codes:
+                    base_wait = min(20.0, 0.5 * (2 ** (chat_attempt - 1)))
+                    if e.rate_limit_info and e.code == "rate_limit":
+                        header_wait = e.rate_limit_info.seconds_until_reset()
+                        if header_wait is not None and header_wait > 0:
+                            base_wait = min(header_wait + 0.5, 60.0)
+                    _log_client(
+                        f"chat() error (attempt {chat_attempt}/{_CHAT_MAX_RETRIES}): "
+                        f"{e.code} — retrying in {base_wait:.1f}s"
+                    )
+                    time.sleep(base_wait)
+                    continue
+                raise
+            except httpx.TimeoutException as e:
+                last_chat_error = e
+                if chat_attempt < _CHAT_MAX_RETRIES:
+                    wait = min(20.0, 0.5 * (2 ** (chat_attempt - 1)))
+                    _log_client(f"chat() timeout (attempt {chat_attempt}/{_CHAT_MAX_RETRIES}) — retrying in {wait:.1f}s")
+                    time.sleep(wait)
+                    continue
+                raise LLMError(f"Request timed out: {e}", code="timeout")
+            except httpx.ConnectError as e:
+                raise LLMError(f"Connection error: {e}", code="connection_error")
+            except httpx.HTTPError as e:
+                last_chat_error = e
+                if chat_attempt < _CHAT_MAX_RETRIES:
+                    wait = min(20.0, 0.5 * (2 ** (chat_attempt - 1)))
+                    _log_client(f"chat() HTTP error (attempt {chat_attempt}/{_CHAT_MAX_RETRIES}) — retrying in {wait:.1f}s")
+                    time.sleep(wait)
+                    continue
+                raise LLMError(f"HTTP error: {e}", code="api_error")
+
+        if data is None:
+            # All retries exhausted — raise the last error
+            if isinstance(last_chat_error, LLMError):
+                raise last_chat_error
+            raise LLMError(
+                f"chat() failed after {_CHAT_MAX_RETRIES} attempts: {last_chat_error}",
+                code="retry_exhausted",
+            )
 
         # Parse response
         result = LLMResponse(raw=data)
@@ -676,23 +724,19 @@ class LLMClient:
             stream_completed = False
 
             try:
-                # Use a per-stream timeout for idle detection
+                # Reuse the shared connection pool; override timeout per-request
+                # for stream idle detection.
                 stream_timeout = httpx.Timeout(
                     timeout=None,
                     connect=30.0,
                     read=self.stream_idle_timeout,
                 )
-                stream_client = httpx.Client(
-                    base_url=self.base_url,
-                    headers={
-                        "Authorization": f"Bearer {self._api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    timeout=stream_timeout,
+                stream_client = _get_shared_http_client(
+                    self.base_url, self._api_key, None,
                 )
 
                 try:
-                    with stream_client.stream("POST", "/chat/completions", json=payload) as resp:
+                    with stream_client.stream("POST", "/chat/completions", json=payload, timeout=stream_timeout) as resp:
                         self._request_count += 1
 
                         # Parse rate-limit headers
@@ -762,7 +806,7 @@ class LLMClient:
                         # (some providers close the stream without [DONE])
                         stream_completed = True
                 finally:
-                    stream_client.close()
+                    pass  # Shared pool manages client lifecycle
 
             except (ContextWindowExceeded, CostLimitExceeded):
                 raise  # Never retry these

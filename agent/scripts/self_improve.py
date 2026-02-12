@@ -292,8 +292,8 @@ CURRICULUM_TIERS = {
         "name": "startup",
         "description": "Agent cannot start — fix import/startup errors",
         "focus_areas": [
-            "error handling and recovery",
-            "tool implementation",
+            "error recovery speed",
+            "tool call precision",
         ],
     },
     1: {
@@ -1115,23 +1115,31 @@ def build_task_generation_prompt(
 
     return (
         "You are generating a coding task for an autonomous coding agent to attempt. "
-        "The agent will try to solve this task, and we will analyze its behavior "
-        "(the full rollout of tool calls, reasoning, and errors) to find weaknesses "
-        "and improve the agent's code.\n\n"
-        f"The current improvement focus area is: **{focus}** — {desc}.\n"
+        "The agent will try to solve this task, and we will analyze its SPEED and "
+        "ACCURACY — how many turns it takes, how many tokens it burns, whether it "
+        "gets the right answer on the first try, and where it wastes time.\n\n"
+        "Our goal is to make this agent FASTER (primarily) and more ACCURATE. "
+        "The task you generate should expose inefficiencies in the agent's behavior.\n\n"
+        f"The current focus area is: **{focus}** — {desc}.\n"
         f"{preflight_section}\n"
         f"## Previous Iterations\n"
         f"{history_text}\n\n"
         f"## Blacklisted Tasks (do NOT generate these)\n"
         f"{blacklist_text}\n\n"
         "## Task Design Guidelines\n"
-        "Generate a task that will EXERCISE the focus area and expose weaknesses:\n"
-        f"- For **{focus}**: design a task that requires the agent to demonstrate "
-        f"strong {focus} skills\n"
-        "- The task should be completable by a competent agent in under 5 minutes\n"
+        "Generate a task that will EXPOSE speed and accuracy weaknesses:\n"
+        f"- For **{focus}**: design a task where a fast agent would solve it in "
+        f"2-3 turns but a slow agent might take 8-10+\n"
+        "- The task should be completable by a competent agent in under 3 minutes "
+        "and ideally in under 1 minute\n"
         "- The task should work in a sandbox directory (the agent will be given a "
         "working directory path)\n"
         "- Make the task concrete and verifiable (specific expected outputs)\n"
+        "- Good task types for exposing speed issues:\n"
+        "  - Multi-file creation/editing (tests if agent batches or does one-at-a-time)\n"
+        "  - Bug fixing in existing code (tests if agent reads carefully vs trial-and-error)\n"
+        "  - Search-and-replace tasks (tests if agent uses efficient tools)\n"
+        "  - Tasks requiring reading a file then acting on it (tests if agent over-reads)\n"
         "- Vary the difficulty and type from previous iterations\n"
         "- The task should be DIFFERENT from tasks already tried above\n"
         f"{simplify_note}\n\n"

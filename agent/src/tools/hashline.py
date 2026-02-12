@@ -103,12 +103,18 @@ def validate_ref(ref: str, lines: Sequence[str]) -> tuple[bool, str | None]:
             f"Line {line_number} out of range (file has {len(lines)} lines)"
         )
 
-    actual_hash = line_hash(lines[line_number - 1])
+    actual_content = lines[line_number - 1]
+    actual_hash = line_hash(actual_content)
     if actual_hash != expected_hash:
+        # Include actual hash and line content so the model can self-correct
+        # without re-reading the file.
+        content_preview = actual_content.rstrip("\n\r")
+        if len(content_preview) > 120:
+            content_preview = content_preview[:120] + "..."
         return False, (
             f"Hash mismatch at line {line_number}: "
-            f"expected {expected_hash!r}, got {actual_hash!r} "
-            f"(file may have changed)"
+            f"expected {expected_hash!r}, actual {actual_hash!r}. "
+            f"Current content: {content_preview!r}"
         )
 
     return True, None
