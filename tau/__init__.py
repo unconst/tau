@@ -1227,59 +1227,37 @@ def run_adapt_streaming(
     stream = TelegramStreamingMessage(
         chat_id,
         reply_to_message_id=reply_to_message_id,
-        initial_text="⏱ 0s",
-        min_edit_interval_seconds=0.9,
-        min_chars_delta=10,
+        initial_text="...",
+        min_edit_interval_seconds=0.8,
+        min_chars_delta=8,
     )
 
-    from .llm import run_baseagent_streaming, parse_event, format_tool_update
+    from .llm import run_baseagent_streaming, parse_event, format_tool_inline
 
     start_time = time.time()
-    thinking_updates: list[str] = []
-    thinking_text_buffer: str = ""
+    streamed_text = ""
+    raw_output = ""
     final_result_text: str | None = None
-    current_tool: str | None = None
-    last_thinking_snippet: str = ""
+    tool_lines: list[str] = []
+    active_tool_idx: int | None = None
+    active_tool_parsed: dict | None = None
     tool_call_count = 0
-    cost_estimate = 0.0
-    context_tokens = 0
+    got_text_deltas = False
 
-    def _format_elapsed(seconds: float) -> str:
-        if seconds < 60:
-            return f"{seconds:.0f}s"
-        minutes = int(seconds // 60)
-        secs = int(seconds % 60)
-        return f"{minutes}m{secs:02d}s"
-
-    def build_display():
-        elapsed = time.time() - start_time
-        lines = []
-
-        if thinking_text_buffer.strip():
-            cleaned = thinking_text_buffer.strip().replace("\n", " ")
-            display_thinking = last_thinking_snippet if last_thinking_snippet else cleaned
-            if len(display_thinking) > 150:
-                display_thinking = "..." + display_thinking[-147:]
-            lines.append(f"💭 {display_thinking}\n")
-
-        if thinking_updates:
-            lines.append("")
-            lines.extend(thinking_updates[-6:])
-
-        footer_parts = [f"⏱ {_format_elapsed(elapsed)}"]
-        if tool_call_count > 0:
-            footer_parts.append(f"🔧 {tool_call_count} tools")
-        if context_tokens > 0:
-            ctx_k = context_tokens / 1000
-            if ctx_k >= 100:
-                footer_parts.append(f"📐 {ctx_k:.0f}k ctx")
-            else:
-                footer_parts.append(f"📐 {ctx_k:.1f}k ctx")
-        if cost_estimate > 0:
-            footer_parts.append(f"💰 ${cost_estimate:.4f}")
-        lines.append("\n" + " · ".join(footer_parts))
-
-        return "\n".join(lines)
+    def _build_live_text() -> str:
+        parts = []
+        if streamed_text.strip():
+            parts.append(streamed_text.rstrip())
+        if tool_lines:
+            if parts:
+                parts.append("")
+            parts.extend(tool_lines[-8:])
+        if not parts:
+            elapsed = time.time() - start_time
+            if elapsed < 2:
+                return "..."
+            return "⏳ adapting..."
+        return "\n".join(parts)
 
     q: queue.Queue = queue.Queue()
 
@@ -1307,31 +1285,18 @@ def run_adapt_streaming(
             try:
                 event = q.get(timeout=0.25)
             except queue.Empty:
-                event = None
                 now = time.time()
                 if now - last_display_update >= 1.5:
-                    stream.set_text(build_display())
+                    stream.set_text(_build_live_text())
                     last_display_update = now
                 continue
 
             if event is None:
                 break
 
-            # Handle raw events for dashboard
             etype = event.get("type", "")
-            if etype in ("stream.tool.started", "stream.tool.completed"):
-                if etype == "stream.tool.completed":
-                    tool_call_count += 1
-            if etype == "turn.metrics":
-                cost_data = event.get("budget", {})
-                cost_estimate = cost_data.get("consumed_cost", 0.0)
-            if etype == "stream.usage":
-                context_tokens = event.get("input_tokens", 0)
-
-            now = time.time()
-            if now - last_display_update >= 1.5:
-                stream.set_text(build_display())
-                last_display_update = now
+            if etype == "stream.tool.completed":
+                tool_call_count += 1
 
             parsed = parse_event(event)
             if parsed is None:
@@ -1339,55 +1304,44 @@ def run_adapt_streaming(
 
             kind = parsed["kind"]
 
-            if kind == "tool_start":
-                current_tool = parsed.get("tool_name")
-                update = format_tool_update(parsed)
-                if update:
-                    thinking_updates.append(update)
-                    stream.set_text(build_display())
+            if kind == "text_delta":
+                delta = parsed.get("text", "")
+                if delta:
+                    got_text_deltas = True
+                    streamed_text += delta
+                    stream.set_text(_build_live_text())
                     last_display_update = time.time()
 
+            elif kind == "tool_start":
+                active_tool_parsed = parsed
+                inline = format_tool_inline(parsed, done=False)
+                tool_lines.append(inline)
+                active_tool_idx = len(tool_lines) - 1
+                stream.set_text(_build_live_text())
+                last_display_update = time.time()
+
             elif kind == "tool_done":
-                if current_tool:
-                    if thinking_updates:
-                        thinking_updates[-1] = thinking_updates[-1].replace("...", " ✓")
-                        stream.set_text(build_display())
-                        last_display_update = time.time()
-                    current_tool = None
+                if active_tool_idx is not None and active_tool_idx < len(tool_lines):
+                    done_inline = format_tool_inline(
+                        active_tool_parsed or parsed, done=True
+                    )
+                    tool_lines[active_tool_idx] = done_inline
+                    stream.set_text(_build_live_text())
+                    last_display_update = time.time()
+                active_tool_idx = None
+                active_tool_parsed = None
 
             elif kind in ("message", "message_done"):
                 text = parsed.get("text", "")
                 if text:
                     if kind == "message_done":
-                        thinking_text_buffer = text
-                    elif len(text) > len(thinking_text_buffer):
-                        thinking_text_buffer = text
-
-                    cleaned = thinking_text_buffer.strip().replace("\n", " ")
-                    last_sentence_end = -1
-                    for i in range(len(cleaned) - 1, -1, -1):
-                        if cleaned[i] in '.!?' and (i == len(cleaned) - 1 or cleaned[i + 1] in ' \n\t'):
-                            last_sentence_end = i
-                            break
-                    if last_sentence_end > 0:
-                        complete_text = cleaned[:last_sentence_end + 1]
-                        if len(complete_text) > 100:
-                            snippet_start = len(complete_text) - 100
-                            for i in range(snippet_start, len(complete_text)):
-                                if complete_text[i] in '.!?' and i + 1 < len(complete_text):
-                                    snippet_start = i + 2
-                                    break
-                            snippet = complete_text[snippet_start:].strip()
-                        else:
-                            snippet = complete_text
-                        if snippet and snippet != last_thinking_snippet:
-                            last_thinking_snippet = snippet
-
-                    if len(thinking_text_buffer) > 50:
-                        final_result_text = thinking_text_buffer
-
-                    stream.set_text(build_display())
-                    last_display_update = time.time()
+                        raw_output = text
+                    elif len(text) > len(raw_output):
+                        raw_output = text
+                    if not got_text_deltas and text.strip():
+                        streamed_text = text
+                        stream.set_text(_build_live_text())
+                        last_display_update = time.time()
 
             elif kind == "error":
                 err_text = parsed.get("text", "Agent error")
@@ -1402,8 +1356,10 @@ def run_adapt_streaming(
         stream.set_text(msg)
         return msg
 
-    if final_result_text:
-        summary = final_result_text.strip()
+    output = (final_result_text or raw_output or streamed_text or "").strip()
+
+    if output:
+        summary = output
         summary = re.sub(r'```[\s\S]*?```', '[code]', summary)
         if len(summary) > 600:
             cut = summary[:600].rfind('. ')
@@ -1417,14 +1373,15 @@ def run_adapt_streaming(
                     summary = summary[:597] + "..."
         final_msg = f"✅ Done\n\n{summary}"
     else:
-        ops = [u.replace("...", "").replace(" ✓", "") for u in thinking_updates]
-        if ops:
-            final_msg = "✅ Done\n\nChanges made:\n" + "\n".join(ops[-10:])
+        # Fallback: summarize tool operations
+        completed = [l for l in tool_lines if "✓" in l]
+        if completed:
+            final_msg = "✅ Done\n\n" + "\n".join(completed[-10:])
         else:
             final_msg = "✅ Done"
 
     stream.set_text(final_msg)
-    return final_result_text or "Adaptation complete"
+    return output or "Adaptation complete"
 
 
 @bot.message_handler(commands=['adapt'])
@@ -2053,76 +2010,56 @@ def run_agent_ask_streaming(
         chat_id,
         reply_to_message_id=reply_to_message_id,
         existing_message_id=existing_message_id,
-        initial_text="⏱ 0s",
-        min_edit_interval_seconds=0.9,
-        min_chars_delta=10,
+        initial_text="...",
+        min_edit_interval_seconds=0.8,
+        min_chars_delta=8,
     )
 
-    from .llm import run_baseagent_streaming, parse_event, format_tool_update
+    from .llm import run_baseagent_streaming, parse_event, format_tool_inline
 
     start_time = time.time()
+    # Streamed text accumulator — holds the live text as the model generates it
+    streamed_text = ""
+    # Final complete message text (from item.completed agent_message)
     raw_output = ""
     final_result_text: str | None = None
-    thinking_updates: list[str] = []
-    thinking_text_buffer: str = ""
-    current_tool: str | None = None
-    last_thinking_snippet: str = ""
-    # Progress dashboard state
-    current_plan_steps: list[dict] = []
+    # Tool tracking
+    tool_lines: list[str] = []  # compact inline tool indicators
+    active_tool_idx: int | None = None  # index into tool_lines of current tool
+    active_tool_parsed: dict | None = None
     tool_call_count = 0
-    cost_estimate = 0.0
-    context_tokens = 0
+    # Track whether we've seen any real text deltas
+    got_text_deltas = False
 
-    def _format_elapsed(seconds: float) -> str:
-        if seconds < 60:
-            return f"{seconds:.0f}s"
-        minutes = int(seconds // 60)
-        secs = int(seconds % 60)
-        return f"{minutes}m{secs:02d}s"
+    def _build_live_text() -> str:
+        """Build the message shown while the agent is working.
 
-    def build_display():
-        elapsed = time.time() - start_time
-        lines = []
+        Layout:
+          <streamed model text so far>
 
-        # Show plan progress if we have a plan
-        if current_plan_steps:
-            completed = sum(1 for s in current_plan_steps if s.get("status") == "completed")
-            total = len(current_plan_steps)
-            in_progress = [s for s in current_plan_steps if s.get("status") == "in_progress"]
-            progress_bar = f"📊 {completed}/{total}"
-            if in_progress:
-                current_step = in_progress[0].get("description", "")
-                progress_bar += f" — {current_step}"
-            lines.append(progress_bar + "\n")
+          ⏳ tool indicator (if tool running)
+          ✓ tool indicator (completed tools)
+        """
+        parts = []
 
-        # Show current thinking snippet
-        if thinking_text_buffer.strip():
-            cleaned = thinking_text_buffer.strip().replace("\n", " ")
-            display_thinking = last_thinking_snippet if last_thinking_snippet else cleaned
-            if len(display_thinking) > 150:
-                display_thinking = "..." + display_thinking[-147:]
-            lines.append(f"💭 {display_thinking}\n")
+        # Main streamed text
+        if streamed_text.strip():
+            parts.append(streamed_text.rstrip())
 
-        # Show recent tool operations
-        if thinking_updates:
-            lines.append("")
-            lines.extend(thinking_updates[-6:])
+        # Tool activity block (compact, appended after text)
+        if tool_lines:
+            # Show a blank line separator if there's text above
+            if parts:
+                parts.append("")
+            parts.extend(tool_lines[-8:])
 
-        # Footer: elapsed time, tool count, context, cost
-        footer_parts = [f"⏱ {_format_elapsed(elapsed)}"]
-        if tool_call_count > 0:
-            footer_parts.append(f"🔧 {tool_call_count} tools")
-        if context_tokens > 0:
-            ctx_k = context_tokens / 1000
-            if ctx_k >= 100:
-                footer_parts.append(f"📐 {ctx_k:.0f}k ctx")
-            else:
-                footer_parts.append(f"📐 {ctx_k:.1f}k ctx")
-        if cost_estimate > 0:
-            footer_parts.append(f"💰 ${cost_estimate:.4f}")
-        lines.append("\n" + " · ".join(footer_parts))
+        if not parts:
+            elapsed = time.time() - start_time
+            if elapsed < 2:
+                return "..."
+            return "⏳ thinking..."
 
-        return "\n".join(lines)
+        return "\n".join(parts)
 
     q: queue.Queue = queue.Queue()
 
@@ -2179,34 +2116,20 @@ def run_agent_ask_streaming(
             try:
                 event = q.get(timeout=0.25)
             except queue.Empty:
-                event = None
+                # Periodic refresh so the user sees progress even without events
                 now = time.time()
                 if now - last_display_update >= 1.5:
-                    stream.set_text(build_display())
+                    stream.set_text(_build_live_text())
                     last_display_update = now
                 continue
 
             if event is None:
                 break
 
-            # Handle raw events for progress dashboard
+            # Track tool count from raw events
             etype = event.get("type", "")
-            if etype == "plan.updated":
-                current_plan_steps = event.get("steps", [])
-            if etype in ("stream.tool.started", "stream.tool.completed"):
-                if etype == "stream.tool.completed":
-                    tool_call_count += 1
-            if etype == "turn.metrics":
-                cost_data = event.get("budget", {})
-                cost_estimate = cost_data.get("consumed_cost", 0.0)
-            if etype == "stream.usage":
-                context_tokens = event.get("input_tokens", 0)
-
-            # Refresh display periodically
-            now = time.time()
-            if now - last_display_update >= 1.5:
-                stream.set_text(build_display())
-                last_display_update = now
+            if etype == "stream.tool.completed":
+                tool_call_count += 1
 
             parsed = parse_event(event)
             if parsed is None:
@@ -2214,84 +2137,79 @@ def run_agent_ask_streaming(
 
             kind = parsed["kind"]
 
-            if kind == "tool_start":
-                current_tool = parsed.get("tool_name")
-                update = format_tool_update(parsed)
-                if update:
-                    thinking_updates.append(update)
-                    stream.set_text(build_display())
+            # --- Real-time text streaming ---
+            if kind == "text_delta":
+                delta = parsed.get("text", "")
+                if delta:
+                    got_text_deltas = True
+                    streamed_text += delta
+                    stream.set_text(_build_live_text())
                     last_display_update = time.time()
 
-            elif kind == "tool_done":
-                if current_tool:
-                    if thinking_updates:
-                        thinking_updates[-1] = thinking_updates[-1].replace("...", " ✓")
-                        stream.set_text(build_display())
-                        last_display_update = time.time()
-                    current_tool = None
+            # --- Tool started: add inline indicator ---
+            elif kind == "tool_start":
+                active_tool_parsed = parsed
+                inline = format_tool_inline(parsed, done=False)
+                tool_lines.append(inline)
+                active_tool_idx = len(tool_lines) - 1
+                stream.set_text(_build_live_text())
+                last_display_update = time.time()
 
+            # --- Tool done: update indicator to ✓ ---
+            elif kind == "tool_done":
+                if active_tool_idx is not None and active_tool_idx < len(tool_lines):
+                    done_inline = format_tool_inline(
+                        active_tool_parsed or parsed, done=True
+                    )
+                    tool_lines[active_tool_idx] = done_inline
+                    stream.set_text(_build_live_text())
+                    last_display_update = time.time()
+                active_tool_idx = None
+                active_tool_parsed = None
+
+            # --- Full message updates (fallback if no deltas) ---
             elif kind in ("message", "message_done"):
                 text = parsed.get("text", "")
                 if text:
                     if kind == "message_done":
-                        thinking_text_buffer = text
-                    elif len(text) > len(thinking_text_buffer):
-                        thinking_text_buffer = text
-                    raw_output = thinking_text_buffer
+                        raw_output = text
+                    elif len(text) > len(raw_output):
+                        raw_output = text
+                    # If we haven't gotten streaming deltas, use the full
+                    # message text as the streamed display
+                    if not got_text_deltas and text.strip():
+                        streamed_text = text
+                        stream.set_text(_build_live_text())
+                        last_display_update = time.time()
 
-                    # Extract a clean thinking snippet for display
-                    cleaned = thinking_text_buffer.strip().replace("\n", " ")
-                    last_sentence_end = -1
-                    for i in range(len(cleaned) - 1, -1, -1):
-                        if cleaned[i] in '.!?' and (i == len(cleaned) - 1 or cleaned[i + 1] in ' \n\t'):
-                            last_sentence_end = i
-                            break
-                    if last_sentence_end > 0:
-                        complete_text = cleaned[:last_sentence_end + 1]
-                        if len(complete_text) > 100:
-                            snippet_start = len(complete_text) - 100
-                            for i in range(snippet_start, len(complete_text)):
-                                if complete_text[i] in '.!?' and i + 1 < len(complete_text):
-                                    snippet_start = i + 2
-                                    break
-                            snippet = complete_text[snippet_start:].strip()
-                        else:
-                            snippet = complete_text
-                        if snippet and snippet != last_thinking_snippet:
-                            last_thinking_snippet = snippet
-
-                    stream.set_text(build_display())
-                    last_display_update = time.time()
-
+            # --- Plan events ---
             elif kind == "plan_proposed":
                 plan_text = parsed.get("text", "")
                 if plan_text:
-                    thinking_updates.append("📋 Plan proposed — waiting for approval...")
-                    stream.set_text(build_display())
+                    tool_lines.append("📋 Plan proposed — waiting for approval...")
+                    stream.set_text(_build_live_text())
                     last_display_update = time.time()
 
             elif kind == "plan_approved":
-                thinking_updates.append("✅ Plan approved — executing...")
-                stream.set_text(build_display())
+                tool_lines.append("✅ Plan approved — executing...")
+                stream.set_text(_build_live_text())
                 last_display_update = time.time()
 
             elif kind == "plan_rejected":
-                thinking_updates.append("❌ Plan rejected")
-                stream.set_text(build_display())
+                tool_lines.append("❌ Plan rejected")
+                stream.set_text(_build_live_text())
                 last_display_update = time.time()
 
             elif kind == "user_input_requested":
-                # ask_user callback handles Telegram interaction directly;
-                # just show status here
                 question = parsed.get("text", "")
                 if question:
-                    thinking_updates.append(f"❓ Asked: {question[:40]}...")
-                    stream.set_text(build_display())
+                    tool_lines.append(f"❓ {question[:60]}")
+                    stream.set_text(_build_live_text())
                     last_display_update = time.time()
 
             elif kind == "turn_done":
-                if thinking_text_buffer:
-                    final_result_text = thinking_text_buffer
+                if raw_output:
+                    final_result_text = raw_output
 
             elif kind == "error":
                 err_text = parsed.get("text", "Agent error")
@@ -2306,7 +2224,7 @@ def run_agent_ask_streaming(
         stream.set_text(msg)
         return msg
 
-    output = (final_result_text or raw_output or "").strip()
+    output = (final_result_text or raw_output or streamed_text or "").strip()
 
     if not output:
         msg = "No response from agent."
