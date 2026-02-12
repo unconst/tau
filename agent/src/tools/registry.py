@@ -679,16 +679,19 @@ class ToolRegistry:
         pattern = args.get("pattern", "")
         include = args.get("include", "")
         search_path = args.get("path", ".")
-        limit = args.get("limit", 50)
-        context_lines = args.get("context_lines", 2)
+        limit = int(args.get("limit", 50))
+        context_lines = int(args.get("context_lines", 2))
         # Clamp context_lines to 0-5
         context_lines = max(0, min(context_lines, 5))
 
         if not pattern:
             return ToolResult.fail("No pattern provided")
 
-        # Build ripgrep command
-        cmd_parts = ["rg", "-n", "--color=never", f"-C {context_lines}"]
+        # Build ripgrep command — keep -C and its value as separate
+        # elements so the shell-quoting logic on line ~702 doesn't
+        # merge them into a single quoted token like "-C 2" which
+        # ripgrep cannot parse.
+        cmd_parts = ["rg", "-n", "--color=never", "-C", str(context_lines)]
 
         if include:
             cmd_parts.extend(["-g", include])
@@ -715,10 +718,20 @@ class ToolRegistry:
                 timeout=30,
             )
 
+            # ripgrep exit codes: 0=matches found, 1=no matches, 2=error
+            if result.returncode == 2:
+                return ToolResult.fail(
+                    f"Search error: {(result.stderr or '').strip() or 'unknown ripgrep error'}"
+                )
+
             # ripgrep output is "filepath:linenumber:content" (match) or
             # "filepath-linenumber-content" (context).  Inject hashline tags
             # for small result sets so the model can use hashline_edit directly.
             raw_lines = [line for line in result.stdout.strip().split("\n") if line]
+
+            if not raw_lines:
+                return ToolResult.ok(f"No matches found for pattern: '{pattern}'")
+
             truncated = raw_lines[:limit]
 
             # Only inject hashes when the result set is small enough that

@@ -62,32 +62,43 @@ CLEAN_EXCLUDES = [
 # Focus areas
 # ---------------------------------------------------------------------------
 FOCUS_AREAS = [
-    "error handling and recovery",
-    "search and navigation",
-    "planning and task decomposition",
-    "context management",
-    "tool implementation",
-    "LLM interaction",
+    "turn efficiency and speed",
+    "token and cost efficiency",
+    "tool call precision",
+    "first-attempt accuracy",
+    "error recovery speed",
+    "prompt and reasoning quality",
 ]
 
 FOCUS_DESCRIPTIONS = {
-    "error handling and recovery": (
-        "how the agent handles tool failures, bad outputs, retries, and error messages"
+    "turn efficiency and speed": (
+        "minimizing the number of turns/iterations to complete a task — the agent "
+        "should solve tasks in as few turns as possible by making decisive, high-impact "
+        "actions each turn instead of exploratory or redundant ones"
     ),
-    "search and navigation": (
-        "how the agent finds files, searches code, navigates and understands project structure"
+    "token and cost efficiency": (
+        "reducing input/output token usage per task — aggressive caching, shorter prompts, "
+        "compact tool outputs, avoiding re-reading files unnecessarily, smarter context "
+        "management to keep conversations lean"
     ),
-    "planning and task decomposition": (
-        "how the agent breaks down complex tasks, tracks progress, uses update_plan"
+    "tool call precision": (
+        "making every tool call count — no wasted shell commands, no redundant reads, "
+        "no grep-then-read-then-grep cycles. The agent should use the right tool with "
+        "the right arguments the first time"
     ),
-    "context management": (
-        "how the agent manages conversation history, compaction, token limits"
+    "first-attempt accuracy": (
+        "getting the correct answer/implementation on the first try — writing correct "
+        "code without needing fix-up iterations, reading instructions carefully, producing "
+        "complete and correct outputs"
     ),
-    "tool implementation": (
-        "quality of tool execution, output handling, edge cases in _execute_* methods"
+    "error recovery speed": (
+        "when errors occur, recovering in minimal turns — fast diagnosis, targeted fixes, "
+        "no flailing. Should identify root cause immediately rather than trying random fixes"
     ),
-    "LLM interaction": (
-        "prompt design, caching strategy, model selection, cost efficiency"
+    "prompt and reasoning quality": (
+        "system prompt design, preamble quality, reasoning chains — does the agent think "
+        "clearly and efficiently before acting, or does it waste tokens on verbose reasoning "
+        "and unnecessary planning"
     ),
 }
 
@@ -1191,9 +1202,13 @@ def build_rollout_review_prompt(
         )
 
     return (
-        "You are analyzing the behavior of an autonomous coding agent to find "
-        "weaknesses and implement improvements to its source code.\n\n"
-        f"## Focus Area: **{focus}** — {desc}\n"
+        "You are a performance engineer analyzing an autonomous coding agent's behavior. "
+        "Your PRIMARY objective is to make this agent FASTER — fewer turns, fewer tokens, "
+        "less wall-clock time per task. Your SECONDARY objective is to make it more ACCURATE "
+        "— correct output on the first attempt, fewer retries, fewer errors.\n\n"
+        "Speed is the #1 priority. Every wasted turn, every redundant file read, every "
+        "unnecessary grep, every verbose reasoning block is a bug to fix.\n\n"
+        f"## Specific Focus: **{focus}** — {desc}\n"
         f"{exec_summary}"
         f"\n## Task Given to the Agent\n"
         f"```\n{task_instruction}\n```\n"
@@ -1205,23 +1220,34 @@ def build_rollout_review_prompt(
         f"{history_text}\n\n"
         f"## Blacklisted Improvements (do NOT implement these)\n"
         f"{blacklist_text}\n\n"
-        "## Your Task\n"
-        "1. **Read the full rollout file** at the path above to understand exactly "
-        "what the agent did step by step\n"
-        "2. **Identify specific weaknesses** in the agent's behavior — for example:\n"
-        "   - Did the agent waste turns on ineffective tool calls?\n"
-        "   - Did it fail to recover from errors?\n"
-        "   - Did it miss obvious approaches?\n"
-        "   - Did it get stuck in loops?\n"
-        "   - Was it inefficient with tokens or turns?\n"
-        "   - Did it misuse tools or fail to use the right tool?\n"
-        "3. **Trace the weakness to specific code** in `agent/src/`\n"
-        "4. **Implement a targeted fix** — modify the agent's source code to "
-        "address the weakness you identified\n\n"
+        "## Your Analysis Task\n"
+        "1. **Read the full rollout file** at the path above\n"
+        "2. **Quantify the waste** — answer these questions:\n"
+        "   - How many turns did the agent take? What's the MINIMUM turns a skilled "
+        "developer would need?\n"
+        "   - How many tool calls were redundant or could be combined?\n"
+        "   - How many tokens were wasted on verbose reasoning, re-reading files, "
+        "or unnecessary exploration?\n"
+        "   - Did the agent get the right answer on the first attempt? If not, how "
+        "many fix-up iterations did it need?\n"
+        "   - Did the agent do things sequentially that could be parallelized?\n"
+        "3. **Identify the root cause in code** — trace the inefficiency to specific "
+        "code in `agent/src/`. Common culprits:\n"
+        "   - System prompt encouraging over-exploration or verbose thinking\n"
+        "   - Tool implementations that return too much data\n"
+        "   - Missing tool output truncation or caching\n"
+        "   - Loop logic that doesn't exit early enough\n"
+        "   - Context management not aggressive enough (bloated conversations)\n"
+        "   - Redundant verification steps\n"
+        "   - Model selection using expensive models for simple operations\n"
+        "4. **Implement a targeted performance fix** — modify the agent's source code "
+        "to eliminate the waste you identified. The fix should measurably reduce either "
+        "turns, tokens, or wall-clock time.\n\n"
         "## Rules\n"
         "- Only modify files under `agent/src/` or `agent/agent.py`\n"
         "- Do NOT modify `agent/scripts/` (self-improvement infrastructure)\n"
-        "- Make minimal, focused changes — fix ONE weakness per iteration\n"
+        "- Make minimal, focused changes — fix ONE performance bottleneck per iteration\n"
+        "- Prefer changes that reduce turns/tokens over cosmetic refactors\n"
         "- The improvement must be DIFFERENT from previous iterations listed above\n"
         "- The improvement must NOT be in the blacklist\n"
         "- Verify syntax after editing: "
