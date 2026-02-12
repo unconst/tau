@@ -242,28 +242,52 @@ class TurnRuntime:
         # the post-hoc nudge in loop.py would otherwise cost.
         _call_names = {c.tool_name for c in parsed_calls}
         if _call_names and _call_names == {"update_plan"}:
-            # Execute the update_plan call(s) so the plan is updated
+            # Execute the update_plan call(s) so the plan is updated.
+            # Also detect if ALL plan steps are now "completed" — this is
+            # a task-completion signal.  Setting pending_completion lets the
+            # next text-only turn finish immediately instead of injecting a
+            # redundant verification re-prompt (saves 1 LLM round-trip).
+            _all_plan_completed = False
             for call in parsed_calls:
                 result = self._tools.execute(ctx, call.tool_name, call.arguments)
                 plan_output = result.output if result.success else (result.error or "plan update failed")
-                updated_messages.append({
-                    "role": "tool",
-                    "tool_call_id": call.call_id,
-                    "content": plan_output + (
-                        "\n\n[EFFICIENCY WARNING] You spent this entire turn on update_plan with "
-                        "NO productive tool call. Each turn costs a full LLM round-trip. "
-                        "On your NEXT response, you MUST include at least one productive "
-                        "tool call (read_file, hashline_edit, grep_files, shell_command, etc.) "
-                        "alongside any plan update."
-                    ),
-                })
+                if result.success and not _all_plan_completed:
+                    steps = call.arguments.get("steps", [])
+                    if (
+                        isinstance(steps, list)
+                        and steps
+                        and all(
+                            isinstance(s, dict) and s.get("status") == "completed"
+                            for s in steps
+                        )
+                    ):
+                        _all_plan_completed = True
+                if _all_plan_completed:
+                    # All steps done — clean output, no efficiency warning
+                    updated_messages.append({
+                        "role": "tool",
+                        "tool_call_id": call.call_id,
+                        "content": plan_output,
+                    })
+                else:
+                    updated_messages.append({
+                        "role": "tool",
+                        "tool_call_id": call.call_id,
+                        "content": plan_output + (
+                            "\n\n[EFFICIENCY WARNING] You spent this entire turn on update_plan with "
+                            "NO productive tool call. Each turn costs a full LLM round-trip. "
+                            "On your NEXT response, you MUST include at least one productive "
+                            "tool call (read_file, hashline_edit, grep_files, shell_command, etc.) "
+                            "alongside any plan update."
+                        ),
+                    })
             return TurnRuntimeResult(
                 messages=updated_messages,
-                pending_completion=pending_completion,
+                pending_completion=_all_plan_completed or pending_completion,
                 last_agent_message=last_agent_message,
                 tool_call_count_delta=len(parsed_calls),
                 completed=False,
-                plan_only_turn=True,
+                plan_only_turn=not _all_plan_completed,
             )
 
         _has_edit = any(c.tool_name in _EDIT_TOOLS for c in parsed_calls)
