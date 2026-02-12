@@ -575,10 +575,19 @@ def _validate_schema(value: Any, schema: dict[str, Any], path: str, errors: list
 
 
 def validate_tool_arguments(name: str, arguments: dict[str, Any]) -> list[str]:
-    """Validate arguments against tool schema; returns a list of errors."""
+    """Validate arguments against tool schema; returns a list of errors.
+
+    If the tool is not found in the static specs (e.g. a custom tool
+    registered at runtime via ToolRegistry.register_tool), validation is
+    skipped and an empty list is returned.  The tool will still be checked
+    at execution time by the ToolRegistry.
+    """
     spec = get_tool_spec(name)
     if not spec:
-        return [f"Unknown tool: {name}"]
+        # Don't reject unknown tools here — they may be custom tools
+        # registered on the ToolRegistry (e.g. schedule_message, send_message).
+        # The registry will catch truly missing tools at execution time.
+        return []
     params = spec.get("parameters", {})
     errors: list[str] = []
     _validate_schema(arguments, params, name, errors)
