@@ -554,20 +554,47 @@ Maximize throughput by issuing multiple tool calls in a single response whenever
 - Mutating tools (`write_file`, `str_replace`, `hashline_edit`, `apply_patch`, `shell_command`) must be issued one at a time
 - Prefer batching 3-6 read-only calls per turn instead of one-at-a-time
 
+GOOD — 1 turn with 2 parallel reads:
+  read_file(file_path="src/foo.py", offset=100, limit=30)
+  read_file(file_path="src/foo.py", offset=500, limit=30)
+
+BAD — 2 separate turns for the same information:
+  Turn 1: read_file(file_path="src/foo.py", offset=100, limit=30)
+  Turn 2: read_file(file_path="src/foo.py", offset=500, limit=30)
+
+Each turn costs a full LLM round-trip. Wasting turns on single reads when you could batch them is the #1 cause of slow task completion. ALWAYS batch independent reads.
+
 ## Planning discipline
 Use `update_plan` to decompose tasks and track progress.
 - One step `in_progress` at a time; keep descriptions short and actionable
 - Always include a verification step (re-read output file, run syntax check, etc.)
-- MINIMIZE standalone update_plan calls — they cost a full turn each
-- Prefer issuing update_plan alongside other tool calls in the same response
-- Skip intermediate status updates; batch multiple step transitions into one update_plan call
+- NEVER issue `update_plan` as the sole tool call in a turn — always pair it with a productive action (read, edit, grep, etc.)
+- Batch multiple step transitions into one `update_plan` call instead of updating after every step
 - Only update the plan when: (a) creating the initial plan, (b) the plan structure changes, or (c) finishing
+
+GOOD — plan update paired with a read:
+  update_plan(steps=[...])
+  read_file(file_path="src/foo.py")
+
+BAD — plan update alone wastes an entire turn:
+  update_plan(steps=[...])
+  (nothing else)
+
+## Optimal workflow
+Follow the read-then-edit pattern to minimize turns:
+1. Read all relevant sections in parallel (batch reads)
+2. Plan your edits mentally based on what you read
+3. Apply all edits in as few tool calls as possible (use batched operations)
+4. Verify once at the end (re-read edited sections + lint)
+
+For a typical refactoring task, aim for 3-5 turns total, NOT 15-20.
 
 ## Coding guidelines
 - `read_file` and `grep_files` return lines tagged as `line_number:hash|content`
 - Prefer `hashline_edit` for surgical edits — reference the `line:hash` tags directly
   - Example: `{"op": "replace", "start": "5:a3", "end": "7:0e", "content": "new code"}`
   - If hashes don't match (file changed), re-read the file and retry
+  - When making multiple edits to the same file, combine them into a SINGLE `hashline_edit` call with multiple operations in the `operations` array — do NOT issue separate calls for each edit
 - Fall back to `str_replace` or `apply_patch` when hashline_edit is not a good fit
 - Fix root causes, not symptoms; avoid unneeded complexity
 - Keep changes minimal, consistent with existing codebase style

@@ -1243,6 +1243,10 @@ def run_adapt_streaming(
     active_tool_parsed: dict | None = None
     tool_call_count = 0
     got_text_deltas = False
+    _text_delta_pending = 0
+    _TEXT_FLUSH_CHARS = 20
+    _TEXT_FLUSH_SECS = 0.8
+    _last_text_flush = 0.0
 
     def _build_live_text() -> str:
         parts = []
@@ -1286,7 +1290,12 @@ def run_adapt_streaming(
                 event = q.get(timeout=0.25)
             except queue.Empty:
                 now = time.time()
-                if now - last_display_update >= 1.5:
+                if _text_delta_pending > 0 and now - _last_text_flush >= _TEXT_FLUSH_SECS:
+                    _text_delta_pending = 0
+                    _last_text_flush = now
+                    stream.set_text(_build_live_text())
+                    last_display_update = now
+                elif now - last_display_update >= 1.5:
                     stream.set_text(_build_live_text())
                     last_display_update = now
                 continue
@@ -1309,8 +1318,13 @@ def run_adapt_streaming(
                 if delta:
                     got_text_deltas = True
                     streamed_text += delta
-                    stream.set_text(_build_live_text())
-                    last_display_update = time.time()
+                    _text_delta_pending += len(delta)
+                    now = time.time()
+                    if _text_delta_pending >= _TEXT_FLUSH_CHARS or now - _last_text_flush >= _TEXT_FLUSH_SECS:
+                        _text_delta_pending = 0
+                        _last_text_flush = now
+                        stream.set_text(_build_live_text())
+                        last_display_update = now
 
             elif kind == "tool_start":
                 active_tool_parsed = parsed
@@ -2030,6 +2044,11 @@ def run_agent_ask_streaming(
     tool_call_count = 0
     # Track whether we've seen any real text deltas
     got_text_deltas = False
+    # Buffer text deltas to reduce Telegram edit jitter (~3 words at a time)
+    _text_delta_pending = 0  # chars accumulated since last flush
+    _TEXT_FLUSH_CHARS = 20   # flush after ~3 words
+    _TEXT_FLUSH_SECS = 0.8   # or after this many seconds
+    _last_text_flush = 0.0
 
     def _build_live_text() -> str:
         """Build the message shown while the agent is working.
@@ -2116,9 +2135,14 @@ def run_agent_ask_streaming(
             try:
                 event = q.get(timeout=0.25)
             except queue.Empty:
-                # Periodic refresh so the user sees progress even without events
+                # Flush buffered text deltas if enough time has passed
                 now = time.time()
-                if now - last_display_update >= 1.5:
+                if _text_delta_pending > 0 and now - _last_text_flush >= _TEXT_FLUSH_SECS:
+                    _text_delta_pending = 0
+                    _last_text_flush = now
+                    stream.set_text(_build_live_text())
+                    last_display_update = now
+                elif now - last_display_update >= 1.5:
                     stream.set_text(_build_live_text())
                     last_display_update = now
                 continue
@@ -2137,14 +2161,19 @@ def run_agent_ask_streaming(
 
             kind = parsed["kind"]
 
-            # --- Real-time text streaming ---
+            # --- Real-time text streaming (buffered ~3 words) ---
             if kind == "text_delta":
                 delta = parsed.get("text", "")
                 if delta:
                     got_text_deltas = True
                     streamed_text += delta
-                    stream.set_text(_build_live_text())
-                    last_display_update = time.time()
+                    _text_delta_pending += len(delta)
+                    now = time.time()
+                    if _text_delta_pending >= _TEXT_FLUSH_CHARS or now - _last_text_flush >= _TEXT_FLUSH_SECS:
+                        _text_delta_pending = 0
+                        _last_text_flush = now
+                        stream.set_text(_build_live_text())
+                        last_display_update = now
 
             # --- Tool started: add inline indicator ---
             elif kind == "tool_start":

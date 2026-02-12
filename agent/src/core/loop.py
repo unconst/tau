@@ -525,6 +525,8 @@ Do NOT ask questions — make reasonable decisions and proceed.
     _recovery_msg_count = 0  # Track error recovery messages to cap accumulation
     _tool_nudge_count = 0  # Track tool-failure nudge messages to cap accumulation
     _plan_staleness_nudge_count = 0  # Track plan-staleness nudge messages
+    _plan_only_nudge_count = 0  # Track plan-only turn nudge messages
+    _consecutive_plan_only_turns = 0  # Track consecutive plan-only turns
     llm_retry_count = 0
     compaction_count = 0
     parallel_batch_count = 0
@@ -627,6 +629,14 @@ Do NOT ask questions — make reasonable decisions and proceed.
                             call_kwargs["extra_body"] = {
                                 "reasoning": {"effort": reasoning_effort},
                             }
+
+                        # Encourage parallel tool calls when the model supports it.
+                        # Some models (e.g. DeepSeek-V3) only emit parallel calls
+                        # when this flag is explicitly set in the request.
+                        if tool_specs and getattr(tier, "supports_parallel_tools", True):
+                            extra = call_kwargs.get("extra_body") or {}
+                            extra["parallel_tool_calls"] = True
+                            call_kwargs["extra_body"] = extra
 
                         # Use streaming if available and enabled
                         if use_streaming and hasattr(llm, "chat_stream"):
@@ -1070,6 +1080,53 @@ Do NOT ask questions — make reasonable decisions and proceed.
             )
             messages.append({"role": "user", "content": stale_nudge})
             _plan_staleness_nudge_count += 1
+
+        # ================================================================
+        # Plan-only turn detection
+        # ================================================================
+        # If the agent's only tool call(s) in a turn were update_plan, it
+        # wasted an entire LLM round-trip on bookkeeping.  Inject a nudge
+        # telling it to combine plan updates with productive actions.
+        _turn_tool_names: set[str] = set()
+        for _msg in reversed(messages):
+            if _msg.get("role") == "assistant" and _msg.get("tool_calls"):
+                _turn_tool_names = {
+                    tc.get("function", {}).get("name", "")
+                    for tc in _msg.get("tool_calls", [])
+                }
+                break
+        if _turn_tool_names and _turn_tool_names == {"update_plan"}:
+            _consecutive_plan_only_turns += 1
+            _log(
+                f"Plan-only turn detected (consecutive: {_consecutive_plan_only_turns}) "
+                "— no productive tool calls this iteration"
+            )
+            emit_raw({
+                "type": "stream.plan_only_turn",
+                "consecutive_plan_only_turns": _consecutive_plan_only_turns,
+            })
+            # Cap nudge messages (max 1 active)
+            if _plan_only_nudge_count >= 1:
+                for ri, rm in enumerate(messages):
+                    if rm.get("role") == "user" and "plan-only turn" in rm.get("content", ""):
+                        messages.pop(ri)
+                        _plan_only_nudge_count -= 1
+                        break
+            plan_only_nudge = (
+                "<system-reminder>\n"
+                "EFFICIENCY WARNING: You just spent a full turn only calling `update_plan` "
+                "with no productive tool calls. Each turn costs a full LLM round-trip.\n\n"
+                "NEVER issue `update_plan` as the only action. Always pair it with a "
+                "productive tool call (read_file, hashline_edit, grep_files, etc.).\n\n"
+                "On your next turn, take a REAL action toward completing the task. "
+                "If you need to update the plan, do it alongside a read or edit.\n"
+                "</system-reminder>"
+            )
+            messages.append({"role": "user", "content": plan_only_nudge})
+            _plan_only_nudge_count += 1
+        else:
+            if _turn_tool_names:
+                _consecutive_plan_only_turns = 0
 
         # ================================================================
         # Consecutive tool failure loop detection
