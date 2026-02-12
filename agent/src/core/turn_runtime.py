@@ -545,9 +545,41 @@ class TurnRuntime:
                     ran_successful_shell=_has_successful_shell,
                 )
 
+        # ---------------------------------------------------------------
+        # Determine pending_completion for the result.
+        #
+        # Previously this was unconditionally False, causing wasteful
+        # verification cycles: after a write-only turn the agent needed
+        # an extra text→verify→text round-trip just to re-arm completion.
+        #
+        # Two optimizations:
+        # 1. Read-only preservation: if pending_completion was already
+        #    armed and this turn had no mutations, preserve it — the
+        #    agent is doing a verification read, not starting new work.
+        # 2. Write-only auto-arm: write_file is deterministic — the
+        #    content provided IS the file content.  When all write_file
+        #    calls succeed with no other mutations, arm completion so
+        #    the next text-only response finishes immediately.
+        # ---------------------------------------------------------------
+        _has_shell = any(c.tool_name == "shell_command" for c in parsed_calls)
+        _edit_tool_names = {c.tool_name for c in parsed_calls if c.tool_name in _EDIT_TOOLS}
+
+        _result_pending = False
+        if not _has_edit and not _has_shell and pending_completion:
+            # Read-only turn while verification was pending — preserve
+            _result_pending = True
+        elif (
+            _edit_tool_names == {"write_file"}
+            and not _has_shell
+            and tool_failures == 0
+            and tool_successes > 0
+        ):
+            # Write-only turn: content is deterministic, auto-arm
+            _result_pending = True
+
         return TurnRuntimeResult(
             messages=updated_messages,
-            pending_completion=False,
+            pending_completion=_result_pending,
             last_agent_message=last_agent_message,
             tool_call_count_delta=len(parsed_calls),
             completed=False,
