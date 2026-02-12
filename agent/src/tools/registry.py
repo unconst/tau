@@ -475,6 +475,31 @@ class ToolRegistry:
                 output += f"\n{result.stderr}"
 
             if result.returncode != 0:
+                # Auto-recover: if `python` is not found, retry with `python3`.
+                # This is extremely common on macOS/Darwin where `python` doesn't
+                # exist by default.  Saves a full LLM round-trip that would
+                # otherwise be spent discovering the right binary name.
+                if result.returncode == 127 and "python" in output.lower() and "not found" in output.lower():
+                    rewritten = self._rewrite_python_command(command)
+                    if rewritten and rewritten != command:
+                        retry = subprocess.run(
+                            ["sh", "-c", rewritten],
+                            cwd=str(effective_cwd),
+                            capture_output=True,
+                            text=True,
+                            timeout=timeout_sec,
+                        )
+                        retry_output = retry.stdout
+                        if retry.stderr:
+                            retry_output += f"\n{retry.stderr}"
+                        if retry.returncode == 0:
+                            return ToolResult.ok(retry_output.strip())
+                        # Retry also failed — return the retry error
+                        return ToolResult.fail(
+                            f"Command failed with exit code {retry.returncode}",
+                            output=(retry_output + f"\n[exit code: {retry.returncode}]").strip(),
+                        )
+
                 return ToolResult.fail(
                     f"Command failed with exit code {result.returncode}",
                     output=(output + f"\n[exit code: {result.returncode}]").strip(),
@@ -486,6 +511,19 @@ class ToolRegistry:
             return ToolResult.fail(f"Command timed out after {timeout_sec}s")
         except Exception as e:
             return ToolResult.fail(str(e))
+
+    @staticmethod
+    def _rewrite_python_command(command: str) -> str | None:
+        """Rewrite a command that uses `python` to use `python3` instead.
+
+        Only rewrites when `python` appears as a standalone command (not
+        inside `python3`, `pythonw`, or similar).  Returns None if no
+        rewrite is applicable.
+        """
+        # Match `python` as a standalone word (not part of python3, pythonw, etc.)
+        # Handles: `python script.py`, `python -c "..."`, `python -m module`, etc.
+        rewritten = re.sub(r'\bpython\b(?!3|\w)', 'python3', command)
+        return rewritten if rewritten != command else None
 
     def _execute_read_file(
         self,
