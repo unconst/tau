@@ -931,7 +931,7 @@ class ToolRegistry:
             status = step.get("status", "pending")
             icon = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(status, "[ ]")
             lines.append(f"{icon} {i}. {step.get('description', '')}")
-        lines.append("Keep this plan updated with update_plan as work progresses.")
+        lines.append("Do not call update_plan just to mark steps done — batch status changes or skip intermediate updates.")
         return "\n".join(lines)
 
     def stamp_plan_iteration(self, iteration: int) -> None:

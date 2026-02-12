@@ -558,7 +558,10 @@ Maximize throughput by issuing multiple tool calls in a single response whenever
 Use `update_plan` to decompose tasks and track progress.
 - One step `in_progress` at a time; keep descriptions short and actionable
 - Always include a verification step (re-read output file, run syntax check, etc.)
-- Mark all steps `completed` (or defer) before finishing
+- MINIMIZE standalone update_plan calls — they cost a full turn each
+- Prefer issuing update_plan alongside other tool calls in the same response
+- Skip intermediate status updates; batch multiple step transitions into one update_plan call
+- Only update the plan when: (a) creating the initial plan, (b) the plan structure changes, or (c) finishing
 
 ## Coding guidelines
 - `read_file` and `grep_files` return lines tagged as `line_number:hash|content`
