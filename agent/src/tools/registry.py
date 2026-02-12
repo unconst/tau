@@ -475,18 +475,15 @@ class ToolRegistry:
                 output += f"\n{result.stderr}"
 
             if result.returncode != 0:
-                output += f"\n[exit code: {result.returncode}]"
+                return ToolResult.fail(
+                    f"Command failed with exit code {result.returncode}",
+                    output=(output + f"\n[exit code: {result.returncode}]").strip(),
+                )
 
-            return ToolResult(
-                success=result.returncode == 0,
-                output=output.strip(),
-            )
+            return ToolResult.ok(output.strip())
 
         except subprocess.TimeoutExpired:
-            return ToolResult(
-                success=False,
-                output=f"Command timed out after {timeout_sec}s",
-            )
+            return ToolResult.fail(f"Command timed out after {timeout_sec}s")
         except Exception as e:
             return ToolResult.fail(str(e))
 

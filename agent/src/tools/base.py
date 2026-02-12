@@ -36,8 +36,13 @@ class ToolResult:
 
     @classmethod
     def fail(cls, error: str, output: str = "") -> "ToolResult":
-        """Create a failed result."""
-        return cls(success=False, output=output, error=error)
+        """Create a failed result.
+
+        When *output* is not provided (or empty), defaults to the *error*
+        message so the LLM always receives meaningful content in the tool
+        response (turn_runtime only sends ``result.output``).
+        """
+        return cls(success=False, output=output or error, error=error)
 
     def with_metadata(self, metadata: ToolMetadata) -> "ToolResult":
         """Add metadata to this result."""
