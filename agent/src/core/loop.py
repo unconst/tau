@@ -228,6 +228,33 @@ def _is_resource_exhausted_error(e: "LLMError") -> bool:
     return any(kw in msg for kw in resource_keywords)
 
 
+def _is_connection_error(e: "LLMError") -> bool:
+    """Return True if the error indicates a DNS or connection-level failure.
+
+    When all models share the same API provider, a connection error for one
+    model means every fallback will fail identically.  Callers should raise
+    immediately instead of cycling through fallback models.
+
+    ``chat_stream`` wraps ``ConnectError`` as ``LLMError(code="stream_exhausted")``
+    but preserves the original error text, so we inspect the message too.
+    """
+    code = getattr(e, "code", "")
+    if code == "connection_error":
+        return True
+
+    msg = (getattr(e, "message", "") or str(e)).lower()
+    connection_keywords = (
+        "connecterror",
+        "nodename nor servname",
+        "name or service not known",
+        "connection refused",
+        "network unreachable",
+        "no route to host",
+        "dns",
+    )
+    return any(kw in msg for kw in connection_keywords)
+
+
 def _compute_retry_delay(attempt: int, base_delay: float = 1.5, max_delay: float = 20.0) -> float:
     delay = min(max_delay, base_delay * (2 ** max(0, attempt - 1)))
     jitter = random.uniform(0.0, min(1.0, delay * 0.25))
@@ -679,6 +706,11 @@ Do NOT ask questions — make reasonable decisions and proceed.
                         if e.code in ("authentication_error", "invalid_api_key"):
                             raise
 
+                        # Connection/DNS errors affect all models (same provider) —
+                        # skip fallbacks entirely so we reach the 3-failure abort fast.
+                        if _is_connection_error(e):
+                            raise
+
                         # Check if this is a resource-exhaustion error and we have
                         # more fallback models available.
                         if _is_resource_exhausted_error(e) and _model_idx + 1 < len(models_to_try):
@@ -725,6 +757,10 @@ Do NOT ask questions — make reasonable decisions and proceed.
                             llm_retry_count += 1
                             time.sleep(wait_time)
                         else:
+                            # Connection/DNS errors — don't bother with fallbacks
+                            if _is_connection_error(e):
+                                raise
+
                             # Last model and retries exhausted — raise
                             if _model_idx + 1 < len(models_to_try):
                                 # Still have fallbacks — try next model
