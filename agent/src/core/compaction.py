@@ -533,6 +533,12 @@ def manage_context(
     usable = get_usable_context(context_window, output_reserve)
     usage_pct = (total_tokens / usable) * 100 if usable else 100.0
 
+    # Fast-path: when well under budget, skip all pruning/compaction work.
+    # This avoids the O(n) backwards scan + working-set update on every
+    # iteration when context is still small (the common case).
+    if not force_compaction and usage_pct < 40.0 and len(messages) <= 30:
+        return messages
+
     _log(f"Context: {total_tokens} tokens ({usage_pct:.1f}% of {usable})")
 
     if not force_compaction and not _is_over(total_tokens):

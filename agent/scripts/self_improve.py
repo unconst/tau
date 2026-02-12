@@ -1,29 +1,32 @@
 #!/usr/bin/env python3
 """
-Self-improvement loop for the agent.
+Rollout-driven self-improvement loop for the agent.
 
-Iteratively discovers weaknesses, implements improvements via Cursor CLI,
-verifies them (syntax, imports, benchmarks), and accumulates successful
-changes via git commits.
+Generates coding tasks, runs the agent on them, captures the full rollout
+trajectory, analyzes the agent's behavior to find weaknesses, and implements
+targeted improvements via Cursor CLI.
+
+Flow per iteration:
+    1. Task generation — Cursor CLI generates a coding task for the agent
+    2. Agent execution — agent.py runs the task, producing a full rollout
+    3. Rollout review — Cursor CLI reads the trajectory, identifies weaknesses,
+       and implements improvements to agent source code
+    4. Verification — syntax + import checks with retry loop
+    5. Decision — accept (commit) or revert
 
 Features:
+- Rollout-driven discovery (real agent behavior informs improvements)
 - Institutional memory tracking all past iterations and outcomes
-- Benchmark suite for measuring agent quality before/after changes
-- Curriculum-based progression (startup → basic → correct → efficient → capable)
-- Rollout-driven discovery (benchmark errors feed directly into proposals)
 - Pre-flight health check (detects agent startup failures before wasting cycles)
-- Quality gates: syntax, import, benchmark regression, score >= 6/10
-- Strict critic: runs in agent mode with full file access & efficiency rubric
+- Quality gates: syntax + import verification
 - Implementation retry loop (2 fix attempts before revert)
-- Benchmark trend tracking with regression detection
 - Adaptive focus selection (curriculum-gated, weakest areas get priority)
 - Git accumulation (successful improvements are committed)
 - Failure mode adaptation (auto-adjusts based on recent failures)
 
 Usage:
     python3 agent/scripts/self_improve.py
-    python3 agent/scripts/self_improve.py --iterations 5 --skip-impl
-    python3 agent/scripts/self_improve.py --skip-benchmarks
+    python3 agent/scripts/self_improve.py --iterations 5
     python3 agent/scripts/self_improve.py --model claude-4.5-sonnet
 """
 
@@ -34,7 +37,6 @@ import ast
 import datetime
 import json
 import os
-import re
 import selectors
 import subprocess
 import sys
@@ -49,8 +51,6 @@ AGENT_DIR = REPO_ROOT / "agent"
 LOG_DIR = AGENT_DIR / ".agent" / "self_improve"
 MEMORY_FILE = LOG_DIR / "memory.json"
 
-# Make benchmark_suite importable from the same directory
-sys.path.insert(0, str(Path(__file__).parent))
 
 # Directories that git-clean should never touch (relative to REPO_ROOT)
 CLEAN_EXCLUDES = [
@@ -134,12 +134,9 @@ def _empty_memory() -> dict:
             "parse_error": 0,
             "timeout": 0,
             "crash": 0,
-            "regression": 0,
             "syntax_error": 0,
             "import_error": 0,
         },
-        "last_benchmark": None,
-        "benchmark_trend": [],  # list of {iteration, passed, total, timestamp}
     }
 
 
@@ -253,68 +250,6 @@ def update_memory(
     save_memory(memory)
 
 
-def record_benchmark_trend(memory: dict, iteration: int, benchmark: dict | None):
-    """Record a benchmark score in the rolling trend tracker."""
-    if not benchmark:
-        return
-    trend = memory.setdefault("benchmark_trend", [])
-    trend.append({
-        "iteration": iteration,
-        "passed": benchmark.get("passed", 0),
-        "total": benchmark.get("total", 0),
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    })
-    # Keep last 50 data points
-    if len(trend) > 50:
-        memory["benchmark_trend"] = trend[-50:]
-    save_memory(memory)
-
-
-def check_benchmark_trend(memory: dict) -> tuple[str, bool]:
-    """Analyze the benchmark trend and detect if performance is declining.
-
-    Returns (description, should_halt).
-    should_halt is True if there's a clear declining trend over the last N points.
-    """
-    trend = memory.get("benchmark_trend", [])
-    if len(trend) < 3:
-        return "Not enough data points for trend analysis.", False
-
-    recent = trend[-5:]  # last 5 benchmark runs
-    scores = [t["passed"] for t in recent]
-
-    # Check for monotonic decline
-    declining = all(scores[i] >= scores[i + 1] for i in range(len(scores) - 1))
-    # But only halt if it's a real decline (not flat at 0)
-    actually_declining = declining and scores[0] > scores[-1]
-
-    # Check for overall regression from peak
-    all_scores = [t["passed"] for t in trend]
-    peak = max(all_scores) if all_scores else 0
-    current = scores[-1] if scores else 0
-    regressed_from_peak = peak > 0 and current < peak * 0.5  # dropped below 50% of peak
-
-    description = (
-        f"Trend ({len(trend)} points): "
-        f"recent={scores}, peak={peak}, current={current}"
-    )
-
-    if actually_declining and len(recent) >= 3:
-        return (
-            f"{description} — DECLINING over last {len(recent)} runs. "
-            "Consider reverting recent changes.",
-            True,
-        )
-    if regressed_from_peak:
-        return (
-            f"{description} — REGRESSED from peak ({peak}) to {current}. "
-            "Recent changes may have degraded the agent.",
-            True,
-        )
-
-    return f"{description} — stable or improving.", False
-
-
 def format_history_for_prompt(memory: dict, last_n: int = 15) -> str:
     """Format recent history for inclusion in prompts."""
     history = memory.get("history", [])[-last_n:]
@@ -333,42 +268,18 @@ def format_history_for_prompt(memory: dict, last_n: int = 15) -> str:
 
 
 # ===========================================================================
-# SCORE EXTRACTION
-# ===========================================================================
-
-def extract_score(text: str) -> int | None:
-    """Extract a score from critique text (N/10 or Score: N patterns)."""
-    if not text:
-        return None
-    # Try "N/10" pattern (most common)
-    match = re.search(r'(\d+)\s*/\s*10', text)
-    if match:
-        return min(int(match.group(1)), 10)
-    # Try "Score: N" pattern
-    match = re.search(r'[Ss]core[:\s]+(\d+)', text)
-    if match:
-        return min(int(match.group(1)), 10)
-    return None
-
-
-# ===========================================================================
 # CURRICULUM & ADAPTIVE FOCUS SELECTION
 # ===========================================================================
 
 # Progression tiers: each tier gates which focus areas are eligible.
-# The agent must graduate through tiers based on benchmark performance.
 #
 # Tier 0 (STARTUP):  Agent can't even start → fix imports/startup errors
-# Tier 1 (BASIC):    Agent starts but fails tasks → basic reliability
-# Tier 2 (CORRECT):  Agent passes some tasks → correctness & robustness
-# Tier 3 (EFFICIENT): Agent passes most tasks → optimize for speed/tokens
-# Tier 4 (CAPABLE):  Agent is efficient → enhance capabilities
+# Tier 1 (BASIC):    Agent starts → all areas eligible (default)
 
 CURRICULUM_TIERS = {
     0: {
         "name": "startup",
         "description": "Agent cannot start — fix import/startup errors",
-        "min_benchmark_pass_rate": -1,  # always eligible if agent can't start
         "focus_areas": [
             "error handling and recovery",
             "tool implementation",
@@ -376,78 +287,19 @@ CURRICULUM_TIERS = {
     },
     1: {
         "name": "basic",
-        "description": "Agent starts but fails most tasks — basic reliability",
-        "min_benchmark_pass_rate": 0.0,
-        "focus_areas": [
-            "error handling and recovery",
-            "tool implementation",
-            "LLM interaction",
-        ],
-    },
-    2: {
-        "name": "correct",
-        "description": "Agent passes some tasks — improve correctness",
-        "min_benchmark_pass_rate": 0.33,
-        "focus_areas": [
-            "error handling and recovery",
-            "search and navigation",
-            "planning and task decomposition",
-            "tool implementation",
-        ],
-    },
-    3: {
-        "name": "efficient",
-        "description": "Agent passes most tasks — optimize efficiency",
-        "min_benchmark_pass_rate": 0.66,
-        "focus_areas": [
-            "context management",
-            "LLM interaction",
-            "planning and task decomposition",
-            "search and navigation",
-        ],
-    },
-    4: {
-        "name": "capable",
-        "description": "Agent is efficient — enhance capabilities",
-        "min_benchmark_pass_rate": 0.85,
-        "focus_areas": FOCUS_AREAS,  # all areas eligible
+        "description": "Agent starts — all areas eligible",
+        "focus_areas": FOCUS_AREAS,
     },
 }
 
 
-def get_curriculum_tier(
-    benchmark_scores: dict | None,
-    agent_healthy: bool = True,
-) -> int:
-    """Determine the current curriculum tier based on benchmark performance."""
-    if not agent_healthy:
-        return 0
-
-    if not benchmark_scores or "results" not in benchmark_scores:
-        return 1  # no benchmark data, assume basic tier
-
-    total = benchmark_scores.get("total", 0)
-    passed = benchmark_scores.get("passed", 0)
-    if total == 0:
-        return 1
-
-    pass_rate = passed / total
-
-    # Find the highest tier we qualify for
-    current_tier = 1
-    for tier_num in sorted(CURRICULUM_TIERS.keys()):
-        if tier_num == 0:
-            continue  # tier 0 is special (startup failure)
-        min_rate = CURRICULUM_TIERS[tier_num]["min_benchmark_pass_rate"]
-        if pass_rate >= min_rate:
-            current_tier = tier_num
-
-    return current_tier
+def get_curriculum_tier(agent_healthy: bool = True) -> int:
+    """Determine the current curriculum tier based on agent health."""
+    return 0 if not agent_healthy else 1
 
 
 def select_focus(
     memory: dict,
-    benchmark_scores: dict | None = None,
     agent_healthy: bool = True,
 ) -> str:
     """Select the focus area most in need of improvement.
@@ -455,7 +307,7 @@ def select_focus(
     Uses the curriculum tier to gate which focus areas are eligible,
     then prioritizes areas with lower scores and fewer landed improvements.
     """
-    tier = get_curriculum_tier(benchmark_scores, agent_healthy)
+    tier = get_curriculum_tier(agent_healthy)
     tier_info = CURRICULUM_TIERS.get(tier, CURRICULUM_TIERS[1])
     eligible_areas = tier_info["focus_areas"]
 
@@ -960,151 +812,134 @@ def run_agent(
         "errors": jsonl["errors"],
         "usage": jsonl["usage"],
         "completion_reason": jsonl["completion_reason"],
+        "session_id": jsonl["session_id"],
     }
 
 
 # ===========================================================================
-# ROLLOUT ANALYSIS
+# ROLLOUT CAPTURE
 # ===========================================================================
 
-def analyze_rollout(agent_result: dict) -> dict:
-    """Extract structured performance metrics from an agent run result.
+def capture_rollout(
+    session_id: str | None,
+    cwd: Path | None = None,
+) -> tuple[dict | None, str]:
+    """Locate and read the agent's session rollout file.
 
-    Parses the JSONL output and stderr to identify:
-    - Token efficiency (input/output/cached)
-    - Turn efficiency (completed vs failed)
-    - Error patterns (recurring errors, crash types)
-    - Stuck-loop indicators (high turns with no progress)
+    Returns (raw_rollout_dict, summary_text).
+    The summary is a human-readable trajectory suitable for inclusion in prompts.
+    The raw dict contains the full message history for deep analysis.
     """
-    usage = agent_result.get("usage", {})
-    turns = agent_result.get("turns", 0)
-    turns_failed = agent_result.get("turns_failed", 0)
-    errors = agent_result.get("errors", [])
-    stderr = agent_result.get("stderr", "") or ""
-    elapsed = agent_result.get("elapsed", 0)
-    exit_code = agent_result.get("exit_code", -1)
-    timed_out = agent_result.get("timed_out", False)
+    if not session_id:
+        return None, "(no session_id — rollout unavailable)"
 
-    # Classify errors
-    error_categories: dict[str, int] = {}
-    for err in errors:
-        err_lower = err.lower()
-        if "none" in err_lower and "iterable" in err_lower:
-            cat = "null_response"
-        elif "rate" in err_lower or "429" in err_lower:
-            cat = "rate_limit"
-        elif "timeout" in err_lower:
-            cat = "timeout"
-        elif "module" in err_lower and "not found" in err_lower:
-            cat = "import_error"
-        elif "connection" in err_lower or "network" in err_lower:
-            cat = "network_error"
-        else:
-            cat = "other"
-        error_categories[cat] = error_categories.get(cat, 0) + 1
+    base = (cwd or REPO_ROOT) / ".agent" / "sessions"
+    rollout_path = base / f"{session_id}.json"
 
-    # Check stderr for import/startup errors
-    startup_error = ""
-    if exit_code != 0 and stderr:
-        for line in stderr.strip().splitlines()[-5:]:
-            if "ModuleNotFoundError" in line or "ImportError" in line:
-                startup_error = line.strip()
-                break
-            if "SyntaxError" in line:
-                startup_error = line.strip()
-                break
+    if not rollout_path.exists():
+        log(f"Rollout file not found: {rollout_path}", "WARN")
+        return None, f"(rollout file not found at {rollout_path})"
 
-    # Compute efficiency metrics
-    input_tokens = usage.get("input_tokens", 0)
-    output_tokens = usage.get("output_tokens", 0)
-    cached_tokens = usage.get("cached_input_tokens", 0)
-    total_tokens = input_tokens + output_tokens
-    cache_hit_rate = (
-        round(cached_tokens / input_tokens, 2) if input_tokens > 0 else 0.0
+    try:
+        raw = json.loads(rollout_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        log(f"Failed to read rollout: {e}", "WARN")
+        return None, f"(failed to read rollout: {e})"
+
+    summary = _summarize_rollout(raw)
+    return raw, summary
+
+
+def _summarize_rollout(rollout: dict) -> str:
+    """Produce a structured text summary of a rollout for prompt inclusion.
+
+    Extracts assistant reasoning, tool calls, tool results (truncated),
+    and errors from the full message history.
+    """
+    lines: list[str] = []
+
+    session_id = rollout.get("session_id", "?")
+    iteration = rollout.get("iteration", "?")
+    usage = rollout.get("usage", {})
+    tool_call_count = rollout.get("tool_call_count", 0)
+
+    lines.append(f"Session: {session_id}")
+    lines.append(f"Iterations: {iteration}")
+    lines.append(f"Tool calls: {tool_call_count}")
+    lines.append(
+        f"Tokens: input={usage.get('input_tokens', 0)}, "
+        f"output={usage.get('output_tokens', 0)}, "
+        f"cached={usage.get('cached_input_tokens', 0)}"
     )
+    lines.append("")
+    lines.append("## Trajectory")
 
-    return {
-        "turns_completed": turns,
-        "turns_failed": turns_failed,
-        "total_turns": turns + turns_failed,
-        "elapsed_seconds": round(elapsed, 1),
-        "exit_code": exit_code,
-        "timed_out": timed_out,
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "cached_tokens": cached_tokens,
-        "total_tokens": total_tokens,
-        "cache_hit_rate": cache_hit_rate,
-        "error_categories": error_categories,
-        "error_count": len(errors),
-        "startup_error": startup_error,
-        "stuck_loop": turns > 5 and turns_failed == 0 and exit_code != 0,
-    }
+    messages = rollout.get("messages", [])
+    turn_num = 0
 
+    for msg in messages:
+        role = msg.get("role", "")
 
-def format_benchmark_diagnostics(benchmark_scores: dict | None) -> str:
-    """Format benchmark results WITH error details for inclusion in prompts.
+        if role == "assistant":
+            turn_num += 1
+            # Extract reasoning text
+            content = msg.get("content")
+            if isinstance(content, str) and content.strip():
+                snippet = content.strip().replace("\n", " ")[:300]
+                lines.append(f"\n--- Turn {turn_num} ---")
+                lines.append(f"[assistant] {snippet}")
+            elif isinstance(content, list):
+                texts = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        texts.append(block.get("text", ""))
+                combined = " ".join(texts).strip().replace("\n", " ")[:300]
+                if combined:
+                    lines.append(f"\n--- Turn {turn_num} ---")
+                    lines.append(f"[assistant] {combined}")
 
-    Unlike the old bench_text which just showed PASS/FAIL, this includes
-    stderr, error messages, and performance metrics so the discovery prompt
-    can target REAL problems.
-    """
-    if not benchmark_scores or "results" not in benchmark_scores:
-        return "Not yet computed."
+            # Extract tool calls
+            tool_calls = msg.get("tool_calls", [])
+            for tc in tool_calls:
+                func = tc.get("function", {})
+                name = func.get("name", "?")
+                args_raw = func.get("arguments", "")
+                # Parse and truncate arguments
+                try:
+                    args_dict = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                    # Truncate long argument values
+                    if isinstance(args_dict, dict):
+                        truncated_args = {}
+                        for k, v in args_dict.items():
+                            sv = str(v)
+                            truncated_args[k] = sv[:200] + "..." if len(sv) > 200 else sv
+                        args_str = json.dumps(truncated_args, ensure_ascii=False)
+                    else:
+                        args_str = str(args_dict)[:300]
+                except (json.JSONDecodeError, TypeError):
+                    args_str = str(args_raw)[:300]
+                lines.append(f"  [tool_call] {name}({args_str})")
 
-    lines = []
-    for name, result in benchmark_scores["results"].items():
-        status = "PASS" if result.get("passed") else "FAIL"
-        elapsed = result.get("elapsed", 0)
-        turns = result.get("turns", 0)
-        turns_failed = result.get("turns_failed", 0)
-        exit_code = result.get("exit_code", -1)
-        errors = result.get("errors", [])
-        stderr_tail = result.get("stderr_tail", "")
-
-        line = f"- **{name}**: {status} ({elapsed:.1f}s, {turns} turns, exit={exit_code})"
-        if not result.get("passed"):
-            # Include WHY it failed
-            if stderr_tail:
-                # Extract the most informative error line
-                for sline in stderr_tail.strip().splitlines():
-                    if any(kw in sline for kw in (
-                        "Error", "error", "Traceback", "ModuleNotFound",
-                        "ImportError", "SyntaxError", "Exception",
-                    )):
-                        line += f"\n  ERROR: {sline.strip()[:200]}"
-                        break
-            if errors:
-                line += f"\n  ERRORS: {'; '.join(errors[:3])}"
-            if turns == 0 and turns_failed == 0:
-                line += "\n  NOTE: Agent produced zero turns (likely crashed on startup)"
-        lines.append(line)
-
-    total = benchmark_scores.get("total", 0)
-    passed = benchmark_scores.get("passed", 0)
-    lines.append(f"\nOverall: {passed}/{total}")
-
-    # Add aggregate diagnosis
-    all_same_error = True
-    first_error = None
-    for result in benchmark_scores["results"].values():
-        stderr = result.get("stderr_tail", "")
-        if stderr and not result.get("passed"):
-            for sline in stderr.strip().splitlines():
-                if "Error" in sline:
-                    if first_error is None:
-                        first_error = sline.strip()
-                    elif sline.strip() != first_error:
-                        all_same_error = False
-                    break
-
-    if first_error and all_same_error and passed == 0:
-        lines.append(
-            f"\n** ALL benchmarks fail with the same error: {first_error[:200]}\n"
-            f"** FIX THIS FIRST — it blocks all other improvements."
-        )
+        elif role == "tool":
+            # Tool result — truncate heavily
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                snippet = content.strip().replace("\n", " ")[:200]
+            else:
+                snippet = str(content)[:200]
+            if snippet:
+                lines.append(f"  [tool_result] {snippet}")
 
     return "\n".join(lines)
+
+
+def get_rollout_path(session_id: str | None, cwd: Path | None = None) -> Path | None:
+    """Return the path to a rollout file, or None if it doesn't exist."""
+    if not session_id:
+        return None
+    base = (cwd or REPO_ROOT) / ".agent" / "sessions"
+    path = base / f"{session_id}.json"
+    return path if path.exists() else None
 
 
 # ===========================================================================
@@ -1210,161 +1045,143 @@ def verify_imports(files: set[str]) -> tuple[bool, list[str]]:
 
 
 # ===========================================================================
-# BENCHMARK INTEGRATION
-# ===========================================================================
-
-def run_benchmarks_safely() -> dict | None:
-    """Run the benchmark suite without affecting the working tree.
-
-    Saves git state before benchmarks, restores it after (regardless of
-    what the agent might have done during benchmark tasks).
-    """
-    try:
-        from benchmark_suite import run_all_benchmarks
-    except ImportError:
-        log("benchmark_suite.py not found — skipping benchmarks", "WARN")
-        return None
-
-    log("Running benchmark suite...")
-    pre_patch = git_save_patch()
-
-    try:
-        results = run_all_benchmarks(
-            run_agent_fn=lambda instruction, timeout=120, max_iterations=5: run_agent(
-                instruction=instruction,
-                timeout=timeout,
-                max_iterations=max_iterations,
-            ),
-        )
-    except Exception as e:
-        log(f"Benchmark suite failed: {e}", "WARN")
-        results = None
-    finally:
-        # Restore working tree to pre-benchmark state
-        git_undo_changes()
-        if pre_patch.strip():
-            git_apply_patch(pre_patch)
-
-    if results:
-        log(f"Benchmark score: {results['score']} ({results['passed']}/{results['total']})")
-
-    return results
-
-
-# ===========================================================================
 # PROMPT BUILDERS
 # ===========================================================================
 
-def build_discovery_prompt(
+CODEBASE_ARCHITECTURE = (
+    "## Codebase Architecture\n"
+    "- `agent/src/tools/registry.py` — ToolRegistry class with `_execute_*` methods "
+    "(active tool implementations: shell, grep, read_file, write_file, etc.)\n"
+    "- `agent/src/tools/grep_files.py` — UNUSED LEGACY code, do NOT modify\n"
+    "- `agent/src/core/loop.py` — Main agent loop (LLM calls, retries, context mgmt)\n"
+    "- `agent/src/core/turn_runtime.py` — Per-turn tool call processing and output truncation\n"
+    "- `agent/src/core/compaction.py` — Context pruning and AI-assisted compaction\n"
+    "- `agent/src/llm/router.py` — Model selection (fast/default/strong) and fallback chains\n"
+    "- `agent/src/llm/client.py` — LLM API client (Chutes provider)\n"
+    "- `agent/src/tools/policy.py` — Tool approval policy and execution policy\n"
+    "- `agent/src/tools/orchestrator.py` — Tool execution orchestration and guard checks\n"
+    "- `agent/src/prompts/system.py` — System prompt (SYSTEM_PROMPT constant)\n"
+    "- `agent/src/config/defaults.py` — Default configuration\n"
+)
+
+
+def build_task_generation_prompt(
     focus: str,
     memory: dict,
-    benchmark_scores: dict | None,
     adaptive: dict,
     preflight_error: str = "",
 ) -> str:
-    """Build a context-rich discovery prompt with memory, blacklist, benchmarks.
+    """Build a prompt for Cursor CLI to generate a coding task for the agent.
 
-    Now includes full benchmark diagnostics (errors, stderr, metrics) so the
-    discovery targets REAL observable failures rather than hypothetical ones.
+    The task is a real coding challenge the agent will attempt to solve.
+    The improvement comes from analyzing HOW the agent solves (or fails to
+    solve) the task, not from the task itself.
     """
     history_text = format_history_for_prompt(memory)
 
     blacklist = memory.get("blacklist", [])
     blacklist_text = "\n".join(f"- {b}" for b in blacklist) if blacklist else "None yet."
 
-    # Benchmark diagnostics with error details
-    bench_text = format_benchmark_diagnostics(benchmark_scores)
-
     desc = FOCUS_DESCRIPTIONS.get(focus, focus)
 
-    simplify_note = ""
-    if adaptive.get("simplify_tasks"):
-        simplify_note = (
-            "\n\nIMPORTANT: Recent iterations have FAILED because tasks were too "
-            "ambitious. Propose a SMALL, focused change — modify 1-2 functions "
-            "in a single file. Prefer safe, incremental improvements."
-        )
-
-    syntax_note = ""
-    if adaptive.get("emphasize_syntax"):
-        syntax_note = (
-            "\n\nIMPORTANT: Recent implementations had syntax errors. Ensure your "
-            "proposal is straightforward and describe the exact code changes needed."
-        )
-
-    # Pre-flight error override: if the agent can't even start, that's THE problem
+    # Pre-flight error override
     preflight_section = ""
     if preflight_error:
         preflight_section = (
             f"\n## CRITICAL: Agent Startup Failure\n"
             f"The agent CANNOT START due to: `{preflight_error}`\n"
-            f"**This MUST be fixed before any other improvement can take effect.**\n"
-            f"Override your focus area and propose a fix for this startup error.\n"
+            f"Generate a very simple task (e.g., create a single file) so we can "
+            f"observe the startup failure in the rollout.\n"
         )
 
-    prompt = (
-        f"You are reviewing a repository containing an autonomous coding agent "
-        f"(at `agent/`). Your focus area is: **{focus}** — {desc}.\n\n"
-        f"{preflight_section}"
-        f"## Previous Iterations (what has already been tried)\n"
+    simplify_note = ""
+    if adaptive.get("simplify_tasks"):
+        simplify_note = (
+            "\n\nIMPORTANT: Recent iterations have FAILED. Generate a SIMPLER task "
+            "that the agent should be able to handle — single-file operations, "
+            "straightforward instructions."
+        )
+
+    return (
+        "You are generating a coding task for an autonomous coding agent to attempt. "
+        "The agent will try to solve this task, and we will analyze its behavior "
+        "(the full rollout of tool calls, reasoning, and errors) to find weaknesses "
+        "and improve the agent's code.\n\n"
+        f"The current improvement focus area is: **{focus}** — {desc}.\n"
+        f"{preflight_section}\n"
+        f"## Previous Iterations\n"
         f"{history_text}\n\n"
-        f"## Blacklisted Proposals (do NOT propose these again)\n"
+        f"## Blacklisted Tasks (do NOT generate these)\n"
         f"{blacklist_text}\n\n"
-        f"## Current Benchmark Results (with error details)\n"
-        f"{bench_text}\n\n"
-        "## Codebase Architecture\n"
-        "- `agent/src/tools/registry.py` — ToolRegistry class with `_execute_*` methods "
-        "(active tool implementations: shell, grep, read_file, write_file, etc.)\n"
-        "- `agent/src/tools/grep_files.py` — UNUSED LEGACY code, do NOT propose changes\n"
-        "- `agent/src/core/loop.py` — Main agent loop (LLM calls, retries, context mgmt)\n"
-        "- `agent/src/core/turn_runtime.py` — Per-turn tool call processing and output truncation\n"
-        "- `agent/src/core/compaction.py` — Context pruning and AI-assisted compaction\n"
-        "- `agent/src/llm/router.py` — Model selection (fast/default/strong) and fallback chains\n"
-        "- `agent/src/llm/client.py` — LLM API client (Chutes provider)\n"
-        "- `agent/src/tools/policy.py` — Tool approval policy and execution policy\n"
-        "- `agent/src/tools/orchestrator.py` — Tool execution orchestration and guard checks\n"
-        "- `agent/src/prompts/system.py` — System prompt (SYSTEM_PROMPT constant)\n"
-        "- `agent/src/config/defaults.py` — Default configuration\n\n"
-        "## Your Task\n"
-        "Read the agent source code in `agent/src/` and identify ONE specific, "
-        "high-impact improvement that:\n"
-        "1. Is DIFFERENT from all previous attempts listed above\n"
-        "2. Is NOT in the blacklist\n"
-        "3. Would meaningfully improve the agent's capability in the focus area\n"
-        "4. Is concrete and implementable in a single session\n"
-        "5. Targets `agent/src/` files (not test files, docs, or scripts)\n"
-        "6. Affects actual behavior (not cosmetic/style changes)\n"
-        "7. Addresses REAL problems visible in the benchmark errors above "
-        "(not hypothetical issues)\n"
-        f"{simplify_note}{syntax_note}\n\n"
+        "## Task Design Guidelines\n"
+        "Generate a task that will EXERCISE the focus area and expose weaknesses:\n"
+        f"- For **{focus}**: design a task that requires the agent to demonstrate "
+        f"strong {focus} skills\n"
+        "- The task should be completable by a competent agent in under 5 minutes\n"
+        "- The task should work in a sandbox directory (the agent will be given a "
+        "working directory path)\n"
+        "- Make the task concrete and verifiable (specific expected outputs)\n"
+        "- Vary the difficulty and type from previous iterations\n"
+        "- The task should be DIFFERENT from tasks already tried above\n"
+        f"{simplify_note}\n\n"
         "Output EXACTLY this format (no other text before or after):\n\n"
-        "TASK_TITLE: <concise title>\n\n"
-        "TASK_INSTRUCTION: <detailed instruction: which files, which functions, "
-        "current behavior, problem, desired behavior, step-by-step implementation plan>"
+        "TASK_INSTRUCTION: <a complete, self-contained instruction for the agent "
+        "to execute. Be specific about expected files, content, and behavior.>"
     )
 
-    if adaptive.get("add_format_examples"):
-        prompt += (
-            "\n\n## Example (follow this format exactly)\n\n"
-            "TASK_TITLE: Add exponential backoff to tool failure retries\n\n"
-            "TASK_INSTRUCTION: In `agent/src/core/loop.py`, the tool failure "
-            "handling around line 340 uses a fixed 1-second delay between retries. "
-            "This causes retry storms when tools are temporarily unavailable. "
-            "Change: (1) In `_handle_tool_result()`, track consecutive failures "
-            "in `self._consecutive_failures`. (2) Compute delay as "
-            "`min(1.0 * 2**failures, 30.0)`. (3) Apply the delay before the "
-            "next LLM call. Files: loop.py only."
+
+def build_rollout_review_prompt(
+    task_instruction: str,
+    rollout_summary: str,
+    rollout_path: str | None,
+    focus: str,
+    memory: dict,
+    adaptive: dict,
+    agent_result: dict | None = None,
+) -> str:
+    """Build prompt for Cursor CLI to review an agent rollout and implement improvements.
+
+    This is the core of the new rollout-driven self-improvement loop. Cursor
+    reads the agent's full trajectory, identifies concrete weaknesses, traces
+    them to specific code, and implements targeted fixes.
+    """
+    history_text = format_history_for_prompt(memory)
+
+    blacklist = memory.get("blacklist", [])
+    blacklist_text = "\n".join(f"- {b}" for b in blacklist) if blacklist else "None yet."
+
+    desc = FOCUS_DESCRIPTIONS.get(focus, focus)
+
+    # Agent execution summary
+    exec_summary = ""
+    if agent_result:
+        exec_summary = (
+            f"\n## Agent Execution Summary\n"
+            f"- Duration: {agent_result.get('elapsed', 0):.1f}s\n"
+            f"- Turns completed: {agent_result.get('turns', 0)}\n"
+            f"- Turns failed: {agent_result.get('turns_failed', 0)}\n"
+            f"- Exit code: {agent_result.get('exit_code', -1)}\n"
+            f"- Timed out: {agent_result.get('timed_out', False)}\n"
+            f"- Errors: {agent_result.get('errors', [])}\n"
+        )
+        usage = agent_result.get("usage", {})
+        if usage:
+            exec_summary += (
+                f"- Tokens: input={usage.get('input_tokens', 0)}, "
+                f"output={usage.get('output_tokens', 0)}, "
+                f"cached={usage.get('cached_input_tokens', 0)}\n"
+            )
+
+    # Rollout file section
+    rollout_file_section = ""
+    if rollout_path:
+        rollout_file_section = (
+            f"\n## Full Rollout File\n"
+            f"The complete agent trajectory (all messages, tool calls, and results) "
+            f"is saved at: `{rollout_path}`\n"
+            f"**Read this file** to see the full sequence of actions the agent took.\n"
         )
 
-    return prompt
-
-
-def build_impl_prompt(
-    title: str,
-    instruction: str,
-    adaptive: dict,
-) -> str:
-    """Build the implementation prompt for Cursor CLI agent mode."""
     syntax_note = ""
     if adaptive.get("emphasize_syntax"):
         syntax_note = (
@@ -1374,110 +1191,44 @@ def build_impl_prompt(
         )
 
     return (
-        "Implement this specific improvement to the coding agent.\n\n"
-        f"## What to Do\n"
-        f"**Title**: {title}\n\n"
-        f"**Instruction**: {instruction}\n\n"
-        "## Codebase Architecture\n"
-        "- `agent/src/tools/registry.py` — ToolRegistry with `_execute_*` methods "
-        "(active tool implementations)\n"
-        "- `agent/src/tools/grep_files.py` / `GrepFilesTool` — UNUSED LEGACY, "
-        "do NOT modify\n"
-        "- `agent/src/core/loop.py` — Main agent loop\n"
-        "- `agent/src/core/turn_runtime.py` — Per-turn tool call processing\n"
-        "- `agent/src/core/compaction.py` — Context management\n"
-        "- `agent/src/llm/router.py` — Model selection/fallback\n"
-        "- `agent/src/llm/client.py` — LLM API client\n"
-        "- `agent/src/prompts/system.py` — System prompt\n\n"
+        "You are analyzing the behavior of an autonomous coding agent to find "
+        "weaknesses and implement improvements to its source code.\n\n"
+        f"## Focus Area: **{focus}** — {desc}\n"
+        f"{exec_summary}"
+        f"\n## Task Given to the Agent\n"
+        f"```\n{task_instruction}\n```\n"
+        f"\n## Rollout Summary (agent's trajectory)\n"
+        f"```\n{rollout_summary}\n```\n"
+        f"{rollout_file_section}\n"
+        f"\n{CODEBASE_ARCHITECTURE}\n"
+        f"\n## Previous Improvement Iterations\n"
+        f"{history_text}\n\n"
+        f"## Blacklisted Improvements (do NOT implement these)\n"
+        f"{blacklist_text}\n\n"
+        "## Your Task\n"
+        "1. **Read the full rollout file** at the path above to understand exactly "
+        "what the agent did step by step\n"
+        "2. **Identify specific weaknesses** in the agent's behavior — for example:\n"
+        "   - Did the agent waste turns on ineffective tool calls?\n"
+        "   - Did it fail to recover from errors?\n"
+        "   - Did it miss obvious approaches?\n"
+        "   - Did it get stuck in loops?\n"
+        "   - Was it inefficient with tokens or turns?\n"
+        "   - Did it misuse tools or fail to use the right tool?\n"
+        "3. **Trace the weakness to specific code** in `agent/src/`\n"
+        "4. **Implement a targeted fix** — modify the agent's source code to "
+        "address the weakness you identified\n\n"
         "## Rules\n"
         "- Only modify files under `agent/src/` or `agent/agent.py`\n"
         "- Do NOT modify `agent/scripts/` (self-improvement infrastructure)\n"
-        "- Make minimal, focused changes\n"
+        "- Make minimal, focused changes — fix ONE weakness per iteration\n"
+        "- The improvement must be DIFFERENT from previous iterations listed above\n"
+        "- The improvement must NOT be in the blacklist\n"
         "- Verify syntax after editing: "
         "`python -c 'import ast; ast.parse(open(\"FILE\").read())'`\n"
         f"{syntax_note}\n"
         "- Do NOT commit changes\n"
-        "- Do NOT try to test by running the agent (requires process restart)\n"
-        "- Verify correctness by reading code and checking syntax only"
-    )
-
-
-def build_critique_prompt(
-    title: str,
-    instruction: str,
-    diff_stat: str,
-    diff_content: str,
-    changed_files: list[str] | None = None,
-    benchmark_before: dict | None = None,
-    benchmark_after: dict | None = None,
-) -> str:
-    """Build critique prompt to evaluate the implementation diff.
-
-    Improvements over original:
-    - Shows up to 12000 chars of diff (was 4000) for better context
-    - Lists changed files so the critic can read them in full (agent mode)
-    - Includes efficiency/performance criteria in the rubric
-    - Includes before/after benchmark data when available
-    """
-    max_diff_chars = 12000
-    diff_display = diff_content[-max_diff_chars:] if len(diff_content) > max_diff_chars else diff_content
-    if len(diff_content) > max_diff_chars:
-        diff_note = f"(showing last {max_diff_chars} of {len(diff_content)} chars)"
-    else:
-        diff_note = "(complete diff)"
-
-    files_section = ""
-    if changed_files:
-        files_list = "\n".join(f"- `{f}`" for f in sorted(changed_files))
-        files_section = (
-            f"\n## Changed Files\n{files_list}\n"
-            "You can read these files to see the full context of the changes.\n"
-        )
-
-    bench_section = ""
-    if benchmark_before or benchmark_after:
-        bench_section = "\n## Benchmark Impact\n"
-        if benchmark_before:
-            bench_section += f"- Before: {benchmark_before.get('score', '?')}\n"
-        if benchmark_after:
-            bench_section += f"- After: {benchmark_after.get('score', '?')}\n"
-        if benchmark_before and benchmark_after:
-            before_p = benchmark_before.get("passed", 0)
-            after_p = benchmark_after.get("passed", 0)
-            if after_p > before_p:
-                bench_section += f"- Delta: +{after_p - before_p} benchmarks passing\n"
-            elif after_p < before_p:
-                bench_section += f"- Delta: -{before_p - after_p} REGRESSION\n"
-            else:
-                bench_section += "- Delta: no change\n"
-
-    return (
-        "You are an expert code reviewer evaluating a change to an autonomous "
-        "coding agent. Your goal is to ensure only HIGH-QUALITY improvements "
-        "land. Be strict — mediocre changes degrade the codebase over time.\n\n"
-        f"## Task\n"
-        f"**Title**: {title}\n"
-        f"**Instruction**: {instruction[:1200]}\n"
-        f"{files_section}"
-        f"{bench_section}\n"
-        f"## Changes Made\n```\n{diff_stat}\n```\n\n"
-        f"## Diff {diff_note}\n```\n{diff_display}\n```\n\n"
-        "## Evaluation Criteria (score each 0-10, then give overall)\n\n"
-        "1. **Correctness** (weight: 3x) — Does the change implement what was "
-        "requested? Are there bugs, edge cases, or logical errors?\n"
-        "2. **Quality** (weight: 2x) — Is the code clean, safe, idiomatic, and "
-        "well-integrated with the existing codebase?\n"
-        "3. **Impact** (weight: 3x) — Will this measurably improve the agent? "
-        "Does it address a real bottleneck? Would it help pass more benchmarks, "
-        "reduce token usage, or complete tasks in fewer turns?\n"
-        "4. **Efficiency** (weight: 1x) — Does the change make the agent faster "
-        "or more token-efficient? Or does it add unnecessary overhead?\n"
-        "5. **Risk** (weight: 1x) — Could this break existing functionality? "
-        "How defensive is the implementation?\n\n"
-        "A score of 6/10 or higher means the change is GOOD ENOUGH to land.\n"
-        "A score below 6/10 means it should be REVERTED.\n"
-        "Be honest — a 5/10 change that barely works should not land.\n\n"
-        "End your evaluation with exactly: **Score: N/10** (where N is 0-10)"
+        "- Do NOT try to test by running the agent"
     )
 
 
@@ -1505,25 +1256,21 @@ def run_iteration(
     memory: dict,
     model: str,
     agent_timeout: int,
-    skip_impl: bool,
-    skip_benchmarks: bool,
     max_agent_iterations: int = 20,
-    baseline_benchmark: dict | None = None,
     no_commit: bool = False,
     agent_healthy: bool = True,
     preflight_error: str = "",
 ) -> dict:
-    """Run one full improvement iteration.
+    """Run one full rollout-driven improvement iteration.
 
     Flow:
-        1. Select focus (adaptive + curriculum tier) + build discovery prompt
-        2. Discovery via Cursor CLI → TASK_TITLE + TASK_INSTRUCTION
-        3. Implementation via Cursor CLI (agent mode)
-        4. Verification: syntax check + import/compile check (with retries)
-        5. Benchmark: run suite, compare to baseline (optional)
-        6. Critique: evaluate the diff, extract score (agent mode, strict)
-        7. Decision: accept (commit) or revert based on quality gates (6/10)
-        8. Update memory + record benchmark trend
+        1. Select focus (adaptive + curriculum tier)
+        2. Task generation via Cursor CLI (ask mode)
+        3. Agent execution on the task (with rollout capture + revert)
+        4. Rollout review + improvement via Cursor CLI (agent mode)
+        5. Verification: syntax check + import/compile check (with retries)
+        6. Decision: accept (commit) or revert
+        7. Update memory
     """
     data: dict = {
         "iteration": iteration,
@@ -1535,33 +1282,29 @@ def run_iteration(
     if adaptive.get("increase_timeout"):
         agent_timeout = max(agent_timeout, 2400)
 
-    # ── Focus selection (curriculum-aware) ─────────────────────────────────
-    focus = select_focus(
-        memory,
-        benchmark_scores=baseline_benchmark,
-        agent_healthy=agent_healthy,
-    )
+    # ── Step 1: Focus selection (curriculum-aware) ─────────────────────────
+    focus = select_focus(memory, agent_healthy=agent_healthy)
     data["focus"] = focus
     banner(f"ITERATION {iteration} — FOCUS: {focus}")
     log(f"Adaptive params: {adaptive}")
 
-    # ── Step 1: Discovery ─────────────────────────────────────────────────
-    banner(f"ITERATION {iteration} — STEP 1: Discovery")
+    # ── Step 2: Task generation ───────────────────────────────────────────
+    banner(f"ITERATION {iteration} — STEP 2: Task Generation")
 
-    discovery_prompt = build_discovery_prompt(
+    task_prompt = build_task_generation_prompt(
         focus=focus,
         memory=memory,
-        benchmark_scores=baseline_benchmark,
         adaptive=adaptive,
         preflight_error=preflight_error,
     )
-    discovery_result = cursor_cli(discovery_prompt, mode="ask", model=model)
-    log(f"Discovery result:\n{discovery_result[:500]}")
-    data["discovery"] = discovery_result
+    task_result = cursor_cli(task_prompt, mode="ask", model=model)
+    log(f"Task generation result:\n{task_result[:500]}")
+    data["task_generation"] = task_result
 
-    title, instruction = parse_task(discovery_result)
-    if not title or not instruction:
-        log("Parse failure — could not extract TASK_TITLE/TASK_INSTRUCTION", "WARN")
+    # Extract the task instruction
+    _, task_instruction = parse_task(task_result)
+    if not task_instruction:
+        log("Parse failure — could not extract TASK_INSTRUCTION", "WARN")
         data["error"] = "parse_failure"
         data["outcome"] = "parse_error"
         update_memory(
@@ -1570,21 +1313,15 @@ def run_iteration(
         )
         return data
 
-    log(f"Task: {title}")
-    log(f"Instruction: {instruction[:200]}...")
-    data["task_title"] = title
-    data["task_instruction"] = instruction
+    # Use a truncated version as the title for logging/memory
+    task_title = task_instruction[:80].replace("\n", " ").strip()
+    if len(task_instruction) > 80:
+        task_title += "..."
 
-    # ── Skip-impl early exit ──────────────────────────────────────────────
-    if skip_impl:
-        log("Skipping implementation (--skip-impl)")
-        data["implementation"] = "skipped"
-        data["outcome"] = "skipped"
-        update_memory(
-            memory, iteration=iteration, focus=focus,
-            task_title=title, score=None, outcome="skipped",
-        )
-        return data
+    log(f"Task: {task_title}")
+    log(f"Instruction: {task_instruction[:200]}...")
+    data["task_title"] = task_title
+    data["task_instruction"] = task_instruction
 
     # Brief cooldown if rate-limited recently
     if _cursor_cli_consecutive_rate_limits > 0:
@@ -1592,9 +1329,59 @@ def run_iteration(
         log(f"Cooldown {cooldown:.0f}s (rate-limit history)")
         time.sleep(cooldown)
 
-    # ── Step 2: Implementation ────────────────────────────────────────────
-    banner(f"ITERATION {iteration} — STEP 2: Implementation")
+    # ── Step 3: Agent execution (with rollout isolation) ──────────────────
+    banner(f"ITERATION {iteration} — STEP 3: Agent Execution")
 
+    # Save git state so we can revert agent's task artifacts
+    pre_patch = git_save_patch()
+
+    agent_result = run_agent(
+        instruction=task_instruction,
+        timeout=agent_timeout,
+        max_iterations=max_agent_iterations,
+    )
+
+    data["agent_result"] = {
+        "elapsed": agent_result.get("elapsed"),
+        "timed_out": agent_result.get("timed_out"),
+        "exit_code": agent_result.get("exit_code"),
+        "turns": agent_result.get("turns"),
+        "turns_failed": agent_result.get("turns_failed"),
+        "errors": agent_result.get("errors"),
+        "usage": agent_result.get("usage"),
+        "session_id": agent_result.get("session_id"),
+    }
+
+    # Capture the rollout before reverting
+    session_id = agent_result.get("session_id")
+    rollout_raw, rollout_summary = capture_rollout(session_id)
+    rollout_path = get_rollout_path(session_id)
+
+    data["rollout_summary"] = rollout_summary[:2000]
+    data["rollout_path"] = str(rollout_path) if rollout_path else None
+
+    log(f"Agent completed: {agent_result.get('turns', 0)} turns, "
+        f"{agent_result.get('elapsed', 0):.1f}s, "
+        f"exit={agent_result.get('exit_code', -1)}")
+
+    if not rollout_raw:
+        log("No rollout captured — agent may have crashed before producing output", "WARN")
+
+    # Revert ALL agent changes (task artifacts, not improvements)
+    git_undo_changes()
+    if pre_patch.strip():
+        git_apply_patch(pre_patch)
+    log("Reverted agent task artifacts — working tree restored")
+
+    # ── Step 4: Rollout review + improvement ──────────────────────────────
+    banner(f"ITERATION {iteration} — STEP 4: Rollout Review + Improvement")
+
+    if _cursor_cli_consecutive_rate_limits > 0:
+        cooldown = min(15.0 * _cursor_cli_consecutive_rate_limits, 60.0)
+        log(f"Cooldown {cooldown:.0f}s (rate-limit history)")
+        time.sleep(cooldown)
+
+    # Save state again for the improvement phase
     pre_patch = git_save_patch()
     pre_modified = git_diff_name_only()
 
@@ -1608,18 +1395,23 @@ def run_iteration(
             except Exception:
                 pass
 
-    impl_prompt = build_impl_prompt(title, instruction, adaptive)
-    impl_result = cursor_cli(impl_prompt, mode="agent", model=model)
+    review_prompt = build_rollout_review_prompt(
+        task_instruction=task_instruction,
+        rollout_summary=rollout_summary,
+        rollout_path=str(rollout_path) if rollout_path else None,
+        focus=focus,
+        memory=memory,
+        adaptive=adaptive,
+        agent_result=agent_result,
+    )
+    review_result = cursor_cli(review_prompt, mode="agent", model=model)
 
-    data["implementation"] = impl_result[:2000]
+    data["review"] = review_result[:2000]
 
-    # ── Detect changes using content comparison (not just file names) ─────
+    # ── Detect changes made by Cursor (the improvements) ──────────────────
     post_modified = git_diff_name_only()
 
-    # Truly new files (not in pre_modified at all)
     new_files = post_modified - pre_modified
-
-    # Pre-dirty files whose content actually changed
     changed_predirty: set[str] = set()
     for f in pre_modified & post_modified:
         full = REPO_ROOT / f
@@ -1634,38 +1426,35 @@ def run_iteration(
     impl_files = new_files | changed_predirty
 
     data["files_changed"] = sorted(impl_files)
-    log(f"Files changed by agent: {sorted(impl_files)}")
-    if changed_predirty:
-        log(f"  (includes pre-dirty files with new edits: {sorted(changed_predirty)})")
+    log(f"Files changed by Cursor: {sorted(impl_files)}")
 
     if not impl_files:
-        log("Implementation produced no changes at all", "WARN")
+        log("Rollout review produced no code changes", "WARN")
         data["outcome"] = "no_changes"
         update_memory(
             memory, iteration=iteration, focus=focus,
-            task_title=title, score=0, outcome="crash",
-            summary="Implementation produced no file changes",
+            task_title=task_title, score=None, outcome="crash",
+            summary="Rollout review produced no file changes",
         )
         return data
 
-    # Compute agent-specific diff (only the agent's changes, not pre-existing)
+    # Compute diff for logging
     agent_diff = _compute_agent_diff(pre_contents, impl_files)
     agent_diff_stat = _summarize_diff(agent_diff, impl_files)
 
     data["implementation_diff"] = agent_diff_stat
-    log(f"Agent diff stat:\n{agent_diff_stat}")
+    log(f"Improvement diff:\n{agent_diff_stat}")
 
-    # ── Step 3: Verification (with retry loop) ──────────────────────────────
-    banner(f"ITERATION {iteration} — STEP 3: Verification")
+    # ── Step 5: Verification (with retry loop) ────────────────────────────
+    banner(f"ITERATION {iteration} — STEP 5: Verification")
 
     max_fix_attempts = 2
     verification_passed = False
 
     for fix_attempt in range(max_fix_attempts + 1):
-        # Filter to only agent source files for verification
         agent_files = {f for f in impl_files if f.startswith("agent/")}
 
-        # 3a: Syntax check
+        # 5a: Syntax check
         syntax_ok, syntax_errors = verify_syntax(agent_files)
         data["syntax_ok"] = syntax_ok
         data["syntax_errors"] = syntax_errors
@@ -1673,14 +1462,13 @@ def run_iteration(
         if not syntax_ok:
             if fix_attempt < max_fix_attempts:
                 log(f"SYNTAX ERRORS (attempt {fix_attempt + 1}/{max_fix_attempts + 1}) "
-                    f"— asking implementer to fix:\n  " + "\n  ".join(syntax_errors), "WARN")
+                    f"— asking Cursor to fix:\n  " + "\n  ".join(syntax_errors), "WARN")
                 fix_prompt = (
                     f"Your previous implementation has syntax errors. Fix them:\n\n"
                     + "\n".join(f"- {e}" for e in syntax_errors) + "\n\n"
                     "Fix ONLY the syntax errors. Do not make other changes."
                 )
                 cursor_cli(fix_prompt, mode="agent", model=model)
-                # Re-detect changed files after fix
                 post_modified_fix = git_diff_name_only()
                 impl_files = (post_modified_fix - pre_modified) | changed_predirty
                 continue
@@ -1691,14 +1479,14 @@ def run_iteration(
                 data["outcome"] = "syntax_error"
                 update_memory(
                     memory, iteration=iteration, focus=focus,
-                    task_title=title, score=0, outcome="syntax_error",
+                    task_title=task_title, score=None, outcome="syntax_error",
                     files_changed=sorted(impl_files),
                     summary=f"Syntax errors after {max_fix_attempts} fix attempts: "
                             f"{'; '.join(syntax_errors[:3])}",
                 )
                 return data
 
-        # 3b: Import/compile check
+        # 5b: Import/compile check
         import_ok, import_errors = verify_imports(agent_files)
         data["import_ok"] = import_ok
         data["import_errors"] = import_errors
@@ -1706,7 +1494,7 @@ def run_iteration(
         if not import_ok:
             if fix_attempt < max_fix_attempts:
                 log(f"IMPORT ERRORS (attempt {fix_attempt + 1}/{max_fix_attempts + 1}) "
-                    f"— asking implementer to fix:\n  " + "\n  ".join(import_errors), "WARN")
+                    f"— asking Cursor to fix:\n  " + "\n  ".join(import_errors), "WARN")
                 fix_prompt = (
                     f"Your previous implementation has compile/import errors. Fix them:\n\n"
                     + "\n".join(f"- {e}" for e in import_errors) + "\n\n"
@@ -1723,24 +1511,22 @@ def run_iteration(
                 data["outcome"] = "import_error"
                 update_memory(
                     memory, iteration=iteration, focus=focus,
-                    task_title=title, score=0, outcome="import_error",
+                    task_title=task_title, score=None, outcome="import_error",
                     files_changed=sorted(impl_files),
                     summary=f"Import errors after {max_fix_attempts} fix attempts: "
                             f"{'; '.join(import_errors[:3])}",
                 )
                 return data
 
-        # Both checks passed
         verification_passed = True
         break
 
     if not verification_passed:
-        # Should not reach here, but defensive
         git_revert_to_patch(pre_patch)
         data["outcome"] = "verification_failed"
         update_memory(
             memory, iteration=iteration, focus=focus,
-            task_title=title, score=0, outcome="crash",
+            task_title=task_title, score=None, outcome="crash",
             summary="Verification loop exited without passing",
         )
         return data
@@ -1752,92 +1538,22 @@ def run_iteration(
 
     log("Verification PASSED (syntax + imports)")
 
-    # ── Step 4: Benchmark (optional) ──────────────────────────────────────
-    benchmark_result = None
-    if not skip_benchmarks and baseline_benchmark is not None:
-        banner(f"ITERATION {iteration} — STEP 4: Benchmark")
+    # ── Accept + commit ───────────────────────────────────────────────────
+    banner(f"ITERATION {iteration} — Accept")
 
-        benchmark_result = run_benchmarks_safely()
-        data["benchmark"] = benchmark_result
-
-        if benchmark_result:
-            baseline_score = baseline_benchmark.get("passed", 0)
-            new_score = benchmark_result.get("passed", 0)
-            log(
-                f"Benchmark: {new_score}/{benchmark_result['total']} "
-                f"(baseline: {baseline_score}/{baseline_benchmark['total']})"
-            )
-            if new_score < baseline_score:
-                log("BENCHMARK REGRESSION — reverting", "WARN")
-                git_revert_to_patch(pre_patch)
-                data["outcome"] = "regression"
-                update_memory(
-                    memory, iteration=iteration, focus=focus,
-                    task_title=title, score=0, outcome="regression",
-                    files_changed=sorted(impl_files),
-                    summary=f"Benchmark regression: {new_score} < {baseline_score}",
-                )
-                return data
-
-    # ── Step 5: Critique ──────────────────────────────────────────────────
-    if _cursor_cli_consecutive_rate_limits > 0:
-        cooldown = min(15.0 * _cursor_cli_consecutive_rate_limits, 60.0)
-        log(f"Cooldown {cooldown:.0f}s before critique")
-        time.sleep(cooldown)
-
-    banner(f"ITERATION {iteration} — STEP 5: Critique")
-
-    critique_prompt = build_critique_prompt(
-        title, instruction, agent_diff_stat, agent_diff,
-        changed_files=sorted(impl_files),
-        benchmark_before=baseline_benchmark,
-        benchmark_after=benchmark_result,
-    )
-    # Run critic in agent mode so it can read the changed files in full context
-    critique_result = cursor_cli(critique_prompt, mode="agent", model=model)
-
-    data["critique"] = critique_result
-    score = extract_score(critique_result)
-    data["score"] = score
-    log(f"Critique score: {score}/10" if score is not None else "Critique score: N/A")
-
-    # ── Step 6: Decision ──────────────────────────────────────────────────
-    banner(f"ITERATION {iteration} — STEP 6: Decision")
-
-    # Quality gate: require score >= 6 (or accept if score couldn't be parsed)
-    # A 6/10 bar ensures only genuinely useful changes land.
-    min_score = 6
-    if score is not None and score < min_score:
-        log(f"Score {score}/10 below threshold {min_score} — reverting", "WARN")
-        git_revert_to_patch(pre_patch)
-        data["outcome"] = "low_score"
-        update_memory(
-            memory, iteration=iteration, focus=focus,
-            task_title=title, score=score, outcome="reverted",
-            files_changed=sorted(impl_files),
-            summary=f"Score {score}/10 below threshold {min_score}",
-        )
-        return data
-
-    # All gates passed — accept the improvement
     committed = False
     if impl_files and not no_commit:
-        committed = git_commit_improvement(title, impl_files, iteration)
+        committed = git_commit_improvement(task_title, impl_files, iteration)
 
-    outcome = "landed"
-    data["outcome"] = outcome
+    data["outcome"] = "landed"
     data["committed"] = committed
-    log(
-        f"ACCEPTED: {title} "
-        f"(score: {score}/10, committed: {committed}, "
-        f"files: {sorted(impl_files) or 'pre-existing only'})"
-    )
+    log(f"ACCEPTED (committed: {committed}, files: {sorted(impl_files)})")
 
     update_memory(
         memory, iteration=iteration, focus=focus,
-        task_title=title, score=score, outcome="landed",
+        task_title=task_title, score=None, outcome="landed",
         files_changed=sorted(impl_files),
-        summary=f"Score {score}/10, committed={committed}",
+        summary=f"Rollout-driven improvement, committed={committed}",
     )
 
     data["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -1850,7 +1566,7 @@ def run_iteration(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Agent self-improvement loop with memory, benchmarks, and quality gates",
+        description="Rollout-driven agent self-improvement loop",
     )
     parser.add_argument(
         "--iterations", type=int, default=0,
@@ -1861,16 +1577,8 @@ def main():
         help="Agent execution timeout in seconds (default: 1800)",
     )
     parser.add_argument(
-        "--skip-impl", action="store_true",
-        help="Discovery only — no implementation",
-    )
-    parser.add_argument(
-        "--skip-benchmarks", action="store_true",
-        help="Skip benchmark suite (faster iterations)",
-    )
-    parser.add_argument(
         "--model", default="opus-4.6-thinking",
-        help="Cursor model for discovery/critique/implementation (default: opus-4.6-thinking)",
+        help="Cursor model for task generation and rollout review (default: opus-4.6-thinking)",
     )
     parser.add_argument(
         "--pause", type=int, default=10,
@@ -1878,7 +1586,7 @@ def main():
     )
     parser.add_argument(
         "--max-agent-iterations", type=int, default=20,
-        help="Max agent loop iterations per step (default: 20)",
+        help="Max agent loop iterations per task (default: 20)",
     )
     parser.add_argument(
         "--no-commit", action="store_true",
@@ -1886,7 +1594,7 @@ def main():
     )
     args = parser.parse_args()
 
-    banner("SELF-IMPROVEMENT LOOP — PREFLIGHT")
+    banner("ROLLOUT-DRIVEN SELF-IMPROVEMENT — PREFLIGHT")
 
     # ── Load memory ───────────────────────────────────────────────────────
     memory = load_memory()
@@ -1899,7 +1607,6 @@ def main():
     log(f"Iterations:      {'infinite' if args.iterations == 0 else args.iterations}")
     log(f"Agent timeout:   {args.timeout}s")
     log(f"Agent max iter:  {args.max_agent_iterations}")
-    log(f"Benchmarks:      {'enabled' if not args.skip_benchmarks else 'disabled'}")
     log(f"Auto-commit:     {'yes' if not args.no_commit else 'no'}")
 
     # ── Focus scores summary ──────────────────────────────────────────────
@@ -1918,37 +1625,6 @@ def main():
         log(f"Agent health check: FAILED — {preflight_error}", "WARN")
         log("The agent cannot start. Self-improvement will focus on fixing this.")
 
-    # ── Benchmark trend check ─────────────────────────────────────────────
-    trend_desc, trend_declining = check_benchmark_trend(memory)
-    log(f"Benchmark trend: {trend_desc}")
-    if trend_declining:
-        log("WARNING: Benchmark performance is declining. "
-            "Will continue but watch closely.", "WARN")
-
-    # ── Baseline benchmarks ───────────────────────────────────────────────
-    baseline_benchmark = None
-    if not args.skip_benchmarks and not args.skip_impl:
-        banner("BASELINE BENCHMARK")
-        baseline_benchmark = run_benchmarks_safely()
-        if baseline_benchmark:
-            log(f"Baseline score: {baseline_benchmark['score']}")
-            memory["last_benchmark"] = baseline_benchmark
-            # Record in trend
-            record_benchmark_trend(
-                memory,
-                iteration=memory.get("iterations_total", 0),
-                benchmark=baseline_benchmark,
-            )
-            save_memory(memory)
-
-            # Log curriculum tier
-            tier = get_curriculum_tier(baseline_benchmark, agent_healthy)
-            tier_info = CURRICULUM_TIERS.get(tier, CURRICULUM_TIERS[1])
-            log(f"Curriculum tier: {tier} ({tier_info['name']}) — "
-                f"{tier_info['description']}")
-        else:
-            log("Baseline benchmark failed or unavailable — continuing without", "WARN")
-
     # ── Main loop ─────────────────────────────────────────────────────────
     iteration = memory.get("iterations_total", 0)
     results = []
@@ -1966,10 +1642,7 @@ def main():
                 memory=memory,
                 model=args.model,
                 agent_timeout=args.timeout,
-                skip_impl=args.skip_impl,
-                skip_benchmarks=args.skip_benchmarks,
                 max_agent_iterations=args.max_agent_iterations,
-                baseline_benchmark=baseline_benchmark,
                 no_commit=args.no_commit,
                 agent_healthy=agent_healthy,
                 preflight_error=preflight_error,
@@ -1977,24 +1650,11 @@ def main():
             results.append(result)
             save_iteration_log(iteration, result)
 
-            # Update baseline if improvement landed and we have new benchmark data
-            if result.get("outcome") == "landed" and result.get("benchmark"):
-                baseline_benchmark = result["benchmark"]
-                record_benchmark_trend(memory, iteration, baseline_benchmark)
-                log("Updated baseline benchmark after successful improvement")
-
-                # Re-check agent health after a landed improvement
+            # Re-check agent health after a landed improvement
+            if result.get("outcome") == "landed":
                 agent_healthy, preflight_error = preflight_check()
                 if agent_healthy:
                     log("Agent health: PASSED (post-improvement)")
-
-            # Check benchmark trend periodically
-            if i % 3 == 0:
-                trend_desc, trend_declining = check_benchmark_trend(memory)
-                log(f"Trend check: {trend_desc}")
-                if trend_declining:
-                    log("ALERT: Benchmark trend is declining. "
-                        "Consider reviewing recent commits.", "WARN")
 
             if args.iterations > 0 and i >= args.iterations:
                 break
@@ -2012,16 +1672,14 @@ def main():
     for r in results:
         title = r.get("task_title", "unknown")
         outcome = r.get("outcome", "?")
-        score = r.get("score")
-        score_str = f"{score}/10" if score is not None else "N/A"
         committed = "✓" if r.get("committed") else "✗"
         log(
             f"  Iter {r.get('iteration', '?')}: [{outcome}] {title} "
-            f"(score: {score_str}, committed: {committed})"
+            f"(committed: {committed})"
         )
 
     landed = sum(1 for r in results if r.get("outcome") == "landed")
-    failed = sum(1 for r in results if r.get("outcome") not in ("landed", "skipped"))
+    failed = sum(1 for r in results if r.get("outcome") not in ("landed",))
     log(f"\nSession: {landed} landed, {failed} failed out of {len(results)} total")
     log(f"All-time: {memory['iterations_total']} iterations, "
         f"{memory['improvements_landed']} landed")

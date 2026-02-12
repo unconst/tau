@@ -875,6 +875,10 @@ def parse_event(event: dict[str, Any]) -> dict[str, Any] | None:
     item = event.get("item") or {}
     item_type = item.get("type", "")
 
+    # -- Streaming text delta (real-time LLM output) --
+    if etype == "stream.text.delta":
+        return {"kind": "text_delta", "text": event.get("delta", ""), "tool_name": None, "tool_detail": None, "item_type": None}
+
     # -- Item started --
     if etype == "item.started":
         if item_type == "agent_message":
@@ -986,6 +990,33 @@ def format_tool_update(parsed: dict[str, Any]) -> str | None:
         tool = name.split(":", 1)[1]
         return f"🔧 {tool}..."
     return f"🔧 {name}..."
+
+
+def format_tool_inline(parsed: dict[str, Any], done: bool = False) -> str:
+    """Return a compact inline tool indicator for embedding in streamed text."""
+    name = parsed.get("tool_name") or "tool"
+    detail = (parsed.get("tool_detail") or "")[:60]
+
+    if done:
+        if name == "Shell":
+            return f"  ✓ ran: {detail}" if detail else "  ✓ ran command"
+        if name == "FileChange":
+            return f"  ✓ edited {detail}" if detail else "  ✓ edited files"
+        if name == "WebSearch":
+            return "  ✓ searched web"
+        if name.startswith("MCP:"):
+            return f"  ✓ {name.split(':', 1)[1]}"
+        return f"  ✓ {name}"
+
+    if name == "Shell":
+        return f"  ⏳ running: {detail}..." if detail else "  ⏳ running command..."
+    if name == "FileChange":
+        return f"  ⏳ editing {detail}..." if detail else "  ⏳ editing files..."
+    if name == "WebSearch":
+        return "  ⏳ searching web..."
+    if name.startswith("MCP:"):
+        return f"  ⏳ {name.split(':', 1)[1]}..."
+    return f"  ⏳ {name}..."
 
 
 # ---------------------------------------------------------------------------

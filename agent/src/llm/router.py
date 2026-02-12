@@ -206,18 +206,17 @@ class ModelRouter:
     ) -> TaskComplexity:
         """Classify the current task's complexity.
 
-        Heuristics:
-        - Short instruction + few messages = SIMPLE
-        - Many iterations or long context = COMPLEX
-        - Everything else = MEDIUM
+        Heuristics (evaluated cheaply first to avoid O(n) scans):
+        - High iteration count alone → COMPLEX
+        - Short instruction + early iteration → SIMPLE (skip char scan)
+        - Long context or complex instruction → COMPLEX
+        - Everything else → MEDIUM
         """
-        # Count total tokens roughly
-        total_chars = sum(
-            len(str(m.get("content", "")))
-            for m in messages
-        )
+        # Fast-path: high iteration count doesn't need message scanning
+        if iteration > 15:
+            return TaskComplexity.COMPLEX
 
-        # Get instruction length
+        # Get instruction (first user message) — O(1) in practice
         instruction = ""
         for m in messages:
             if m.get("role") == "user":
@@ -228,12 +227,7 @@ class ModelRouter:
 
         instruction_len = len(instruction)
 
-        # Simple: short instruction, early iteration, small context
-        if instruction_len < 200 and iteration < 3 and total_chars < 10000:
-            return TaskComplexity.SIMPLE
-
-        # Complex: many iterations, large context, or complex instruction
-        if iteration > 15 or total_chars > 100000 or instruction_len > 2000:
+        if instruction_len > 2000:
             return TaskComplexity.COMPLEX
 
         # Complex: instruction mentions multiple files or architectural changes
@@ -243,6 +237,23 @@ class ModelRouter:
             "multiple files", "comprehensive",
         ]
         if any(kw in instruction.lower() for kw in complex_keywords):
+            return TaskComplexity.COMPLEX
+
+        # Fast-path: short instruction + early iteration → SIMPLE without
+        # the expensive O(n) char scan over all messages.
+        if instruction_len < 200 and iteration < 3 and len(messages) < 10:
+            return TaskComplexity.SIMPLE
+
+        # Deferred O(n) scan — only when the cheap checks are inconclusive.
+        total_chars = sum(
+            len(str(m.get("content", "")))
+            for m in messages
+        )
+
+        if instruction_len < 200 and iteration < 3 and total_chars < 10000:
+            return TaskComplexity.SIMPLE
+
+        if total_chars > 100000:
             return TaskComplexity.COMPLEX
 
         return TaskComplexity.MEDIUM

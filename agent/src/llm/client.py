@@ -358,15 +358,9 @@ class LLMClient:
         self.stream_max_retries = int(os.environ.get("STREAM_MAX_RETRIES", "5"))
         self.stream_idle_timeout = float(os.environ.get("STREAM_IDLE_TIMEOUT", "300.0"))
 
-        # Create httpx client with timeout
-        self._client = httpx.Client(
-            base_url=self.base_url,
-            headers={
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-            },
-            timeout=httpx.Timeout(timeout=self.timeout, connect=30.0),
-        )
+        # Use shared httpx client pool — avoids TCP/TLS handshake per instance
+        self._client = _get_shared_http_client(self.base_url, self._api_key, self.timeout)
+        self._owns_client = False  # shared; don't close on __exit__
 
     @staticmethod
     def _is_context_window_error(status_code: int, error_msg: str) -> bool:
@@ -941,8 +935,9 @@ class LLMClient:
         self._budget_reservation_key = reservation_key
 
     def close(self):
-        """Close the HTTP client."""
-        self._client.close()
+        """Close the HTTP client (no-op for shared pool clients)."""
+        if self._owns_client:
+            self._client.close()
 
     def __enter__(self):
         return self

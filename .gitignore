@@ -51,3 +51,7 @@ tasks/*/*.py
 context/tasks/
 
 codex/
+
+# E2E test artifacts
+tests/e2e/rollouts/*.json
+tests/e2e/.sandboxes/
