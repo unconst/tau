@@ -1208,9 +1208,13 @@ class ToolRegistry:
         lines = content.splitlines()
 
         # ------------------------------------------------------------------
-        # Validate all refs before applying anything
+        # Validate all refs before applying anything.
+        # Collect ALL errors (especially hash mismatches) so the model can
+        # self-correct in a single retry instead of re-reading the file
+        # across multiple turns.
         # ------------------------------------------------------------------
         parsed_ops: list[dict[str, Any]] = []
+        validation_errors: list[str] = []
         for idx, op in enumerate(operations, 1):
             op_type = op.get("op", "")
             start_ref = op.get("start", "")
@@ -1218,27 +1222,39 @@ class ToolRegistry:
             new_content = op.get("content", "")
 
             if op_type not in ("replace", "insert", "delete"):
+                # Structural errors are fatal — fail immediately
                 return ToolResult.fail(
                     f"Operation {idx}: invalid op '{op_type}' (expected replace, insert, or delete)"
                 )
             if not start_ref:
                 return ToolResult.fail(f"Operation {idx}: missing 'start' reference")
 
-            # Validate start ref
+            # Validate start ref — collect errors, don't fail yet
             ok, err = validate_ref(start_ref, lines)
             if not ok:
-                return ToolResult.fail(f"Operation {idx}: {err}")
-            start_line, start_hash = parse_ref(start_ref)
+                validation_errors.append(f"Operation {idx}: {err}")
+                # Still parse the ref to continue validation of other ops
+                try:
+                    start_line, _ = parse_ref(start_ref)
+                except ValueError:
+                    start_line = 1
+            else:
+                start_line, _ = parse_ref(start_ref)
 
             # Validate end ref if present
             end_line = start_line
             if end_ref:
                 ok, err = validate_ref(end_ref, lines)
                 if not ok:
-                    return ToolResult.fail(f"Operation {idx}: {err}")
-                end_line, _ = parse_ref(end_ref)
-                if end_line < start_line:
-                    return ToolResult.fail(
+                    validation_errors.append(f"Operation {idx}: {err}")
+                    try:
+                        end_line, _ = parse_ref(end_ref)
+                    except ValueError:
+                        end_line = start_line
+                else:
+                    end_line, _ = parse_ref(end_ref)
+                if end_line < start_line and not validation_errors:
+                    validation_errors.append(
                         f"Operation {idx}: end line {end_line} < start line {start_line}"
                     )
 
@@ -1254,6 +1270,14 @@ class ToolRegistry:
                 "end": end_line,
                 "content": new_content or "",
             })
+
+        # Report ALL validation errors at once so the model can fix them
+        # in a single retry rather than discovering them one at a time.
+        if validation_errors:
+            error_summary = "; ".join(validation_errors)
+            return ToolResult.fail(
+                f"{len(validation_errors)} validation error(s): {error_summary}"
+            )
 
         # ------------------------------------------------------------------
         # Sort operations bottom-up (highest line number first) so earlier
