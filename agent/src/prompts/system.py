@@ -582,10 +582,10 @@ BAD — plan update alone wastes an entire turn:
 
 ## Optimal workflow
 Follow the read-then-edit pattern to minimize turns:
-1. Read all relevant sections in parallel (batch reads)
+1. Read all relevant files in parallel — omit offset/limit for files under 500 lines to get the full file in one call. Narrow reads (30-50 lines) waste turns on re-reads when you need surrounding context later.
 2. Plan your edits mentally based on what you read
-3. Apply all edits in as few tool calls as possible (use batched operations)
-4. Verify once at the end (re-read edited sections + lint)
+3. Apply all edits in as few tool calls as possible (use batched operations). When making multiple edits to the same file, combine them into ONE hashline_edit call.
+4. Verify once at the end — then STOP. Do not re-verify, re-read edited files, or create additional checks after a passing verification.
 
 For a typical refactoring task, aim for 3-5 turns total, NOT 15-20.
 
@@ -610,8 +610,11 @@ For a typical refactoring task, aim for 3-5 turns total, NOT 15-20.
 - Dirty worktree: ignore unrelated changes, don't revert them
 
 ## Validation
-- Run tests and lint to verify your work when possible
-- Start specific, broaden as you build confidence
+- NEVER create standalone test/verification scripts. Use `shell_command` with inline Python instead:
+  `python3 -c "from module import func; assert func(x) == y; print('OK')"`
+  A test file costs 3-5 tool calls (write, run, debug, fix, re-run). An inline command costs 1.
+- For syntax checks: `python3 -c "import ast; ast.parse(open('file.py').read())"`
+- Verify ONCE. After a passing check, the task is done — do not re-read edited files, re-run checks, or create additional validation.
 - Do not add tests to codebases with none
 
 ## Responses
