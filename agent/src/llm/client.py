@@ -878,7 +878,18 @@ class LLMClient:
         return self._last_rate_limit
 
     def _prepare_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Prepare messages for the API, cleaning up any incompatible fields."""
+        """Prepare messages for the API, cleaning up any incompatible fields.
+
+        Importantly, after stripping Anthropic-specific ``cache_control``
+        fields, single-text-part lists are collapsed back to plain strings.
+        This keeps message serialization **byte-identical** across iterations
+        so that automatic prefix caching (offered by many OpenAI-compatible
+        providers) gets consistent cache hits.  Without this, ``_apply_caching``
+        in ``loop.py`` converts some messages from string to list format; the
+        set of converted messages shifts each iteration (the "last 2 non-system
+        messages" move), causing the same message to appear as a string in one
+        iteration and a list in the next — breaking the prefix cache.
+        """
         prepared = []
         for msg in messages:
             new_msg = dict(msg)
@@ -894,7 +905,23 @@ class LLMClient:
                         cleaned_parts.append(cleaned_part)
                     else:
                         cleaned_parts.append(part)
-                new_msg["content"] = cleaned_parts
+
+                # Collapse single-text-part lists back to plain strings so
+                # that the JSON serialization is identical to the original
+                # string content.  This is critical for automatic prefix
+                # caching: if _apply_caching converted "content": "text" to
+                # "content": [{"type":"text","text":"text"}], prefix bytes
+                # would differ from the un-converted version on subsequent
+                # iterations, destroying cache hits.
+                if (
+                    len(cleaned_parts) == 1
+                    and isinstance(cleaned_parts[0], dict)
+                    and cleaned_parts[0].get("type") == "text"
+                    and set(cleaned_parts[0].keys()) == {"type", "text"}
+                ):
+                    new_msg["content"] = cleaned_parts[0]["text"]
+                else:
+                    new_msg["content"] = cleaned_parts
 
             prepared.append(new_msg)
 

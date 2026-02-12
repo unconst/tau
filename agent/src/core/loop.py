@@ -527,6 +527,9 @@ Do NOT ask questions — make reasonable decisions and proceed.
     _plan_staleness_nudge_count = 0  # Track plan-staleness nudge messages
     _plan_only_nudge_count = 0  # Track plan-only turn nudge messages
     _consecutive_plan_only_turns = 0  # Track consecutive plan-only turns
+    _plan_only_freebies_used = 0  # Plan-only turns forgiven (iteration not consumed)
+    _max_plan_only_freebies = int(config.get("max_plan_only_freebies", 5) or 5)
+    _total_plan_only_turns = 0  # Total plan-only turns observed
     llm_retry_count = 0
     compaction_count = 0
     parallel_batch_count = 0
@@ -1124,6 +1127,12 @@ Do NOT ask questions — make reasonable decisions and proceed.
             )
             messages.append({"role": "user", "content": plan_only_nudge})
             _plan_only_nudge_count += 1
+            _total_plan_only_turns += 1
+            # Don't count plan-only turns against the iteration budget (up to cap)
+            if _plan_only_freebies_used < _max_plan_only_freebies:
+                iteration -= 1
+                _plan_only_freebies_used += 1
+                _log(f"Plan-only turn forgiven ({_plan_only_freebies_used}/{_max_plan_only_freebies} freebies used)")
         else:
             if _turn_tool_names:
                 _consecutive_plan_only_turns = 0
