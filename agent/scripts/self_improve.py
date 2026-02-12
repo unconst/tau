@@ -1714,7 +1714,7 @@ def main():
 
     landed = sum(1 for r in results if r.get("outcome") == "landed")
     failed = sum(1 for r in results if r.get("outcome") not in ("landed",))
-    log(f"\nSession: {landed} landed, {failed} failed out of {len(results)} total")
+    log(f"\nSession: {landed} landed, {failed} failed out of {len(results)} pushtotal")
     log(f"All-time: {memory['iterations_total']} iterations, "
         f"{memory['improvements_landed']} landed")
     log(f"Memory: {MEMORY_FILE}")

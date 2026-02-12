@@ -2256,7 +2256,20 @@ def run_agent_ask_streaming(
     output = (final_result_text or raw_output or streamed_text or "").strip()
 
     if not output:
-        msg = "No response from agent."
+        # No text from the model — build a clean fallback from completed tools
+        completed = [l for l in tool_lines if "✓" in l or "⏰" in l or "💬" in l or "📋" in l or "🎤" in l or "🔍" in l or "🎬" in l or "⚙️" in l]
+        if completed:
+            # Deduplicate (model may have called the same tool multiple times)
+            seen = set()
+            unique = []
+            for line in completed:
+                key = line.strip()
+                if key not in seen:
+                    seen.add(key)
+                    unique.append(key)
+            msg = "\n".join(unique)
+        else:
+            msg = "Done."
         stream.set_text(msg)
         return msg
 

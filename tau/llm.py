@@ -397,11 +397,24 @@ You have the following tools:
 - **grep_files** / **glob_files** / **list_dir** — Search and explore files
 - **web_search** — Search the web for information
 
+# Action Response Style (CRITICAL)
+
+When the user asks you to DO something (schedule a message, create a task, set a reminder, send something, etc.):
+1. Call the appropriate tool exactly ONCE.
+2. After the tool succeeds, respond with a short, natural confirmation in plain text. Examples:
+   - "Done — I'll send you that in 1 minute."
+   - "Reminder set for 2pm."
+   - "Task created."
+3. Do NOT call the same tool more than once for the same request.
+4. Do NOT repeat tool calls if the first one succeeded.
+5. Do NOT include tool names, JSON, or argument syntax in your text response.
+6. Your text response IS the final message shown to the user — make it conversational and clean.
+
 # Guidelines
 
 - Answer directly, be concise. No preamble, no filler.
 - For simple questions (factual, conversational), just answer — don't run shell commands unnecessarily.
-- When the user asks for actions (reminders, tasks, searches, code changes), use the appropriate tools.
+- When the user asks for actions (reminders, tasks, searches, code changes), use the appropriate tool ONCE, then confirm with text.
 - For coding tasks, use your full file editing capability.
 - Do NOT say "Is there anything else..." or similar closing phrases.
 - Do NOT explain your thinking process in the response.
@@ -992,10 +1005,38 @@ def format_tool_update(parsed: dict[str, Any]) -> str | None:
     return f"🔧 {name}..."
 
 
+# Tau-specific action tools — shown with friendly labels, not raw call syntax.
+# Maps tool_name prefix (as it appears in the command detail) to (emoji, done_label, progress_label).
+_TAU_FRIENDLY_TOOLS: dict[str, tuple[str, str, str]] = {
+    "schedule_message": ("⏰", "message scheduled", "scheduling message..."),
+    "send_message": ("💬", "message sent", "sending message..."),
+    "send_voice": ("🎤", "voice message sent", "sending voice..."),
+    "create_task": ("📋", "task created", "creating task..."),
+    "search_skills": ("🔍", "searched skills", "searching skills..."),
+    "generate_video": ("🎬", "video generated", "generating video..."),
+    "commands": ("⚙️", "command executed", "running command..."),
+}
+
+
+def _match_tau_tool(detail: str) -> tuple[str, str, str] | None:
+    """If *detail* starts with a known Tau tool call, return its friendly labels."""
+    for tool_prefix, labels in _TAU_FRIENDLY_TOOLS.items():
+        if detail.startswith(f"{tool_prefix}(") or detail == tool_prefix:
+            return labels
+    return None
+
+
 def format_tool_inline(parsed: dict[str, Any], done: bool = False) -> str:
     """Return a compact inline tool indicator for embedding in streamed text."""
     name = parsed.get("tool_name") or "tool"
     detail = (parsed.get("tool_detail") or "")[:60]
+
+    # Detect Tau action tools (emitted as command_execution with detail like "schedule_message({...})")
+    if name == "Shell" and detail:
+        tau = _match_tau_tool(detail)
+        if tau:
+            emoji, done_label, progress_label = tau
+            return f"  {emoji} {done_label}" if done else f"  {emoji} {progress_label}"
 
     if done:
         if name == "Shell":
