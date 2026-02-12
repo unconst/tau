@@ -22,6 +22,12 @@ from src.tools.specs import get_all_tools, tool_is_mutating, tool_supports_paral
 if TYPE_CHECKING:
     pass  # AgentContext is duck-typed (has shell(), cwd, etc.)
 
+_LIST_DIR_SKIP_DIRS: frozenset[str] = frozenset({
+    ".git", "__pycache__", "node_modules", ".venv", ".env",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox",
+    ".eggs", ".cache", ".DS_Store", "dist", "build", ".agent",
+})
+
 
 @dataclass
 class ExecutorConfig:
@@ -539,7 +545,10 @@ class ToolRegistry:
             selected = lines[start:end]
 
             # Format with hashline tags (line_number:hash|content)
-            output_lines = []
+            total_lines = len(lines)
+            shown_end = min(end, total_lines)
+            header_line = f"[File: {path} | {total_lines} lines | {file_size:,} bytes | showing {start + 1}-{shown_end}]"
+            output_lines = [header_line]
             for i, line in enumerate(selected, start=start + 1):
                 output_lines.append(format_hashline(i, line.rstrip()))
 
@@ -643,6 +652,9 @@ class ToolRegistry:
             for item in items:
                 if len(entries) >= max_entries:
                     break
+
+                if item.is_dir() and item.name in _LIST_DIR_SKIP_DIRS:
+                    continue
 
                 rel_path = item.relative_to(base)
 
