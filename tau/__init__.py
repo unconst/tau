@@ -102,6 +102,55 @@ INTENT_PATTERNS = {
 }
 
 
+def _select_model_for_message(text: str) -> str:
+    """Choose the right model based on whether the message likely needs tools.
+
+    Messages that need scheduling, file operations, tasks, web search, etc.
+    use the AGENT_MODEL (better at function calling).  Simple conversational
+    messages use the CHAT_MODEL (faster, cheaper).
+    """
+    from .llm import CHAT_MODEL, AGENT_MODEL
+
+    text_lower = text.lower()
+
+    # Patterns that strongly suggest tool use is needed
+    _TOOL_TRIGGERS = [
+        # Scheduling / reminders
+        "schedule", "remind", "reminder", "callback", "in 1 ", "in 2 ",
+        "in 5 ", "in 10 ", "in 30 ", "in an hour",
+        "after ", "later", "timer", "alarm",
+        # Time patterns like "1 min", "2 hours"
+        "minute", "minutes",
+        # Tasks
+        "create a task", "add a task", "add task", "new task", "todo",
+        # File operations
+        "write file", "create file", "edit file", "read file", "delete file",
+        # Commands / actions
+        "run ", "execute", "search for", "look up", "google",
+        "send me", "send a message", "write me a message", "notify",
+        # Cron
+        "cron", "recurring", "every day", "every hour", "every morning",
+        # System
+        "adapt", "modify your", "update your", "change your",
+        "restart", "status", "what are you working",
+    ]
+
+    # Also match time patterns like "1 min", "5m", "2h", "in X min/hour"
+    import re as _re
+    _TIME_RE = _re.compile(r'\b(?:in\s+)?\d+\s*(?:min|m|hour|h|sec|s)\b', _re.IGNORECASE)
+
+    needs_tools = any(trigger in text_lower for trigger in _TOOL_TRIGGERS) or bool(_TIME_RE.search(text_lower))
+
+    if needs_tools:
+        model = os.getenv("TAU_AGENT_MODEL", AGENT_MODEL)
+        logger.info(f"Model routing: AGENT_MODEL ({model}) — message likely needs tools")
+        return model
+
+    model = os.getenv("TAU_CHAT_MODEL", CHAT_MODEL)
+    logger.info(f"Model routing: CHAT_MODEL ({model}) — simple conversation")
+    return model
+
+
 def classify_intent(message: str) -> dict | None:
     """Classify user intent and return command info if applicable.
     
@@ -2418,9 +2467,10 @@ def handle_message(message):
                 # Don't process this as a normal message
                 return
 
-    # Model selection — always use the agent path via Chutes
-    from .llm import CHAT_MODEL, build_tau_system_prompt
-    agent_model = os.getenv("TAU_CHAT_MODEL", CHAT_MODEL)
+    # Model selection — use AGENT_MODEL when tools are likely needed (scheduling,
+    # tasks, file ops, etc.), CHAT_MODEL for simple conversational messages.
+    from .llm import CHAT_MODEL, AGENT_MODEL, build_tau_system_prompt
+    agent_model = _select_model_for_message(message.text)
 
     tau_system_prompt = build_tau_system_prompt(
         chat_id=message.chat.id,

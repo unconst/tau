@@ -469,6 +469,15 @@ class TurnRuntime:
                     _has_successful_shell = True
             else:
                 tool_failures += 1
+                # Log tool failure details for debugging
+                import sys as _sys
+                _err_preview = (output or "")[:200]
+                print(
+                    f"[{__import__('time').strftime('%H:%M:%S')}] [tool] FAILED: "
+                    f"{call.tool_name}({json.dumps(call.arguments)[:100]}) -> {_err_preview}",
+                    file=_sys.stderr,
+                    flush=True,
+                )
             emit_raw(
                 self._with_runtime_meta(
                     {
