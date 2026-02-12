@@ -559,24 +559,31 @@ def _register_tau_tools(tools) -> None:
     # ------------------------------------------------------------------
     def _handle_schedule_message(args: dict) -> ToolResult:
         try:
-            from tau.tools.schedule_message import schedule_at, schedule_cron
+            from tau.tools.schedule_message import schedule_at, schedule_cron, schedule_delay_thread
             message = args.get("message", "")
-            delay = args.get("delay")
-            at_time = args.get("at")
-            cron_expr = args.get("cron")
+            # Accept both "delay" and "in" as parameter names (models often use "in")
+            delay = args.get("delay") or args.get("in") or args.get("in_time")
+            at_time = args.get("at") or args.get("at_time")
+            cron_expr = args.get("cron") or args.get("cron_expr")
 
             if at_time:
                 schedule_at(at_time, message)
                 return ToolResult(success=True, output=f"Scheduled at {at_time}: {message}")
             elif delay:
-                time_spec = f"now + {delay.replace('h', ' hours').replace('m', ' minutes')}"
-                schedule_at(time_spec, message)
-                return ToolResult(success=True, output=f"Scheduled in {delay}: {message}")
+                # Try the 'at' command first, fall back to threading
+                try:
+                    time_spec = f"now + {delay.replace('h', ' hours').replace('m', ' minutes')}"
+                    schedule_at(time_spec, message)
+                    return ToolResult(success=True, output=f"Scheduled in {delay}: {message}")
+                except Exception:
+                    # Fallback: use Python threading (works on macOS where atrun is disabled)
+                    schedule_delay_thread(delay, message)
+                    return ToolResult(success=True, output=f"Scheduled in {delay} (via timer): {message}")
             elif cron_expr:
                 schedule_cron(cron_expr, message)
                 return ToolResult(success=True, output=f"Added cron job ({cron_expr}): {message}")
             else:
-                return ToolResult(success=False, output="Specify --delay, --at, or --cron")
+                return ToolResult(success=False, output="Provide 'delay' (e.g. '1m', '2h'), 'at' (e.g. '14:00'), or 'cron' (e.g. '0 9 * * *')")
         except Exception as e:
             return ToolResult(success=False, output=str(e))
 
@@ -585,19 +592,19 @@ def _register_tau_tools(tools) -> None:
         {
             "name": "schedule_message",
             "description": (
-                "Schedule a future message.  Use --in '2h' for relative or "
-                "--at '14:00' for absolute time, or --cron '0 9 * * *' for recurring."
+                "Schedule a future message. Pass 'delay' for relative time (e.g. '1m', '2h'), "
+                "'at' for absolute time (e.g. '14:00'), or 'cron' for recurring (e.g. '0 9 * * *')."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "message": {"type": "string", "description": "Message text."},
+                    "message": {"type": "string", "description": "The message text to send."},
                     "delay": {
                         "type": "string",
-                        "description": "Relative delay like '30m', '2h', '1d'.",
+                        "description": "Relative delay, e.g. '1m', '30m', '2h', '1d'.",
                     },
-                    "at": {"type": "string", "description": "Absolute time like '14:00'."},
-                    "cron": {"type": "string", "description": "Cron expression."},
+                    "at": {"type": "string", "description": "Absolute time, e.g. '14:00'."},
+                    "cron": {"type": "string", "description": "Cron expression, e.g. '0 9 * * *'."},
                 },
                 "required": ["message"],
             },

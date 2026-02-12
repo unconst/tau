@@ -277,6 +277,10 @@ def run_single_benchmark(
             "timed_out": agent_result.get("timed_out", False),
             "exit_code": agent_result.get("exit_code", -1),
             "turns": agent_result.get("turns", 0),
+            "turns_failed": agent_result.get("turns_failed", 0),
+            "errors": agent_result.get("errors", []),
+            "stderr_tail": (agent_result.get("stderr", "") or "")[-500:],
+            "usage": agent_result.get("usage", {}),
         }
     except Exception as e:
         return {

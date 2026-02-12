@@ -9,10 +9,15 @@ changes via git commits.
 Features:
 - Institutional memory tracking all past iterations and outcomes
 - Benchmark suite for measuring agent quality before/after changes
-- Adaptive focus selection (weakest areas get priority)
-- Quality gates (syntax check, import check, benchmark regression check)
-- Git accumulation (successful improvements are committed, not thrown away)
-- Score-based acceptance threshold
+- Curriculum-based progression (startup → basic → correct → efficient → capable)
+- Rollout-driven discovery (benchmark errors feed directly into proposals)
+- Pre-flight health check (detects agent startup failures before wasting cycles)
+- Quality gates: syntax, import, benchmark regression, score >= 6/10
+- Strict critic: runs in agent mode with full file access & efficiency rubric
+- Implementation retry loop (2 fix attempts before revert)
+- Benchmark trend tracking with regression detection
+- Adaptive focus selection (curriculum-gated, weakest areas get priority)
+- Git accumulation (successful improvements are committed)
 - Failure mode adaptation (auto-adjusts based on recent failures)
 
 Usage:
@@ -134,6 +139,7 @@ def _empty_memory() -> dict:
             "import_error": 0,
         },
         "last_benchmark": None,
+        "benchmark_trend": [],  # list of {iteration, passed, total, timestamp}
     }
 
 
@@ -247,6 +253,68 @@ def update_memory(
     save_memory(memory)
 
 
+def record_benchmark_trend(memory: dict, iteration: int, benchmark: dict | None):
+    """Record a benchmark score in the rolling trend tracker."""
+    if not benchmark:
+        return
+    trend = memory.setdefault("benchmark_trend", [])
+    trend.append({
+        "iteration": iteration,
+        "passed": benchmark.get("passed", 0),
+        "total": benchmark.get("total", 0),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    })
+    # Keep last 50 data points
+    if len(trend) > 50:
+        memory["benchmark_trend"] = trend[-50:]
+    save_memory(memory)
+
+
+def check_benchmark_trend(memory: dict) -> tuple[str, bool]:
+    """Analyze the benchmark trend and detect if performance is declining.
+
+    Returns (description, should_halt).
+    should_halt is True if there's a clear declining trend over the last N points.
+    """
+    trend = memory.get("benchmark_trend", [])
+    if len(trend) < 3:
+        return "Not enough data points for trend analysis.", False
+
+    recent = trend[-5:]  # last 5 benchmark runs
+    scores = [t["passed"] for t in recent]
+
+    # Check for monotonic decline
+    declining = all(scores[i] >= scores[i + 1] for i in range(len(scores) - 1))
+    # But only halt if it's a real decline (not flat at 0)
+    actually_declining = declining and scores[0] > scores[-1]
+
+    # Check for overall regression from peak
+    all_scores = [t["passed"] for t in trend]
+    peak = max(all_scores) if all_scores else 0
+    current = scores[-1] if scores else 0
+    regressed_from_peak = peak > 0 and current < peak * 0.5  # dropped below 50% of peak
+
+    description = (
+        f"Trend ({len(trend)} points): "
+        f"recent={scores}, peak={peak}, current={current}"
+    )
+
+    if actually_declining and len(recent) >= 3:
+        return (
+            f"{description} — DECLINING over last {len(recent)} runs. "
+            "Consider reverting recent changes.",
+            True,
+        )
+    if regressed_from_peak:
+        return (
+            f"{description} — REGRESSED from peak ({peak}) to {current}. "
+            "Recent changes may have degraded the agent.",
+            True,
+        )
+
+    return f"{description} — stable or improving.", False
+
+
 def format_history_for_prompt(memory: dict, last_n: int = 15) -> str:
     """Format recent history for inclusion in prompts."""
     history = memory.get("history", [])[-last_n:]
@@ -284,21 +352,120 @@ def extract_score(text: str) -> int | None:
 
 
 # ===========================================================================
-# ADAPTIVE FOCUS SELECTION
+# CURRICULUM & ADAPTIVE FOCUS SELECTION
 # ===========================================================================
 
-def select_focus(memory: dict) -> str:
+# Progression tiers: each tier gates which focus areas are eligible.
+# The agent must graduate through tiers based on benchmark performance.
+#
+# Tier 0 (STARTUP):  Agent can't even start → fix imports/startup errors
+# Tier 1 (BASIC):    Agent starts but fails tasks → basic reliability
+# Tier 2 (CORRECT):  Agent passes some tasks → correctness & robustness
+# Tier 3 (EFFICIENT): Agent passes most tasks → optimize for speed/tokens
+# Tier 4 (CAPABLE):  Agent is efficient → enhance capabilities
+
+CURRICULUM_TIERS = {
+    0: {
+        "name": "startup",
+        "description": "Agent cannot start — fix import/startup errors",
+        "min_benchmark_pass_rate": -1,  # always eligible if agent can't start
+        "focus_areas": [
+            "error handling and recovery",
+            "tool implementation",
+        ],
+    },
+    1: {
+        "name": "basic",
+        "description": "Agent starts but fails most tasks — basic reliability",
+        "min_benchmark_pass_rate": 0.0,
+        "focus_areas": [
+            "error handling and recovery",
+            "tool implementation",
+            "LLM interaction",
+        ],
+    },
+    2: {
+        "name": "correct",
+        "description": "Agent passes some tasks — improve correctness",
+        "min_benchmark_pass_rate": 0.33,
+        "focus_areas": [
+            "error handling and recovery",
+            "search and navigation",
+            "planning and task decomposition",
+            "tool implementation",
+        ],
+    },
+    3: {
+        "name": "efficient",
+        "description": "Agent passes most tasks — optimize efficiency",
+        "min_benchmark_pass_rate": 0.66,
+        "focus_areas": [
+            "context management",
+            "LLM interaction",
+            "planning and task decomposition",
+            "search and navigation",
+        ],
+    },
+    4: {
+        "name": "capable",
+        "description": "Agent is efficient — enhance capabilities",
+        "min_benchmark_pass_rate": 0.85,
+        "focus_areas": FOCUS_AREAS,  # all areas eligible
+    },
+}
+
+
+def get_curriculum_tier(
+    benchmark_scores: dict | None,
+    agent_healthy: bool = True,
+) -> int:
+    """Determine the current curriculum tier based on benchmark performance."""
+    if not agent_healthy:
+        return 0
+
+    if not benchmark_scores or "results" not in benchmark_scores:
+        return 1  # no benchmark data, assume basic tier
+
+    total = benchmark_scores.get("total", 0)
+    passed = benchmark_scores.get("passed", 0)
+    if total == 0:
+        return 1
+
+    pass_rate = passed / total
+
+    # Find the highest tier we qualify for
+    current_tier = 1
+    for tier_num in sorted(CURRICULUM_TIERS.keys()):
+        if tier_num == 0:
+            continue  # tier 0 is special (startup failure)
+        min_rate = CURRICULUM_TIERS[tier_num]["min_benchmark_pass_rate"]
+        if pass_rate >= min_rate:
+            current_tier = tier_num
+
+    return current_tier
+
+
+def select_focus(
+    memory: dict,
+    benchmark_scores: dict | None = None,
+    agent_healthy: bool = True,
+) -> str:
     """Select the focus area most in need of improvement.
 
-    Priority favors areas with lower average scores and fewer landed
-    improvements, while deprioritizing areas that have seen recent success.
+    Uses the curriculum tier to gate which focus areas are eligible,
+    then prioritizes areas with lower scores and fewer landed improvements.
     """
+    tier = get_curriculum_tier(benchmark_scores, agent_healthy)
+    tier_info = CURRICULUM_TIERS.get(tier, CURRICULUM_TIERS[1])
+    eligible_areas = tier_info["focus_areas"]
+
+    log(f"Curriculum tier: {tier} ({tier_info['name']}) — "
+        f"eligible areas: {eligible_areas}")
+
     focus_scores = memory.get("focus_scores", {})
-    if not focus_scores:
-        return FOCUS_AREAS[0]
 
     candidates = []
-    for area in FOCUS_AREAS:
+    for area in eligible_areas:
         stats = focus_scores.get(area, {})
         avg = stats.get("avg_score", 0.0)
         landed = stats.get("landed_count", 0)
@@ -310,6 +477,9 @@ def select_focus(memory: dict) -> str:
         # - Many attempts without landings → higher priority
         priority = avg + (landed * 3.0) - max(0, attempts - landed) * 0.3
         candidates.append((priority, area))
+
+    if not candidates:
+        return FOCUS_AREAS[0]
 
     candidates.sort(key=lambda x: x[0])
 
@@ -366,11 +536,16 @@ def cursor_cli(
         cmd = [
             "agent", "-p",
             "--model", model,
-            "--mode", mode,
             "--output-format", "stream-json",
             "--force",
             prompt,
         ]
+        # --mode only supports "plan" and "ask". The default (no --mode)
+        # is full agent mode with read+write access. Passing an invalid
+        # mode like "agent" causes the CLI to silently exit with no output.
+        if mode in ("ask", "plan"):
+            cmd.insert(4, "--mode")
+            cmd.insert(5, mode)
 
         log(f"Cursor ({mode}, attempt {attempt}/{max_retries}) → {prompt[:120]}...")
 
@@ -428,6 +603,22 @@ def cursor_cli(
         stderr_text = proc.stderr.read()
         proc.wait()
 
+        # Log exit code and stderr for diagnostics
+        if proc.returncode != 0:
+            log(f"Cursor CLI exited with code {proc.returncode} (mode={mode})", "WARN")
+            if stderr_text:
+                # Show last 500 chars of stderr for debugging
+                stderr_tail = stderr_text.strip()[-500:]
+                log(f"Cursor CLI stderr: {stderr_tail}", "WARN")
+
+        # Warn on empty result (common failure mode)
+        if not result_text.strip():
+            log(f"Cursor CLI returned EMPTY result (mode={mode}, "
+                f"exit={proc.returncode})", "WARN")
+            if stderr_text:
+                stderr_tail = stderr_text.strip()[-300:]
+                log(f"  stderr hint: {stderr_tail}", "WARN")
+
         # Rate-limit detection
         rate_limited = False
         if proc.returncode != 0 and stderr_text:
@@ -446,12 +637,19 @@ def cursor_cli(
             time.sleep(wait)
             continue
 
+        # Retry on empty result with non-zero exit (likely transient failure)
+        if not result_text.strip() and proc.returncode != 0 and attempt < max_retries:
+            log(f"Empty result with non-zero exit — retrying (attempt {attempt}/{max_retries})",
+                "WARN")
+            time.sleep(5.0)
+            continue
+
         if not rate_limited:
             _cursor_cli_consecutive_rate_limits = 0
 
         return result_text
 
-    log("Cursor CLI retries exhausted after rate-limiting", "WARN")
+    log("Cursor CLI retries exhausted", "WARN")
     return result_text
 
 
@@ -560,6 +758,51 @@ def git_commit_improvement(title: str, files: set[str], iteration: int) -> bool:
 
     log(f"Commit failed: {result.stderr.strip()}", "WARN")
     return False
+
+
+# ===========================================================================
+# AGENT-SPECIFIC DIFF HELPERS
+# ===========================================================================
+
+def _compute_agent_diff(
+    pre_contents: dict[str, str],
+    impl_files: set[str],
+) -> str:
+    """Compute a unified diff showing ONLY changes the agent made.
+
+    For pre-dirty files, this diffs the pre-agent content against the current
+    content — isolating just the agent's edits from pre-existing modifications.
+    For new files, it diffs against an empty string.
+    """
+    import difflib
+
+    diffs: list[str] = []
+    for f in sorted(impl_files):
+        old = pre_contents.get(f, "")
+        full = REPO_ROOT / f
+        try:
+            new = full.read_text(encoding="utf-8") if full.exists() else ""
+        except Exception:
+            new = ""
+        if old == new:
+            continue
+        diff = "\n".join(difflib.unified_diff(
+            old.splitlines(), new.splitlines(),
+            fromfile=f"a/{f}", tofile=f"b/{f}", lineterm="",
+        ))
+        if diff:
+            diffs.append(diff)
+    return "\n".join(diffs)
+
+
+def _summarize_diff(diff_content: str, impl_files: set[str]) -> str:
+    """Build a short stat-like summary from a unified diff string."""
+    if not diff_content:
+        return "(no diff)"
+    insertions = sum(1 for line in diff_content.splitlines() if line.startswith("+") and not line.startswith("+++"))
+    deletions = sum(1 for line in diff_content.splitlines() if line.startswith("-") and not line.startswith("---"))
+    files_str = ", ".join(sorted(impl_files))
+    return f"{len(impl_files)} file(s) changed ({files_str}), {insertions} insertions(+), {deletions} deletions(-)"
 
 
 # ===========================================================================
@@ -721,6 +964,185 @@ def run_agent(
 
 
 # ===========================================================================
+# ROLLOUT ANALYSIS
+# ===========================================================================
+
+def analyze_rollout(agent_result: dict) -> dict:
+    """Extract structured performance metrics from an agent run result.
+
+    Parses the JSONL output and stderr to identify:
+    - Token efficiency (input/output/cached)
+    - Turn efficiency (completed vs failed)
+    - Error patterns (recurring errors, crash types)
+    - Stuck-loop indicators (high turns with no progress)
+    """
+    usage = agent_result.get("usage", {})
+    turns = agent_result.get("turns", 0)
+    turns_failed = agent_result.get("turns_failed", 0)
+    errors = agent_result.get("errors", [])
+    stderr = agent_result.get("stderr", "") or ""
+    elapsed = agent_result.get("elapsed", 0)
+    exit_code = agent_result.get("exit_code", -1)
+    timed_out = agent_result.get("timed_out", False)
+
+    # Classify errors
+    error_categories: dict[str, int] = {}
+    for err in errors:
+        err_lower = err.lower()
+        if "none" in err_lower and "iterable" in err_lower:
+            cat = "null_response"
+        elif "rate" in err_lower or "429" in err_lower:
+            cat = "rate_limit"
+        elif "timeout" in err_lower:
+            cat = "timeout"
+        elif "module" in err_lower and "not found" in err_lower:
+            cat = "import_error"
+        elif "connection" in err_lower or "network" in err_lower:
+            cat = "network_error"
+        else:
+            cat = "other"
+        error_categories[cat] = error_categories.get(cat, 0) + 1
+
+    # Check stderr for import/startup errors
+    startup_error = ""
+    if exit_code != 0 and stderr:
+        for line in stderr.strip().splitlines()[-5:]:
+            if "ModuleNotFoundError" in line or "ImportError" in line:
+                startup_error = line.strip()
+                break
+            if "SyntaxError" in line:
+                startup_error = line.strip()
+                break
+
+    # Compute efficiency metrics
+    input_tokens = usage.get("input_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0)
+    cached_tokens = usage.get("cached_input_tokens", 0)
+    total_tokens = input_tokens + output_tokens
+    cache_hit_rate = (
+        round(cached_tokens / input_tokens, 2) if input_tokens > 0 else 0.0
+    )
+
+    return {
+        "turns_completed": turns,
+        "turns_failed": turns_failed,
+        "total_turns": turns + turns_failed,
+        "elapsed_seconds": round(elapsed, 1),
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cached_tokens": cached_tokens,
+        "total_tokens": total_tokens,
+        "cache_hit_rate": cache_hit_rate,
+        "error_categories": error_categories,
+        "error_count": len(errors),
+        "startup_error": startup_error,
+        "stuck_loop": turns > 5 and turns_failed == 0 and exit_code != 0,
+    }
+
+
+def format_benchmark_diagnostics(benchmark_scores: dict | None) -> str:
+    """Format benchmark results WITH error details for inclusion in prompts.
+
+    Unlike the old bench_text which just showed PASS/FAIL, this includes
+    stderr, error messages, and performance metrics so the discovery prompt
+    can target REAL problems.
+    """
+    if not benchmark_scores or "results" not in benchmark_scores:
+        return "Not yet computed."
+
+    lines = []
+    for name, result in benchmark_scores["results"].items():
+        status = "PASS" if result.get("passed") else "FAIL"
+        elapsed = result.get("elapsed", 0)
+        turns = result.get("turns", 0)
+        turns_failed = result.get("turns_failed", 0)
+        exit_code = result.get("exit_code", -1)
+        errors = result.get("errors", [])
+        stderr_tail = result.get("stderr_tail", "")
+
+        line = f"- **{name}**: {status} ({elapsed:.1f}s, {turns} turns, exit={exit_code})"
+        if not result.get("passed"):
+            # Include WHY it failed
+            if stderr_tail:
+                # Extract the most informative error line
+                for sline in stderr_tail.strip().splitlines():
+                    if any(kw in sline for kw in (
+                        "Error", "error", "Traceback", "ModuleNotFound",
+                        "ImportError", "SyntaxError", "Exception",
+                    )):
+                        line += f"\n  ERROR: {sline.strip()[:200]}"
+                        break
+            if errors:
+                line += f"\n  ERRORS: {'; '.join(errors[:3])}"
+            if turns == 0 and turns_failed == 0:
+                line += "\n  NOTE: Agent produced zero turns (likely crashed on startup)"
+        lines.append(line)
+
+    total = benchmark_scores.get("total", 0)
+    passed = benchmark_scores.get("passed", 0)
+    lines.append(f"\nOverall: {passed}/{total}")
+
+    # Add aggregate diagnosis
+    all_same_error = True
+    first_error = None
+    for result in benchmark_scores["results"].values():
+        stderr = result.get("stderr_tail", "")
+        if stderr and not result.get("passed"):
+            for sline in stderr.strip().splitlines():
+                if "Error" in sline:
+                    if first_error is None:
+                        first_error = sline.strip()
+                    elif sline.strip() != first_error:
+                        all_same_error = False
+                    break
+
+    if first_error and all_same_error and passed == 0:
+        lines.append(
+            f"\n** ALL benchmarks fail with the same error: {first_error[:200]}\n"
+            f"** FIX THIS FIRST — it blocks all other improvements."
+        )
+
+    return "\n".join(lines)
+
+
+# ===========================================================================
+# PRE-FLIGHT HEALTH CHECK
+# ===========================================================================
+
+def preflight_check() -> tuple[bool, str]:
+    """Verify the agent can at least start up without import errors.
+
+    Returns (healthy, error_message).
+    """
+    python = _venv_python()
+    agent_py = AGENT_DIR / "agent.py"
+    if not agent_py.exists():
+        return False, f"agent.py not found at {agent_py}"
+
+    # Try to import the agent's main modules
+    check_script = (
+        "import sys; sys.path.insert(0, 'agent'); "
+        "from src.tools.registry import ToolRegistry; "
+        "from src.core.loop import run_agent_loop; "
+        "from src.llm.client import LLMClient; "
+        "print('OK')"
+    )
+    result = subprocess.run(
+        [python, "-c", check_script],
+        cwd=str(REPO_ROOT),
+        capture_output=True, text=True,
+        timeout=30,
+    )
+    if result.returncode == 0 and "OK" in result.stdout:
+        return True, ""
+
+    error = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "Unknown error"
+    return False, error
+
+
+# ===========================================================================
 # TASK PARSING
 # ===========================================================================
 
@@ -838,22 +1260,20 @@ def build_discovery_prompt(
     memory: dict,
     benchmark_scores: dict | None,
     adaptive: dict,
+    preflight_error: str = "",
 ) -> str:
-    """Build a context-rich discovery prompt with memory, blacklist, benchmarks."""
+    """Build a context-rich discovery prompt with memory, blacklist, benchmarks.
+
+    Now includes full benchmark diagnostics (errors, stderr, metrics) so the
+    discovery targets REAL observable failures rather than hypothetical ones.
+    """
     history_text = format_history_for_prompt(memory)
 
     blacklist = memory.get("blacklist", [])
     blacklist_text = "\n".join(f"- {b}" for b in blacklist) if blacklist else "None yet."
 
-    # Benchmark scores
-    bench_text = "Not yet computed."
-    if benchmark_scores and "results" in benchmark_scores:
-        lines = []
-        for name, result in benchmark_scores["results"].items():
-            status = "PASS" if result.get("passed") else "FAIL"
-            lines.append(f"- {name}: {status}")
-        bench_text = "\n".join(lines)
-        bench_text += f"\nOverall: {benchmark_scores.get('score', '?')}"
+    # Benchmark diagnostics with error details
+    bench_text = format_benchmark_diagnostics(benchmark_scores)
 
     desc = FOCUS_DESCRIPTIONS.get(focus, focus)
 
@@ -872,14 +1292,25 @@ def build_discovery_prompt(
             "proposal is straightforward and describe the exact code changes needed."
         )
 
+    # Pre-flight error override: if the agent can't even start, that's THE problem
+    preflight_section = ""
+    if preflight_error:
+        preflight_section = (
+            f"\n## CRITICAL: Agent Startup Failure\n"
+            f"The agent CANNOT START due to: `{preflight_error}`\n"
+            f"**This MUST be fixed before any other improvement can take effect.**\n"
+            f"Override your focus area and propose a fix for this startup error.\n"
+        )
+
     prompt = (
         f"You are reviewing a repository containing an autonomous coding agent "
         f"(at `agent/`). Your focus area is: **{focus}** — {desc}.\n\n"
+        f"{preflight_section}"
         f"## Previous Iterations (what has already been tried)\n"
         f"{history_text}\n\n"
         f"## Blacklisted Proposals (do NOT propose these again)\n"
         f"{blacklist_text}\n\n"
-        f"## Current Benchmark Scores\n"
+        f"## Current Benchmark Results (with error details)\n"
         f"{bench_text}\n\n"
         "## Codebase Architecture\n"
         "- `agent/src/tools/registry.py` — ToolRegistry class with `_execute_*` methods "
@@ -903,6 +1334,8 @@ def build_discovery_prompt(
         "4. Is concrete and implementable in a single session\n"
         "5. Targets `agent/src/` files (not test files, docs, or scripts)\n"
         "6. Affects actual behavior (not cosmetic/style changes)\n"
+        "7. Addresses REAL problems visible in the benchmark errors above "
+        "(not hypothetical issues)\n"
         f"{simplify_note}{syntax_note}\n\n"
         "Output EXACTLY this format (no other text before or after):\n\n"
         "TASK_TITLE: <concise title>\n\n"
@@ -974,20 +1407,76 @@ def build_critique_prompt(
     instruction: str,
     diff_stat: str,
     diff_content: str,
+    changed_files: list[str] | None = None,
+    benchmark_before: dict | None = None,
+    benchmark_after: dict | None = None,
 ) -> str:
-    """Build critique prompt to evaluate the implementation diff."""
+    """Build critique prompt to evaluate the implementation diff.
+
+    Improvements over original:
+    - Shows up to 12000 chars of diff (was 4000) for better context
+    - Lists changed files so the critic can read them in full (agent mode)
+    - Includes efficiency/performance criteria in the rubric
+    - Includes before/after benchmark data when available
+    """
+    max_diff_chars = 12000
+    diff_display = diff_content[-max_diff_chars:] if len(diff_content) > max_diff_chars else diff_content
+    if len(diff_content) > max_diff_chars:
+        diff_note = f"(showing last {max_diff_chars} of {len(diff_content)} chars)"
+    else:
+        diff_note = "(complete diff)"
+
+    files_section = ""
+    if changed_files:
+        files_list = "\n".join(f"- `{f}`" for f in sorted(changed_files))
+        files_section = (
+            f"\n## Changed Files\n{files_list}\n"
+            "You can read these files to see the full context of the changes.\n"
+        )
+
+    bench_section = ""
+    if benchmark_before or benchmark_after:
+        bench_section = "\n## Benchmark Impact\n"
+        if benchmark_before:
+            bench_section += f"- Before: {benchmark_before.get('score', '?')}\n"
+        if benchmark_after:
+            bench_section += f"- After: {benchmark_after.get('score', '?')}\n"
+        if benchmark_before and benchmark_after:
+            before_p = benchmark_before.get("passed", 0)
+            after_p = benchmark_after.get("passed", 0)
+            if after_p > before_p:
+                bench_section += f"- Delta: +{after_p - before_p} benchmarks passing\n"
+            elif after_p < before_p:
+                bench_section += f"- Delta: -{before_p - after_p} REGRESSION\n"
+            else:
+                bench_section += "- Delta: no change\n"
+
     return (
-        "You are an expert evaluating a code change to an autonomous coding agent.\n\n"
+        "You are an expert code reviewer evaluating a change to an autonomous "
+        "coding agent. Your goal is to ensure only HIGH-QUALITY improvements "
+        "land. Be strict — mediocre changes degrade the codebase over time.\n\n"
         f"## Task\n"
         f"**Title**: {title}\n"
-        f"**Instruction**: {instruction[:800]}\n\n"
+        f"**Instruction**: {instruction[:1200]}\n"
+        f"{files_section}"
+        f"{bench_section}\n"
         f"## Changes Made\n```\n{diff_stat}\n```\n\n"
-        f"## Diff (last 4000 chars)\n```\n{diff_content[-4000:]}\n```\n\n"
-        "Evaluate:\n"
-        "1. **Correctness** — Does the change implement what was requested?\n"
-        "2. **Quality** — Is the code clean, safe, and well-integrated?\n"
-        "3. **Impact** — Will this meaningfully improve the agent?\n"
-        "4. **Risk** — Could this break existing functionality?\n\n"
+        f"## Diff {diff_note}\n```\n{diff_display}\n```\n\n"
+        "## Evaluation Criteria (score each 0-10, then give overall)\n\n"
+        "1. **Correctness** (weight: 3x) — Does the change implement what was "
+        "requested? Are there bugs, edge cases, or logical errors?\n"
+        "2. **Quality** (weight: 2x) — Is the code clean, safe, idiomatic, and "
+        "well-integrated with the existing codebase?\n"
+        "3. **Impact** (weight: 3x) — Will this measurably improve the agent? "
+        "Does it address a real bottleneck? Would it help pass more benchmarks, "
+        "reduce token usage, or complete tasks in fewer turns?\n"
+        "4. **Efficiency** (weight: 1x) — Does the change make the agent faster "
+        "or more token-efficient? Or does it add unnecessary overhead?\n"
+        "5. **Risk** (weight: 1x) — Could this break existing functionality? "
+        "How defensive is the implementation?\n\n"
+        "A score of 6/10 or higher means the change is GOOD ENOUGH to land.\n"
+        "A score below 6/10 means it should be REVERTED.\n"
+        "Be honest — a 5/10 change that barely works should not land.\n\n"
         "End your evaluation with exactly: **Score: N/10** (where N is 0-10)"
     )
 
@@ -1021,18 +1510,20 @@ def run_iteration(
     max_agent_iterations: int = 20,
     baseline_benchmark: dict | None = None,
     no_commit: bool = False,
+    agent_healthy: bool = True,
+    preflight_error: str = "",
 ) -> dict:
     """Run one full improvement iteration.
 
     Flow:
-        1. Select focus (adaptive) + build discovery prompt with memory context
+        1. Select focus (adaptive + curriculum tier) + build discovery prompt
         2. Discovery via Cursor CLI → TASK_TITLE + TASK_INSTRUCTION
         3. Implementation via Cursor CLI (agent mode)
-        4. Verification: syntax check + import/compile check
+        4. Verification: syntax check + import/compile check (with retries)
         5. Benchmark: run suite, compare to baseline (optional)
-        6. Critique: evaluate the diff, extract score
-        7. Decision: accept (commit) or revert based on quality gates
-        8. Update memory
+        6. Critique: evaluate the diff, extract score (agent mode, strict)
+        7. Decision: accept (commit) or revert based on quality gates (6/10)
+        8. Update memory + record benchmark trend
     """
     data: dict = {
         "iteration": iteration,
@@ -1044,8 +1535,12 @@ def run_iteration(
     if adaptive.get("increase_timeout"):
         agent_timeout = max(agent_timeout, 2400)
 
-    # ── Focus selection ───────────────────────────────────────────────────
-    focus = select_focus(memory)
+    # ── Focus selection (curriculum-aware) ─────────────────────────────────
+    focus = select_focus(
+        memory,
+        benchmark_scores=baseline_benchmark,
+        agent_healthy=agent_healthy,
+    )
     data["focus"] = focus
     banner(f"ITERATION {iteration} — FOCUS: {focus}")
     log(f"Adaptive params: {adaptive}")
@@ -1058,6 +1553,7 @@ def run_iteration(
         memory=memory,
         benchmark_scores=baseline_benchmark,
         adaptive=adaptive,
+        preflight_error=preflight_error,
     )
     discovery_result = cursor_cli(discovery_prompt, mode="ask", model=model)
     log(f"Discovery result:\n{discovery_result[:500]}")
@@ -1102,80 +1598,157 @@ def run_iteration(
     pre_patch = git_save_patch()
     pre_modified = git_diff_name_only()
 
+    # Snapshot file contents so we can detect changes to pre-dirty files
+    pre_contents: dict[str, str] = {}
+    for f in pre_modified:
+        full = REPO_ROOT / f
+        if full.exists() and full.is_file():
+            try:
+                pre_contents[f] = full.read_text(encoding="utf-8")
+            except Exception:
+                pass
+
     impl_prompt = build_impl_prompt(title, instruction, adaptive)
     impl_result = cursor_cli(impl_prompt, mode="agent", model=model)
 
     data["implementation"] = impl_result[:2000]
 
+    # ── Detect changes using content comparison (not just file names) ─────
     post_modified = git_diff_name_only()
-    impl_files = post_modified - pre_modified
-    # Also check files that were already modified but might have new changes
-    all_impl_files = impl_files  # For verification we check all modified agent files
 
-    diff_stat = git_diff_stat()
-    data["implementation_diff"] = diff_stat
+    # Truly new files (not in pre_modified at all)
+    new_files = post_modified - pre_modified
+
+    # Pre-dirty files whose content actually changed
+    changed_predirty: set[str] = set()
+    for f in pre_modified & post_modified:
+        full = REPO_ROOT / f
+        if full.exists() and full.is_file():
+            try:
+                current = full.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            if current != pre_contents.get(f, ""):
+                changed_predirty.add(f)
+
+    impl_files = new_files | changed_predirty
+
     data["files_changed"] = sorted(impl_files)
-
-    log(f"Implementation diff:\n{diff_stat}")
-    log(f"New files modified: {sorted(impl_files)}")
+    log(f"Files changed by agent: {sorted(impl_files)}")
+    if changed_predirty:
+        log(f"  (includes pre-dirty files with new edits: {sorted(changed_predirty)})")
 
     if not impl_files:
-        # Check if ANY file content changed (implementation may have modified
-        # an already-dirty file)
-        new_patch = git_save_patch()
-        if new_patch.strip() == pre_patch.strip():
-            log("Implementation produced no changes at all", "WARN")
-            data["outcome"] = "no_changes"
-            update_memory(
-                memory, iteration=iteration, focus=focus,
-                task_title=title, score=0, outcome="crash",
-                summary="Implementation produced no file changes",
-            )
-            return data
-        else:
-            log("Implementation modified pre-existing files (cannot commit separately)")
-            # Still proceed with verification — changes exist but in pre-modified files
-            all_impl_files = post_modified
+        log("Implementation produced no changes at all", "WARN")
+        data["outcome"] = "no_changes"
+        update_memory(
+            memory, iteration=iteration, focus=focus,
+            task_title=title, score=0, outcome="crash",
+            summary="Implementation produced no file changes",
+        )
+        return data
 
-    # ── Step 3: Verification ──────────────────────────────────────────────
+    # Compute agent-specific diff (only the agent's changes, not pre-existing)
+    agent_diff = _compute_agent_diff(pre_contents, impl_files)
+    agent_diff_stat = _summarize_diff(agent_diff, impl_files)
+
+    data["implementation_diff"] = agent_diff_stat
+    log(f"Agent diff stat:\n{agent_diff_stat}")
+
+    # ── Step 3: Verification (with retry loop) ──────────────────────────────
     banner(f"ITERATION {iteration} — STEP 3: Verification")
 
-    # Filter to only agent source files for verification
-    agent_files = {f for f in (impl_files | post_modified) if f.startswith("agent/")}
+    max_fix_attempts = 2
+    verification_passed = False
 
-    # 3a: Syntax check
-    syntax_ok, syntax_errors = verify_syntax(agent_files)
-    data["syntax_ok"] = syntax_ok
-    data["syntax_errors"] = syntax_errors
+    for fix_attempt in range(max_fix_attempts + 1):
+        # Filter to only agent source files for verification
+        agent_files = {f for f in impl_files if f.startswith("agent/")}
 
-    if not syntax_ok:
-        log(f"SYNTAX ERRORS — reverting:\n  " + "\n  ".join(syntax_errors), "WARN")
+        # 3a: Syntax check
+        syntax_ok, syntax_errors = verify_syntax(agent_files)
+        data["syntax_ok"] = syntax_ok
+        data["syntax_errors"] = syntax_errors
+
+        if not syntax_ok:
+            if fix_attempt < max_fix_attempts:
+                log(f"SYNTAX ERRORS (attempt {fix_attempt + 1}/{max_fix_attempts + 1}) "
+                    f"— asking implementer to fix:\n  " + "\n  ".join(syntax_errors), "WARN")
+                fix_prompt = (
+                    f"Your previous implementation has syntax errors. Fix them:\n\n"
+                    + "\n".join(f"- {e}" for e in syntax_errors) + "\n\n"
+                    "Fix ONLY the syntax errors. Do not make other changes."
+                )
+                cursor_cli(fix_prompt, mode="agent", model=model)
+                # Re-detect changed files after fix
+                post_modified_fix = git_diff_name_only()
+                impl_files = (post_modified_fix - pre_modified) | changed_predirty
+                continue
+            else:
+                log(f"SYNTAX ERRORS — exhausted {max_fix_attempts} fix attempts, "
+                    f"reverting:\n  " + "\n  ".join(syntax_errors), "WARN")
+                git_revert_to_patch(pre_patch)
+                data["outcome"] = "syntax_error"
+                update_memory(
+                    memory, iteration=iteration, focus=focus,
+                    task_title=title, score=0, outcome="syntax_error",
+                    files_changed=sorted(impl_files),
+                    summary=f"Syntax errors after {max_fix_attempts} fix attempts: "
+                            f"{'; '.join(syntax_errors[:3])}",
+                )
+                return data
+
+        # 3b: Import/compile check
+        import_ok, import_errors = verify_imports(agent_files)
+        data["import_ok"] = import_ok
+        data["import_errors"] = import_errors
+
+        if not import_ok:
+            if fix_attempt < max_fix_attempts:
+                log(f"IMPORT ERRORS (attempt {fix_attempt + 1}/{max_fix_attempts + 1}) "
+                    f"— asking implementer to fix:\n  " + "\n  ".join(import_errors), "WARN")
+                fix_prompt = (
+                    f"Your previous implementation has compile/import errors. Fix them:\n\n"
+                    + "\n".join(f"- {e}" for e in import_errors) + "\n\n"
+                    "Fix ONLY the import/compile errors. Do not make other changes."
+                )
+                cursor_cli(fix_prompt, mode="agent", model=model)
+                post_modified_fix = git_diff_name_only()
+                impl_files = (post_modified_fix - pre_modified) | changed_predirty
+                continue
+            else:
+                log(f"IMPORT ERRORS — exhausted {max_fix_attempts} fix attempts, "
+                    f"reverting:\n  " + "\n  ".join(import_errors), "WARN")
+                git_revert_to_patch(pre_patch)
+                data["outcome"] = "import_error"
+                update_memory(
+                    memory, iteration=iteration, focus=focus,
+                    task_title=title, score=0, outcome="import_error",
+                    files_changed=sorted(impl_files),
+                    summary=f"Import errors after {max_fix_attempts} fix attempts: "
+                            f"{'; '.join(import_errors[:3])}",
+                )
+                return data
+
+        # Both checks passed
+        verification_passed = True
+        break
+
+    if not verification_passed:
+        # Should not reach here, but defensive
         git_revert_to_patch(pre_patch)
-        data["outcome"] = "syntax_error"
+        data["outcome"] = "verification_failed"
         update_memory(
             memory, iteration=iteration, focus=focus,
-            task_title=title, score=0, outcome="syntax_error",
-            files_changed=sorted(impl_files),
-            summary=f"Syntax errors: {'; '.join(syntax_errors[:3])}",
+            task_title=title, score=0, outcome="crash",
+            summary="Verification loop exited without passing",
         )
         return data
 
-    # 3b: Import/compile check
-    import_ok, import_errors = verify_imports(agent_files)
-    data["import_ok"] = import_ok
-    data["import_errors"] = import_errors
-
-    if not import_ok:
-        log(f"IMPORT ERRORS — reverting:\n  " + "\n  ".join(import_errors), "WARN")
-        git_revert_to_patch(pre_patch)
-        data["outcome"] = "import_error"
-        update_memory(
-            memory, iteration=iteration, focus=focus,
-            task_title=title, score=0, outcome="import_error",
-            files_changed=sorted(impl_files),
-            summary=f"Import errors: {'; '.join(import_errors[:3])}",
-        )
-        return data
+    # Recompute diff after possible fix attempts
+    agent_diff = _compute_agent_diff(pre_contents, impl_files)
+    agent_diff_stat = _summarize_diff(agent_diff, impl_files)
+    data["implementation_diff"] = agent_diff_stat
 
     log("Verification PASSED (syntax + imports)")
 
@@ -1214,9 +1787,14 @@ def run_iteration(
 
     banner(f"ITERATION {iteration} — STEP 5: Critique")
 
-    diff_content = git_diff_content()
-    critique_prompt = build_critique_prompt(title, instruction, diff_stat, diff_content)
-    critique_result = cursor_cli(critique_prompt, mode="ask", model=model)
+    critique_prompt = build_critique_prompt(
+        title, instruction, agent_diff_stat, agent_diff,
+        changed_files=sorted(impl_files),
+        benchmark_before=baseline_benchmark,
+        benchmark_after=benchmark_result,
+    )
+    # Run critic in agent mode so it can read the changed files in full context
+    critique_result = cursor_cli(critique_prompt, mode="agent", model=model)
 
     data["critique"] = critique_result
     score = extract_score(critique_result)
@@ -1226,8 +1804,9 @@ def run_iteration(
     # ── Step 6: Decision ──────────────────────────────────────────────────
     banner(f"ITERATION {iteration} — STEP 6: Decision")
 
-    # Quality gate: require score >= 3 (or accept if score couldn't be parsed)
-    min_score = 3
+    # Quality gate: require score >= 6 (or accept if score couldn't be parsed)
+    # A 6/10 bar ensures only genuinely useful changes land.
+    min_score = 6
     if score is not None and score < min_score:
         log(f"Score {score}/10 below threshold {min_score} — reverting", "WARN")
         git_revert_to_patch(pre_patch)
@@ -1330,6 +1909,22 @@ def main():
         attempts = stats.get("attempts", 0)
         log(f"  {area}: {landed} landed / {attempts} attempts (avg score: {avg:.1f})")
 
+    # ── Pre-flight health check ───────────────────────────────────────────
+    banner("PRE-FLIGHT HEALTH CHECK")
+    agent_healthy, preflight_error = preflight_check()
+    if agent_healthy:
+        log("Agent health check: PASSED")
+    else:
+        log(f"Agent health check: FAILED — {preflight_error}", "WARN")
+        log("The agent cannot start. Self-improvement will focus on fixing this.")
+
+    # ── Benchmark trend check ─────────────────────────────────────────────
+    trend_desc, trend_declining = check_benchmark_trend(memory)
+    log(f"Benchmark trend: {trend_desc}")
+    if trend_declining:
+        log("WARNING: Benchmark performance is declining. "
+            "Will continue but watch closely.", "WARN")
+
     # ── Baseline benchmarks ───────────────────────────────────────────────
     baseline_benchmark = None
     if not args.skip_benchmarks and not args.skip_impl:
@@ -1338,7 +1933,19 @@ def main():
         if baseline_benchmark:
             log(f"Baseline score: {baseline_benchmark['score']}")
             memory["last_benchmark"] = baseline_benchmark
+            # Record in trend
+            record_benchmark_trend(
+                memory,
+                iteration=memory.get("iterations_total", 0),
+                benchmark=baseline_benchmark,
+            )
             save_memory(memory)
+
+            # Log curriculum tier
+            tier = get_curriculum_tier(baseline_benchmark, agent_healthy)
+            tier_info = CURRICULUM_TIERS.get(tier, CURRICULUM_TIERS[1])
+            log(f"Curriculum tier: {tier} ({tier_info['name']}) — "
+                f"{tier_info['description']}")
         else:
             log("Baseline benchmark failed or unavailable — continuing without", "WARN")
 
@@ -1364,6 +1971,8 @@ def main():
                 max_agent_iterations=args.max_agent_iterations,
                 baseline_benchmark=baseline_benchmark,
                 no_commit=args.no_commit,
+                agent_healthy=agent_healthy,
+                preflight_error=preflight_error,
             )
             results.append(result)
             save_iteration_log(iteration, result)
@@ -1371,7 +1980,21 @@ def main():
             # Update baseline if improvement landed and we have new benchmark data
             if result.get("outcome") == "landed" and result.get("benchmark"):
                 baseline_benchmark = result["benchmark"]
+                record_benchmark_trend(memory, iteration, baseline_benchmark)
                 log("Updated baseline benchmark after successful improvement")
+
+                # Re-check agent health after a landed improvement
+                agent_healthy, preflight_error = preflight_check()
+                if agent_healthy:
+                    log("Agent health: PASSED (post-improvement)")
+
+            # Check benchmark trend periodically
+            if i % 3 == 0:
+                trend_desc, trend_declining = check_benchmark_trend(memory)
+                log(f"Trend check: {trend_desc}")
+                if trend_declining:
+                    log("ALERT: Benchmark trend is declining. "
+                        "Consider reviewing recent commits.", "WARN")
 
             if args.iterations > 0 and i >= args.iterations:
                 break
