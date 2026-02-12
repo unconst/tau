@@ -112,6 +112,8 @@ class TurnRuntimeResult:
     guard_escalations_delta: int = 0
     subagent_failures_delta: int = 0
     subagent_rate_limit_failures_delta: int = 0
+    tool_successes_delta: int = 0
+    tool_failures_delta: int = 0
 
 
 class TurnRuntime:
@@ -160,6 +162,11 @@ class TurnRuntime:
         skip_verification: bool,
         verification_prompt: str,
     ) -> TurnRuntimeResult:
+        # Defensive None normalization — some models return null fields
+        if response.text is None:
+            response.text = ""
+        if response.function_calls is None:
+            response.function_calls = []
         response_text = response.text or ""
         last_agent_message = response_text
 
@@ -281,6 +288,8 @@ class TurnRuntime:
         guard_escalations = 0
         subagent_failures = 0
         subagent_rate_limit_failures = 0
+        tool_successes = 0
+        tool_failures = 0
         for kind, call, decision_or_result in precomputed:
             item_id = next_item_id()
             emit(
@@ -390,6 +399,10 @@ class TurnRuntime:
                     )
                 )
             )
+            if result.success:
+                tool_successes += 1
+            else:
+                tool_failures += 1
             emit_raw(
                 self._with_runtime_meta(
                     {
@@ -460,6 +473,8 @@ class TurnRuntime:
                     guard_escalations_delta=guard_escalations,
                     subagent_failures_delta=subagent_failures,
                     subagent_rate_limit_failures_delta=subagent_rate_limit_failures,
+                    tool_successes_delta=tool_successes,
+                    tool_failures_delta=tool_failures,
                 )
 
         return TurnRuntimeResult(
@@ -474,6 +489,8 @@ class TurnRuntime:
             guard_escalations_delta=guard_escalations,
             subagent_failures_delta=subagent_failures,
             subagent_rate_limit_failures_delta=subagent_rate_limit_failures,
+            tool_successes_delta=tool_successes,
+            tool_failures_delta=tool_failures,
         )
 
     @staticmethod

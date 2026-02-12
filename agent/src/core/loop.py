@@ -176,6 +176,7 @@ def _is_retryable_llm_error(code: str, message: str) -> bool:
         "server_error",
         "connection_error",
         "api_error",
+        "empty_response",
     }
     if code in retryable_codes:
         return True
@@ -196,6 +197,35 @@ def _is_retryable_llm_error(code: str, message: str) -> bool:
             "empty response",
         )
     )
+
+
+def _is_resource_exhausted_error(e: "LLMError") -> bool:
+    """Return True if the error indicates the model's resources are exhausted.
+
+    These errors warrant falling back to a different model rather than
+    retrying the same one endlessly:
+    - 429 rate-limit errors
+    - Quota / capacity / resource exhaustion messages
+    - Stream exhaustion after all stream-level retries
+    """
+    code = getattr(e, "code", "")
+    msg = (getattr(e, "message", "") or str(e)).lower()
+
+    if code in ("rate_limit", "stream_exhausted"):
+        return True
+
+    resource_keywords = (
+        "rate limit",
+        "rate_limit",
+        "quota exceeded",
+        "resource exhausted",
+        "capacity",
+        "too many requests",
+        "throttled",
+        "exhausted",
+        "429",
+    )
+    return any(kw in msg for kw in resource_keywords)
 
 
 def _compute_retry_delay(attempt: int, base_delay: float = 1.5, max_delay: float = 20.0) -> float:
@@ -463,8 +493,11 @@ Do NOT ask questions — make reasonable decisions and proceed.
     iteration = int(restored.get("iteration", 0) or 0) if restored else 0
     checkpoint_every = max(1, int(config.get("checkpoint_every", 1) or 1))
     consecutive_failures = 0
+    consecutive_tool_failure_turns = 0  # Turns where ALL tool calls failed
     _last_plan_hash = ""  # Cache plan context to avoid re-injecting unchanged plans
     _recovery_msg_count = 0  # Track error recovery messages to cap accumulation
+    _tool_nudge_count = 0  # Track tool-failure nudge messages to cap accumulation
+    _plan_staleness_nudge_count = 0  # Track plan-staleness nudge messages
     llm_retry_count = 0
     compaction_count = 0
     parallel_batch_count = 0
@@ -506,12 +539,15 @@ Do NOT ask questions — make reasonable decisions and proceed.
                     _plan_hash = _hl.md5(plan_context.encode()).hexdigest()
                     if _plan_hash != _last_plan_hash:
                         _last_plan_hash = _plan_hash
-                        request_messages.append(
-                            {
-                                "role": "system",
-                                "content": plan_context,
-                            }
-                        )
+                        _log(f"Plan context updated ({len(plan_context)} chars)")
+                    # Always inject plan — request_messages is rebuilt each
+                    # iteration so the plan would vanish if we skip this.
+                    request_messages.append(
+                        {
+                            "role": "system",
+                            "content": plan_context,
+                        }
+                    )
 
             # If compaction happened, update our messages reference
             if len(context_messages) < len(messages):
@@ -528,7 +564,7 @@ Do NOT ask questions — make reasonable decisions and proceed.
             tool_specs = tools.get_tools_for_llm()
 
             # ================================================================
-            # Call LLM with retry logic + model routing
+            # Call LLM with retry logic + model routing + fallback models
             # ================================================================
             max_retries = 5
             response = None
@@ -537,150 +573,218 @@ Do NOT ask questions — make reasonable decisions and proceed.
             # Reuse tier from context management (avoid double selection)
             tier = _tier
 
-            for attempt in range(1, max_retries + 1):
-                try:
-                    call_kwargs = dict(
-                        messages=cached_messages,
-                        tools=tool_specs,
-                        max_tokens=config.get("max_tokens", tier.max_tokens),
-                        model=tier.model,
-                    )
+            # Build the ordered list of models to try: primary + fallbacks.
+            # Exclude the primary model from fallbacks to avoid duplicates.
+            _fallbacks = [m for m in (tier.fallback_models or []) if m != tier.model]
+            models_to_try = [tier.model] + _fallbacks
 
-                    # Only send reasoning effort when the model supports it
-                    reasoning_effort = config.get("reasoning_effort", tier.reasoning_effort)
-                    if reasoning_effort and reasoning_effort != "none" and getattr(tier, "supports_reasoning", False):
-                        call_kwargs["extra_body"] = {
-                            "reasoning": {"effort": reasoning_effort},
-                        }
+            model_succeeded = False
+            for _model_idx, _current_model in enumerate(models_to_try):
+                if model_succeeded:
+                    break
 
-                    # Use streaming if available and enabled
-                    if use_streaming and hasattr(llm, "chat_stream"):
-                        def _on_stream_text(delta: str) -> None:
-                            emit_raw({"type": "stream.text.delta", "delta": delta})
+                model_exhausted = False  # set True when resource-exhausted → try next
 
-                        response = llm.chat_stream(**call_kwargs, on_text=_on_stream_text)
-                    else:
-                        response = llm.chat(**call_kwargs)
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        call_kwargs = dict(
+                            messages=cached_messages,
+                            tools=tool_specs,
+                            max_tokens=config.get("max_tokens", tier.max_tokens),
+                            model=_current_model,
+                        )
 
-                    # Track token usage from response
-                    if hasattr(response, "tokens") and response.tokens:
-                        tokens = response.tokens
-                        if isinstance(tokens, dict):
-                            total_input_tokens += tokens.get("input", 0)
-                            total_output_tokens += tokens.get("output", 0)
-                            total_cached_tokens += tokens.get("cached", 0)
+                        # Only send reasoning effort when the model supports it
+                        reasoning_effort = config.get("reasoning_effort", tier.reasoning_effort)
+                        if reasoning_effort and reasoning_effort != "none" and getattr(tier, "supports_reasoning", False):
+                            call_kwargs["extra_body"] = {
+                                "reasoning": {"effort": reasoning_effort},
+                            }
 
-                    # Emit live usage so the Telegram UI can show context size
-                    emit_raw({
-                        "type": "stream.usage",
-                        "input_tokens": total_input_tokens,
-                        "output_tokens": total_output_tokens,
-                        "cached_tokens": total_cached_tokens,
-                    })
+                        # Use streaming if available and enabled
+                        if use_streaming and hasattr(llm, "chat_stream"):
+                            def _on_stream_text(delta: str) -> None:
+                                emit_raw({"type": "stream.text.delta", "delta": delta})
 
-                    consecutive_failures = 0
-                    break  # Success, exit retry loop
+                            response = llm.chat_stream(**call_kwargs, on_text=_on_stream_text)
+                        else:
+                            response = llm.chat(**call_kwargs)
 
-                except CostLimitExceeded:
-                    raise  # Don't retry cost limit errors
+                        # Track token usage from response
+                        if hasattr(response, "tokens") and response.tokens:
+                            tokens = response.tokens
+                            if isinstance(tokens, dict):
+                                total_input_tokens += tokens.get("input", 0)
+                                total_output_tokens += tokens.get("output", 0)
+                                total_cached_tokens += tokens.get("cached", 0)
 
-                except ContextWindowExceeded as e:
-                    # Auto-recovery: shrink context and retry instead of
-                    # wasting a generic retry attempt.
-                    _log(f"Context window exceeded — shrinking history and retrying (attempt {attempt})")
-                    emit_raw({
-                        "type": "stream.context_recovery",
-                        "attempt": attempt,
-                        "message_count": len(messages),
-                    })
+                        # Emit live usage so the Telegram UI can show context size
+                        emit_raw({
+                            "type": "stream.usage",
+                            "input_tokens": total_input_tokens,
+                            "output_tokens": total_output_tokens,
+                            "cached_tokens": total_cached_tokens,
+                        })
 
-                    # Force compaction and rebuild cached_messages
-                    from src.core.compaction import manage_context as _manage_ctx
-                    messages = _manage_ctx(
-                        messages=messages,
-                        system_prompt=system_prompt,
-                        llm=llm,
-                        force_compaction=True,
-                        _token_budget=token_budget,
-                        context_window=tier.context_window,
-                        output_reserve=tier.output_reserve,
-                        auto_compact_threshold=tier.auto_compact_threshold,
-                    )
-                    compaction_count += 1
-                    # Rebuild request messages with new compacted history
-                    request_messages = list(messages)
-                    if hasattr(tools, "format_plan_for_context"):
-                        plan_context = tools.format_plan_for_context()
-                        if plan_context:
-                            request_messages.append({"role": "system", "content": plan_context})
-                    cached_messages = _apply_caching(request_messages, enabled=cache_enabled)
-                    # Update call_kwargs for next attempt
-                    if attempt < max_retries:
-                        llm_retry_count += 1
-                        continue
-                    else:
-                        raise  # Exhausted retries
+                        consecutive_failures = 0
+                        model_succeeded = True
+                        break  # Success, exit retry loop
 
-                except LLMError as e:
-                    last_error = e
-                    error_msg = str(e.message) if hasattr(e, "message") else str(e)
-                    _log(f"LLM error (attempt {attempt}/{max_retries}): {e.code} - {error_msg}")
+                    except CostLimitExceeded:
+                        raise  # Don't retry cost limit errors
 
-                    # Don't retry authentication errors
-                    if e.code in ("authentication_error", "invalid_api_key"):
-                        raise
+                    except ContextWindowExceeded as e:
+                        # Auto-recovery: shrink context and retry instead of
+                        # wasting a generic retry attempt.
+                        _log(f"Context window exceeded — shrinking history and retrying (attempt {attempt})")
+                        emit_raw({
+                            "type": "stream.context_recovery",
+                            "attempt": attempt,
+                            "message_count": len(messages),
+                        })
 
-                    # Check if it's a retryable error
-                    is_retryable = _is_retryable_llm_error(e.code, error_msg)
+                        # Force compaction and rebuild cached_messages
+                        from src.core.compaction import manage_context as _manage_ctx
+                        messages = _manage_ctx(
+                            messages=messages,
+                            system_prompt=system_prompt,
+                            llm=llm,
+                            force_compaction=True,
+                            _token_budget=token_budget,
+                            context_window=tier.context_window,
+                            output_reserve=tier.output_reserve,
+                            auto_compact_threshold=tier.auto_compact_threshold,
+                        )
+                        compaction_count += 1
+                        # Rebuild request messages with new compacted history
+                        request_messages = list(messages)
+                        if hasattr(tools, "format_plan_for_context"):
+                            plan_context = tools.format_plan_for_context()
+                            if plan_context:
+                                request_messages.append({"role": "system", "content": plan_context})
+                        cached_messages = _apply_caching(request_messages, enabled=cache_enabled)
+                        # Update call_kwargs for next attempt
+                        if attempt < max_retries:
+                            llm_retry_count += 1
+                            continue
+                        else:
+                            raise  # Exhausted retries
 
-                    if attempt < max_retries and is_retryable:
-                        # Use rate-limit header info for smarter backoff
-                        wait_time = _compute_retry_delay(attempt)
-                        if e.rate_limit_info and e.code == "rate_limit":
-                            header_wait = e.rate_limit_info.seconds_until_reset()
-                            if header_wait is not None and header_wait > 0:
-                                wait_time = min(header_wait + 0.5, 60.0)  # cap at 60s
-                                _log(f"Rate-limit header suggests reset in {header_wait:.1f}s")
-                        _log(f"Retrying in {wait_time:.1f} seconds...")
-                        emit_raw(
-                            {
-                                "type": "stream.retry",
-                                "attempt": attempt,
-                                "max_attempts": max_retries,
-                                "wait_seconds": round(wait_time, 2),
+                    except LLMError as e:
+                        last_error = e
+                        error_msg = str(e.message) if hasattr(e, "message") else str(e)
+                        _log(f"LLM error (attempt {attempt}/{max_retries}, model={_current_model}): {e.code} - {error_msg}")
+
+                        # Don't retry authentication errors
+                        if e.code in ("authentication_error", "invalid_api_key"):
+                            raise
+
+                        # Check if this is a resource-exhaustion error and we have
+                        # more fallback models available.
+                        if _is_resource_exhausted_error(e) and _model_idx + 1 < len(models_to_try):
+                            next_model = models_to_try[_model_idx + 1]
+                            _log(
+                                f"Model '{_current_model}' resource-exhausted, "
+                                f"falling back to '{next_model}' "
+                                f"(fallback {_model_idx + 1}/{len(models_to_try) - 1})"
+                            )
+                            emit_raw({
+                                "type": "stream.model_fallback",
+                                "exhausted_model": _current_model,
+                                "fallback_model": next_model,
+                                "fallback_index": _model_idx + 1,
+                                "total_fallbacks": len(models_to_try) - 1,
                                 "error_code": e.code,
-                            }
+                                "error_message": error_msg[:200],
+                            })
+                            model_exhausted = True
+                            break  # Break retry loop → try next model
+
+                        # Check if it's a retryable error
+                        is_retryable = _is_retryable_llm_error(e.code, error_msg)
+
+                        if attempt < max_retries and is_retryable:
+                            # Use rate-limit header info for smarter backoff
+                            wait_time = _compute_retry_delay(attempt)
+                            if e.rate_limit_info and e.code == "rate_limit":
+                                header_wait = e.rate_limit_info.seconds_until_reset()
+                                if header_wait is not None and header_wait > 0:
+                                    wait_time = min(header_wait + 0.5, 60.0)  # cap at 60s
+                                    _log(f"Rate-limit header suggests reset in {header_wait:.1f}s")
+                            _log(f"Retrying in {wait_time:.1f} seconds...")
+                            emit_raw(
+                                {
+                                    "type": "stream.retry",
+                                    "attempt": attempt,
+                                    "max_attempts": max_retries,
+                                    "wait_seconds": round(wait_time, 2),
+                                    "error_code": e.code,
+                                    "model": _current_model,
+                                }
+                            )
+                            llm_retry_count += 1
+                            time.sleep(wait_time)
+                        else:
+                            # Last model and retries exhausted — raise
+                            if _model_idx + 1 < len(models_to_try):
+                                # Still have fallbacks — try next model
+                                next_model = models_to_try[_model_idx + 1]
+                                _log(
+                                    f"Model '{_current_model}' failed after {max_retries} retries, "
+                                    f"falling back to '{next_model}'"
+                                )
+                                emit_raw({
+                                    "type": "stream.model_fallback",
+                                    "exhausted_model": _current_model,
+                                    "fallback_model": next_model,
+                                    "fallback_index": _model_idx + 1,
+                                    "total_fallbacks": len(models_to_try) - 1,
+                                    "error_code": e.code,
+                                    "error_message": error_msg[:200],
+                                })
+                                model_exhausted = True
+                                break
+                            raise
+
+                    except Exception as e:
+                        last_error = e
+                        error_msg = str(e)
+                        _log(
+                            f"Unexpected error (attempt {attempt}/{max_retries}, model={_current_model}): "
+                            f"{type(e).__name__}: {error_msg}"
                         )
-                        llm_retry_count += 1
-                        time.sleep(wait_time)
-                    else:
-                        raise
 
-                except Exception as e:
-                    last_error = e
-                    error_msg = str(e)
-                    _log(
-                        f"Unexpected error (attempt {attempt}/{max_retries}): {type(e).__name__}: {error_msg}"
-                    )
+                        is_retryable = _is_retryable_llm_error("unexpected", error_msg)
 
-                    is_retryable = _is_retryable_llm_error("unexpected", error_msg)
+                        if attempt < max_retries and is_retryable:
+                            wait_time = _compute_retry_delay(attempt)
+                            _log(f"Retrying in {wait_time:.1f} seconds...")
+                            emit_raw(
+                                {
+                                    "type": "stream.retry",
+                                    "attempt": attempt,
+                                    "max_attempts": max_retries,
+                                    "wait_seconds": round(wait_time, 2),
+                                    "error_code": "unexpected",
+                                    "model": _current_model,
+                                }
+                            )
+                            llm_retry_count += 1
+                            time.sleep(wait_time)
+                        else:
+                            raise
 
-                    if attempt < max_retries and is_retryable:
-                        wait_time = _compute_retry_delay(attempt)
-                        _log(f"Retrying in {wait_time:.1f} seconds...")
-                        emit_raw(
-                            {
-                                "type": "stream.retry",
-                                "attempt": attempt,
-                                "max_attempts": max_retries,
-                                "wait_seconds": round(wait_time, 2),
-                                "error_code": "unexpected",
-                            }
-                        )
-                        llm_retry_count += 1
-                        time.sleep(wait_time)
-                    else:
-                        raise
+                # If the model was resource-exhausted, continue to the next model
+                if model_exhausted:
+                    continue
+
+            # All models tried without success and without raising — response
+            # is still None (e.g. every model was resource-exhausted).
+            if not model_succeeded or response is None:
+                raise LLMError(
+                    "All models exhausted without producing a response",
+                    code="all_models_exhausted",
+                )
 
         except CostLimitExceeded as e:
             _log(f"Cost limit exceeded: {e}")
@@ -886,6 +990,142 @@ Do NOT ask questions — make reasonable decisions and proceed.
         guard_escalations += runtime_result.guard_escalations_delta
         subagent_failures += runtime_result.subagent_failures_delta
         subagent_rate_limit_failures += runtime_result.subagent_rate_limit_failures_delta
+
+        # ================================================================
+        # Plan iteration stamping & staleness nudging
+        # ================================================================
+        if hasattr(tools, "stamp_plan_iteration"):
+            tools.stamp_plan_iteration(iteration)
+
+        _plan_stale_threshold = int(config.get("plan_stale_threshold", 10) or 10)
+        if (
+            hasattr(tools, "plan_last_updated_iteration")
+            and hasattr(tools, "format_plan_for_context")
+            and tools.format_plan_for_context()  # plan exists
+            and tools.plan_last_updated_iteration > 0  # was set at least once
+            and (iteration - tools.plan_last_updated_iteration) >= _plan_stale_threshold
+            and (iteration - tools.plan_last_updated_iteration) % _plan_stale_threshold == 0
+        ):
+            _log(
+                f"Plan stale for {iteration - tools.plan_last_updated_iteration} iterations "
+                f"(last updated at iteration {tools.plan_last_updated_iteration})"
+            )
+            emit_raw({
+                "type": "stream.plan_stale",
+                "iterations_since_update": iteration - tools.plan_last_updated_iteration,
+                "last_updated_iteration": tools.plan_last_updated_iteration,
+            })
+            # Cap nudge messages to prevent context bloat (max 1 active)
+            if _plan_staleness_nudge_count >= 1:
+                for ri, rm in enumerate(messages):
+                    if rm.get("role") == "user" and "plan has not been updated" in rm.get("content", ""):
+                        messages.pop(ri)
+                        _plan_staleness_nudge_count -= 1
+                        break
+            stale_nudge = (
+                "<system-reminder>\n"
+                f"Your execution plan has not been updated for {iteration - tools.plan_last_updated_iteration} iterations. "
+                "Please review your plan against the original task:\n"
+                "1. Are the remaining steps still correct?\n"
+                "2. Should any steps be marked completed, modified, or added?\n"
+                "3. Are you still making progress toward the goal?\n"
+                "Use `update_plan` to refresh your plan, even if just to confirm it's still accurate.\n"
+                "</system-reminder>"
+            )
+            messages.append({"role": "user", "content": stale_nudge})
+            _plan_staleness_nudge_count += 1
+
+        # ================================================================
+        # Consecutive tool failure loop detection
+        # ================================================================
+        # If the turn had tool calls and ALL of them failed, count it as a
+        # tool-failure turn.  Any success resets the counter.
+        _turn_tool_total = runtime_result.tool_successes_delta + runtime_result.tool_failures_delta
+        if _turn_tool_total > 0:
+            if runtime_result.tool_successes_delta == 0:
+                consecutive_tool_failure_turns += 1
+                _log(
+                    f"All {runtime_result.tool_failures_delta} tool call(s) failed this turn "
+                    f"(consecutive tool-failure turns: {consecutive_tool_failure_turns})"
+                )
+            else:
+                consecutive_tool_failure_turns = 0
+
+        # Hard abort: too many consecutive tool-failure turns
+        _max_tool_failure_turns = int(config.get("max_consecutive_tool_failure_turns", 8) or 8)
+        if consecutive_tool_failure_turns >= _max_tool_failure_turns:
+            _log(f"Tool failure loop detected: {consecutive_tool_failure_turns} consecutive turns with all tools failing — aborting")
+            emit_raw({
+                "type": "stream.tool_failure_loop",
+                "consecutive_tool_failure_turns": consecutive_tool_failure_turns,
+                "action": "abort",
+            })
+            emit(
+                TurnFailedEvent(
+                    error={
+                        "message": (
+                            f"Tool failure loop: {consecutive_tool_failure_turns} consecutive turns "
+                            "where every tool call failed. Aborting to prevent wasted iterations."
+                        )
+                    },
+                    trace_id=trace_id,
+                    parent_trace_id=parent_trace_id,
+                    subagent_id=subagent_id,
+                    depth=depth,
+                )
+            )
+            completion_reason = "tool_failure_loop"
+            session.save_rollout(
+                messages=messages,
+                iteration=iteration,
+                pending_completion=pending_completion,
+                tool_call_count=tool_call_count,
+                usage={
+                    "input_tokens": total_input_tokens,
+                    "cached_input_tokens": total_cached_tokens,
+                    "output_tokens": total_output_tokens,
+                },
+            )
+            ctx.done()
+            return
+
+        # Soft nudge: inject a recovery message to redirect the model
+        _tool_nudge_threshold = int(config.get("tool_failure_nudge_threshold", 3) or 3)
+        if (
+            consecutive_tool_failure_turns > 0
+            and consecutive_tool_failure_turns % _tool_nudge_threshold == 0
+            and consecutive_tool_failure_turns < _max_tool_failure_turns
+        ):
+            _log(f"Injecting tool-failure recovery nudge (consecutive={consecutive_tool_failure_turns})")
+            emit_raw({
+                "type": "stream.tool_failure_loop",
+                "consecutive_tool_failure_turns": consecutive_tool_failure_turns,
+                "action": "nudge",
+            })
+            # Cap nudge messages to prevent context bloat (max 2)
+            if _tool_nudge_count >= 2:
+                for ri, rm in enumerate(messages):
+                    if rm.get("role") == "user" and "tool calls have failed" in rm.get("content", ""):
+                        messages.pop(ri)
+                        _tool_nudge_count -= 1
+                        break
+            nudge = (
+                "<system-reminder>\n"
+                f"WARNING: Your last {consecutive_tool_failure_turns} turns of tool calls ALL failed. "
+                "You appear to be stuck in a failure loop. STOP and reassess.\n\n"
+                "1. Re-read the original task (first user message)\n"
+                "2. Review the recent errors — what pattern do you see?\n"
+                "3. Try a DIFFERENT approach:\n"
+                "   - If file paths are wrong, use list_dir to discover the correct structure\n"
+                "   - If commands fail, use a simpler alternative\n"
+                "   - If edits fail, re-read the file first to get current contents\n"
+                "   - If you're stuck, break the problem into a smaller first step\n"
+                "4. Do NOT retry the same failing operation\n"
+                "</system-reminder>"
+            )
+            messages.append({"role": "user", "content": nudge})
+            _tool_nudge_count += 1
+
         # Circuit breaker for repeated subagent instability.
         max_subagent_failures = int(config.get("max_subagent_failures", 3) or 3)
         max_subagent_rate_limits = int(config.get("max_subagent_rate_limits", 2) or 2)
@@ -991,6 +1231,7 @@ Do NOT ask questions — make reasonable decisions and proceed.
             "guard_escalations": guard_escalations,
             "subagent_failures": subagent_failures,
             "subagent_rate_limit_failures": subagent_rate_limit_failures,
+            "consecutive_tool_failure_turns": consecutive_tool_failure_turns,
             "completion_reason": completion_reason,
             "budget": {
                 "max_cost": budget.snapshot().max_cost,

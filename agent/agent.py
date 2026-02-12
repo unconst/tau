@@ -22,29 +22,97 @@ import sys
 import time
 from pathlib import Path
 
+# ---------------------------------------------------------------------------
+# Venv bootstrap: re-exec inside .venv if we're running with system Python.
+# This avoids PEP 668 "externally-managed-environment" failures and ensures
+# all project dependencies are importable.
+# ---------------------------------------------------------------------------
+def _reexec_in_venv() -> None:
+    """If running outside the project venv, re-exec with .venv/bin/python."""
+    if sys.prefix != sys.base_prefix:
+        return  # already in a venv
+
+    agent_dir = Path(__file__).resolve().parent
+    # Walk up to find project root (where .venv lives)
+    for candidate in (agent_dir.parent, agent_dir):
+        venv_python = candidate / ".venv" / "bin" / "python"
+        if venv_python.is_file():
+            print(
+                f"[setup] Re-launching with venv Python: {venv_python}",
+                file=sys.stderr,
+                flush=True,
+            )
+            os.execv(str(venv_python), [str(venv_python)] + sys.argv)
+            # execv replaces the process — this line is never reached
+
+
+_reexec_in_venv()
+
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
 
 # Auto-install dependencies if missing
 def ensure_dependencies():
-    """Install dependencies if not present."""
+    """Install dependencies if not present.
+
+    Tries multiple installation strategies so the agent can bootstrap in any
+    Python environment (uv-managed venvs, plain pip, system Python, etc.).
+    Never raises on failure — if all installers fail we still attempt to
+    proceed since the deps may already be importable via other means.
+    """
     try:
-        import httpx
-        import pydantic
+        import httpx  # noqa: F401
+        import pydantic  # noqa: F401
+        return  # Already available, nothing to do
     except ImportError:
-        print("[setup] Installing dependencies...", file=sys.stderr)
-        agent_dir = Path(__file__).parent
-        req_file = agent_dir / "requirements.txt"
-        if req_file.exists():
-            subprocess.run(
-                [sys.executable, "-m", "pip", "install", "-r", str(req_file), "-q"], check=True
+        pass
+
+    agent_dir = Path(__file__).parent
+    req_file = agent_dir / "requirements.txt"
+    target = ["-r", str(req_file)] if req_file.exists() else [str(agent_dir)]
+
+    # Ordered list of installation strategies to try
+    strategies = [
+        # 1. uv pip install (works in uv-managed environments / .venv)
+        (["uv", "pip", "install"] + target + ["-q"], "uv pip"),
+        # 2. Current interpreter's pip module (traditional venvs / system Python)
+        ([sys.executable, "-m", "pip", "install"] + target + ["-q"], "pip"),
+    ]
+
+    for cmd, label in strategies:
+        try:
+            print(f"[setup] Trying {label} install...", file=sys.stderr)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,
             )
-        else:
-            subprocess.run(
-                [sys.executable, "-m", "pip", "install", str(agent_dir), "-q"], check=True
+            if result.returncode == 0:
+                print(f"[setup] Dependencies installed via {label}", file=sys.stderr)
+                return
+            # Non-zero exit — log and try next strategy
+            stderr_snippet = (result.stderr or "").strip()[:200]
+            print(
+                f"[setup] {label} failed (exit {result.returncode}): {stderr_snippet}",
+                file=sys.stderr,
             )
-        print("[setup] Dependencies installed", file=sys.stderr)
+        except FileNotFoundError:
+            # Installer binary not found (e.g. uv not installed) — skip
+            print(f"[setup] {label} not available, skipping", file=sys.stderr)
+        except subprocess.TimeoutExpired:
+            print(f"[setup] {label} timed out, skipping", file=sys.stderr)
+        except Exception as e:
+            print(f"[setup] {label} error: {e}", file=sys.stderr)
+
+    # All strategies exhausted — warn but don't crash.  The subsequent
+    # imports will raise a clear ImportError if deps are truly missing.
+    print(
+        "[setup] WARNING: Could not install dependencies via any method. "
+        "Proceeding anyway — imports may fail.",
+        file=sys.stderr,
+    )
 
 
 ensure_dependencies()
@@ -141,6 +209,12 @@ def main():
         action="store_true",
         help="Resume from the latest saved session",
     )
+    parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=0,
+        help="Maximum agent loop iterations (0 = use config default)",
+    )
     args = parser.parse_args()
 
     _log("=" * 60)
@@ -165,16 +239,21 @@ def main():
 
     _log("Components initialized")
 
+    # Build config, allowing CLI overrides
+    run_config = {
+        **CONFIG,
+        "resume_session_id": args.resume,
+        "resume_latest": args.resume_latest,
+    }
+    if args.max_iterations > 0:
+        run_config["max_iterations"] = args.max_iterations
+
     try:
         run_agent_loop(
             llm=llm,
             tools=tools,
             ctx=ctx,
-            config={
-                **CONFIG,
-                "resume_session_id": args.resume,
-                "resume_latest": args.resume_latest,
-            },
+            config=run_config,
         )
     except CostLimitExceeded as e:
         _log(f"Cost limit exceeded: {e}")

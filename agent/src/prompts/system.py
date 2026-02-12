@@ -552,18 +552,22 @@ For non-trivial tasks, use `update_plan` and keep it current.
 - Mark all steps `completed` (or defer) before finishing
 
 ## Coding guidelines
-- Use `apply_patch` to edit files (NEVER `applypatch` or `apply-patch`)
+- `read_file` and `grep_files` return lines tagged as `line_number:hash|content`
+- Prefer `hashline_edit` for surgical edits — reference the `line:hash` tags directly
+  - Example: `{"op": "replace", "start": "5:a3", "end": "7:0e", "content": "new code"}`
+  - If hashes don't match (file changed), re-read the file and retry
+- Fall back to `str_replace` or `apply_patch` when hashline_edit is not a good fit
 - Fix root causes, not symptoms; avoid unneeded complexity
 - Keep changes minimal, consistent with existing codebase style
 - Do not fix unrelated bugs or broken tests
-- Do not re-read files after `apply_patch` — the call fails if it didn't work
+- Do not re-read files after a successful edit — the call fails if it didn't work
 - Do not `git commit` unless explicitly requested
 - Use `rg` (ripgrep) for searching — much faster than `grep`
 - NEVER use destructive git commands (`reset --hard`, `checkout --`) unless requested
 - Never revert changes you didn't make
 
 ## Editing constraints
-- Default to ASCII; use `apply_patch` for single-file edits
+- Default to ASCII; prefer `hashline_edit` for targeted edits, `apply_patch` for multi-file patches
 - Dirty worktree: ignore unrelated changes, don't revert them
 
 ## Validation

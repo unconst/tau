@@ -41,8 +41,9 @@ Use `rg` (ripgrep) for searching text or files as it's much faster than grep."""
 # Read file tool
 READ_FILE_SPEC: dict[str, Any] = {
     "name": "read_file",
-    "description": """Reads a local file with 1-indexed line numbers.
-Returns file content with line numbers in format 'L{number}: {content}'.
+    "description": """Reads a local file with hashline-tagged lines.
+Each line is returned as 'line_number:hash|content' where hash is a 2-char hex tag.
+Use the line_number:hash references with hashline_edit to make precise edits.
 Supports reading specific ranges with offset and limit parameters.""",
     "parameters": {
         "type": "object",
@@ -99,7 +100,8 @@ GREP_FILES_SPEC: dict[str, Any] = {
     "name": "grep_files",
     "description": """Finds files whose contents match the pattern.
 Uses ripgrep (rg) for fast searching.
-Returns file paths sorted by modification time.""",
+Returns matching lines with surrounding context, showing filepath:line_number:content.
+The limit parameter controls total match results (not files).""",
     "parameters": {
         "type": "object",
         "properties": {
@@ -117,7 +119,11 @@ Returns file paths sorted by modification time.""",
             },
             "limit": {
                 "type": "number",
-                "description": "Maximum number of file paths to return (default: 100)",
+                "description": "Maximum number of match results to return (default: 50)",
+            },
+            "context_lines": {
+                "type": "number",
+                "description": "Number of surrounding context lines to show per match (default: 2, max: 5)",
             },
         },
         "required": ["pattern"],
@@ -267,6 +273,62 @@ The edit will FAIL if old_string is not unique in the file unless replace_all is
     },
 }
 
+# Hashline edit tool
+HASHLINE_EDIT_SPEC: dict[str, Any] = {
+    "name": "hashline_edit",
+    "description": """Edit a file using line:hash references from read_file/grep output.
+Each line in read_file output has format 'line_number:hash|content'.
+Reference these tags to make precise edits without reproducing old content.
+
+Operations:
+- replace: Replace line(s). Provide start (and optional end for ranges) + content.
+- insert: Insert new lines after the referenced line. Provide start + content.
+- delete: Delete line(s). Provide start (and optional end for ranges).
+
+Example: To replace lines 5:a3 through 7:0e with new code:
+  {"op": "replace", "start": "5:a3", "end": "7:0e", "content": "new code here"}
+
+If the file changed since you read it, hashes won't match and the edit is rejected.
+Multiple operations are applied bottom-up to preserve line numbers.""",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "file_path": {
+                "type": "string",
+                "description": "Path to the file to edit",
+            },
+            "operations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "op": {
+                            "type": "string",
+                            "enum": ["replace", "insert", "delete"],
+                            "description": "Operation type",
+                        },
+                        "start": {
+                            "type": "string",
+                            "description": "Line reference as 'line_number:hash' (e.g. '5:a3')",
+                        },
+                        "end": {
+                            "type": "string",
+                            "description": "End line reference for range operations (e.g. '10:f1'). Omit for single-line ops.",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "New content (required for replace and insert, omit for delete)",
+                        },
+                    },
+                    "required": ["op", "start"],
+                },
+                "description": "List of edit operations to apply",
+            },
+        },
+        "required": ["file_path", "operations"],
+    },
+}
+
 # Glob files tool
 GLOB_FILES_SPEC: dict[str, Any] = {
     "name": "glob_files",
@@ -370,6 +432,7 @@ def _build_tool_specs() -> dict[str, dict[str, Any]]:
         "spawn_subagent": SUBAGENT_SPEC,
         "spawn_comparison": COMPARISON_SPEC,
         "str_replace": STR_REPLACE_SPEC,
+        "hashline_edit": HASHLINE_EDIT_SPEC,
         "glob_files": GLOB_FILES_SPEC,
         "lint": LINT_SPEC,
         "ask_user": ASK_USER_SPEC,
@@ -414,6 +477,7 @@ MUTATING_TOOLS: set[str] = {
     "write_file",
     "apply_patch",
     "str_replace",
+    "hashline_edit",
     "shell_command",
 }
 

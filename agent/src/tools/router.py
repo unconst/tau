@@ -24,6 +24,8 @@ class ToolRouter:
 
     @staticmethod
     def parse_calls(function_calls: Iterable[Any]) -> List[ToolInvocation]:
+        if function_calls is None:
+            return []
         parsed: list[ToolInvocation] = []
         for idx, call in enumerate(function_calls):
             call_id = getattr(call, "id", None) or f"call_{idx}"

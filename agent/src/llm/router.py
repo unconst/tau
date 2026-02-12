@@ -12,6 +12,9 @@ Callers can also override per-call (e.g. cheap model for verification steps).
 Each ``ModelTier`` now carries per-model metadata (context window, capabilities,
 truncation policy) so the rest of the system can adapt behavior per model
 instead of using hardcoded global constants.
+
+When a model is resource-exhausted (rate-limited, quota exceeded), the router
+provides a ``fallback_models`` chain that the agent loop can cascade through.
 """
 
 from __future__ import annotations
@@ -20,6 +23,24 @@ import os
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional
+
+
+# ---------------------------------------------------------------------------
+# Default fallback model chain — used when the primary model is exhausted.
+# Order matters: secondary → tertiary → quaternary.
+# Override via TAU_FALLBACK_MODELS env var (comma-separated model IDs).
+# ---------------------------------------------------------------------------
+_ENV_FALLBACK_MODELS = os.environ.get("TAU_FALLBACK_MODELS", "")
+DEFAULT_FALLBACK_MODELS: List[str] = (
+    [m.strip() for m in _ENV_FALLBACK_MODELS.split(",") if m.strip()]
+    if _ENV_FALLBACK_MODELS
+    else [
+        "Qwen/Qwen3-32B",
+        "deepseek-ai/DeepSeek-V3.2-TEE",
+        "openai/gpt-oss-120b-TEE",
+        "moonshotai/Kimi-K2.5-TEE",
+    ]
+)
 
 
 class TaskComplexity(Enum):
@@ -63,6 +84,10 @@ class ModelTier:
     supports_temperature: bool = True
     tool_output_max_tokens: int = 0  # 0 = defer to compaction
 
+    # Fallback models to try when the primary model is resource-exhausted
+    # (rate-limited, quota exceeded, etc.).  Tried in order.
+    fallback_models: List[str] = field(default_factory=list)
+
     @property
     def usable_context(self) -> int:
         """Context window minus output reserve."""
@@ -88,9 +113,10 @@ class RouterConfig:
         supports_parallel_tools=True,
         supports_temperature=True,
         tool_output_max_tokens=4_000,
+        fallback_models=list(DEFAULT_FALLBACK_MODELS),
     ))
     default: ModelTier = field(default_factory=lambda: ModelTier(
-        model=os.environ.get("TAU_AGENT_MODEL", os.environ.get("LLM_MODEL", "zai-org/GLM-4.7-TEE")),
+        model=os.environ.get("TAU_AGENT_MODEL", os.environ.get("LLM_MODEL", "deepseek-ai/DeepSeek-V3.2-TEE")),
         max_tokens=16384,
         context_window=131_072,
         output_reserve=16_384,
@@ -99,9 +125,10 @@ class RouterConfig:
         supports_parallel_tools=True,
         supports_temperature=True,
         tool_output_max_tokens=8_000,
+        fallback_models=list(DEFAULT_FALLBACK_MODELS),
     ))
     strong: ModelTier = field(default_factory=lambda: ModelTier(
-        model=os.environ.get("TAU_STRONG_MODEL", os.environ.get("LLM_MODEL", "deepseek-ai/DeepSeek-R1-0528-TEE")),
+        model=os.environ.get("TAU_STRONG_MODEL", os.environ.get("LLM_MODEL", "deepseek-ai/DeepSeek-V3.2-TEE")),
         max_tokens=16384,
         reasoning_effort="high",
         context_window=131_072,
@@ -111,6 +138,7 @@ class RouterConfig:
         supports_parallel_tools=False,
         supports_temperature=False,
         tool_output_max_tokens=8_000,
+        fallback_models=list(DEFAULT_FALLBACK_MODELS),
     ))
 
     # Enable/disable routing (when disabled, always use default)

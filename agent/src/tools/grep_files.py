@@ -27,6 +27,7 @@ class GrepFilesTool(BaseTool):
         include: Optional[str] = None,
         path: Optional[str] = None,
         limit: int = DEFAULT_LIMIT,
+        context_lines: int = 2,
     ) -> ToolResult:
         """Search for files matching a pattern.
 
@@ -35,9 +36,10 @@ class GrepFilesTool(BaseTool):
             include: Glob pattern to filter files
             path: Directory to search in
             limit: Maximum number of results
+            context_lines: Number of surrounding context lines to show per match
 
         Returns:
-            ToolResult with matching file paths
+            ToolResult with matching lines and context
         """
         # Resolve search path
         search_path = self.resolve_path(path) if path else self.cwd
@@ -47,14 +49,16 @@ class GrepFilesTool(BaseTool):
 
         # Cap limit
         limit = min(limit, self.MAX_LIMIT)
+        # Clamp context_lines to 0-5
+        context_lines = max(0, min(context_lines, 5))
 
         # Try ripgrep first (fastest)
-        rg_result = self._search_with_ripgrep(pattern, include, search_path, limit)
+        rg_result = self._search_with_ripgrep(pattern, include, search_path, limit, context_lines)
         if rg_result is not None:
             return rg_result
 
         # Fallback to Python implementation
-        return self._search_with_python(pattern, include, search_path, limit)
+        return self._search_with_python(pattern, include, search_path, limit, context_lines)
 
     def _search_with_ripgrep(
         self,
@@ -62,18 +66,21 @@ class GrepFilesTool(BaseTool):
         include: Optional[str],
         search_path: Path,
         limit: int,
+        context_lines: int = 2,
     ) -> Optional[ToolResult]:
         """Search using ripgrep (rg).
 
         Returns None if ripgrep is not available.
         """
-        cmd = ["rg", "--files-with-matches", "--no-heading"]
+        cmd = ["rg", "-n", "--color=never", f"-C {context_lines}"]
 
         if include:
             # Convert glob to rg glob format
             cmd.extend(["--glob", include])
 
         cmd.extend([pattern, str(search_path)])
+        # Add max-count to limit total matches
+        cmd.extend(["--max-count", str(limit)])
 
         try:
             result = subprocess.run(
@@ -84,18 +91,23 @@ class GrepFilesTool(BaseTool):
             )
 
             if result.returncode == 0:
-                files = result.stdout.strip().split("\n") if result.stdout.strip() else []
-                files = files[:limit]
+                # ripgrep output is already formatted as "filepath:linenumber:content"
+                # Split into lines but keep only up to limit matches
+                lines = [line for line in result.stdout.strip().split("\n") if line]
+                lines = lines[:limit]
 
-                if not files:
-                    return ToolResult.ok("No matching files found.")
+                if not lines:
+                    return ToolResult.ok("No matches found.")
 
-                output = f"Found {len(files)} matching files:\n" + "\n".join(files)
-                return ToolResult.ok(output, data={"count": len(files), "files": files})
+                output = "\n".join(lines)
+                if len(lines) > limit:
+                    output += f"\n\n[... {len(lines) - limit} more matches ...]"
+
+                return ToolResult.ok(output)
 
             elif result.returncode == 1:
                 # No matches
-                return ToolResult.ok("No matching files found.")
+                return ToolResult.ok("No matches found.")
 
             elif result.returncode == 2:
                 # Error - might be bad pattern
@@ -116,6 +128,7 @@ class GrepFilesTool(BaseTool):
         include: Optional[str],
         search_path: Path,
         limit: int,
+        context_lines: int = 2,
     ) -> ToolResult:
         """Fallback Python implementation for searching."""
         try:
@@ -123,8 +136,9 @@ class GrepFilesTool(BaseTool):
         except re.error as e:
             return ToolResult.fail(f"Invalid regex pattern: {e}")
 
-        matching_files: list[str] = []
+        matches: list[str] = []
         errors: list[str] = []
+        match_count = 0
 
         # Convert include glob to regex if provided
         include_regex = None
@@ -148,22 +162,51 @@ class GrepFilesTool(BaseTool):
                 return True
             return include_regex.match(file_path.name) is not None
 
+        def search_file(file_path: Path) -> None:
+            nonlocal match_count
+            if match_count >= limit:
+                return
+            
+            try:
+                content = file_path.read_text(encoding="utf-8", errors="ignore")
+                lines = content.splitlines()
+                
+                for i, line in enumerate(lines):
+                    if match_count >= limit:
+                        return
+                    
+                    if regex.search(line):
+                        # Get context lines
+                        start_line = max(0, i - context_lines)
+                        end_line = min(len(lines), i + context_lines + 1)
+                        
+                        # Add context lines
+                        for j in range(start_line, end_line):
+                            line_num = j + 1
+                            line_content = lines[j]
+                            prefix = "  " if j != i else "> "
+                            matches.append(f"{file_path}:{line_num}:{prefix}{line_content}")
+                        
+                        # Add separator between matches
+                        if j < end_line - 1:
+                            matches.append("--")
+                        
+                        match_count += 1
+                        
+            except (PermissionError, OSError):
+                pass
+
         def search_dir(dir_path: Path) -> None:
-            if len(matching_files) >= limit:
+            if match_count >= limit:
                 return
 
             try:
                 for item in dir_path.iterdir():
-                    if len(matching_files) >= limit:
+                    if match_count >= limit:
                         return
 
                     if item.is_file() and should_include(item):
-                        try:
-                            content = item.read_text(encoding="utf-8", errors="ignore")
-                            if regex.search(content):
-                                matching_files.append(str(item))
-                        except (PermissionError, OSError):
-                            pass
+                        search_file(item)
 
                     elif item.is_dir() and not item.is_symlink():
                         # Skip hidden directories
@@ -174,21 +217,18 @@ class GrepFilesTool(BaseTool):
                 errors.append(f"Permission denied: {dir_path}")
 
         if search_path.is_file():
-            try:
-                content = search_path.read_text(encoding="utf-8", errors="ignore")
-                if regex.search(content):
-                    matching_files.append(str(search_path))
-            except (PermissionError, OSError) as e:
-                return ToolResult.fail(f"Cannot read file: {e}")
+            search_file(search_path)
         else:
             search_dir(search_path)
 
-        if not matching_files:
-            return ToolResult.ok("No matching files found.")
+        if not matches:
+            return ToolResult.ok("No matches found.")
 
-        output = f"Found {len(matching_files)} matching files:\n" + "\n".join(matching_files)
+        output = "\n".join(matches)
+        if match_count >= limit:
+            output += f"\n\n[... reached limit of {limit} matches ...]"
 
         if errors:
             output += "\n\nWarnings:\n" + "\n".join(errors[:5])
 
-        return ToolResult.ok(output, data={"count": len(matching_files), "files": matching_files})
+        return ToolResult.ok(output, data={"count": match_count})

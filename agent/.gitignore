@@ -53,6 +53,9 @@ logs/
 .DS_Store
 Thumbs.db
 
+# Agent runtime state
+.agent/
+
 # Project specific
 *.bak
 *.backup

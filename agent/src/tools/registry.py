@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from src.tools.base import ToolResult
 from src.tools.guards import GuardConfig, GuardError, PathGuards
+from src.tools.hashline import format_hashline, format_lines, line_hash
 from src.tools.specs import get_all_tools, tool_is_mutating, tool_supports_parallel
 
 if TYPE_CHECKING:
@@ -163,6 +164,7 @@ class ToolRegistry:
         """
         self.cwd = cwd or Path("/app")
         self._plan: list[dict[str, str]] = []
+        self._plan_last_updated_iteration: int = 0
         self._config = config or ExecutorConfig()
         self._cache: Dict[str, CachedResult] = {}
         self._stats = ExecutorStats()
@@ -363,6 +365,11 @@ class ToolRegistry:
                 lambda: self._execute_str_replace(cwd, arguments, enforce_guards),
                 self._config.default_timeout,
             )
+        if name == "hashline_edit":
+            return self._run_with_timeout(
+                lambda: self._execute_hashline_edit(cwd, arguments, enforce_guards),
+                self._config.default_timeout,
+            )
         if name == "glob_files":
             return self._run_with_timeout(
                 lambda: self._execute_glob_files(cwd, arguments, enforce_guards),
@@ -516,11 +523,11 @@ class ToolRegistry:
                 output_lines = [f"[File: {path} | {file_size:,} bytes | {total} lines]"]
                 output_lines.append(f"[Showing first 100 and last {len(tail)} lines. Use offset/limit for specific sections.]\n")
                 for i, line in enumerate(head, start=1):
-                    output_lines.append(f"L{i}: {line.rstrip()}")
+                    output_lines.append(format_hashline(i, line.rstrip()))
                 if tail:
                     output_lines.append(f"\n[... {total - 100 - len(tail)} lines omitted ...]\n")
                     for i, line in enumerate(tail, start=total - len(tail) + 1):
-                        output_lines.append(f"L{i}: {line.rstrip()}")
+                        output_lines.append(format_hashline(i, line.rstrip()))
                 return ToolResult.ok("\n".join(output_lines))
 
             with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -531,10 +538,10 @@ class ToolRegistry:
             end = start + limit
             selected = lines[start:end]
 
-            # Format with line numbers
+            # Format with hashline tags (line_number:hash|content)
             output_lines = []
             for i, line in enumerate(selected, start=start + 1):
-                output_lines.append(f"L{i}: {line.rstrip()}")
+                output_lines.append(format_hashline(i, line.rstrip()))
 
             output = "\n".join(output_lines)
 
@@ -663,19 +670,25 @@ class ToolRegistry:
         pattern = args.get("pattern", "")
         include = args.get("include", "")
         search_path = args.get("path", ".")
-        limit = args.get("limit", 100)
+        limit = args.get("limit", 50)
+        context_lines = args.get("context_lines", 2)
+        # Clamp context_lines to 0-5
+        context_lines = max(0, min(context_lines, 5))
 
         if not pattern:
             return ToolResult.fail("No pattern provided")
 
         # Build ripgrep command
-        cmd_parts = ["rg", "-l", "--color=never"]
+        cmd_parts = ["rg", "-n", "--color=never", f"-C {context_lines}"]
 
         if include:
             cmd_parts.extend(["-g", include])
 
         cmd_parts.append(pattern)
         cmd_parts.append(search_path)
+        # Add max-count to limit total matches
+        cmd_parts.append("--max-count")
+        cmd_parts.append(str(limit))
 
         cmd = " ".join(f'"{p}"' if " " in p else p for p in cmd_parts)
         if enforce_guards:
@@ -693,14 +706,20 @@ class ToolRegistry:
                 timeout=30,
             )
 
-            files = [f for f in result.stdout.strip().split("\n") if f]
+            # ripgrep output is "filepath:linenumber:content" (match) or
+            # "filepath-linenumber-content" (context).  Inject hashline tags
+            # for small result sets so the model can use hashline_edit directly.
+            raw_lines = [line for line in result.stdout.strip().split("\n") if line]
+            truncated = raw_lines[:limit]
 
-            if not files:
-                return ToolResult.ok("No matches found")
+            # Only inject hashes when the result set is small enough that
+            # reading files to compute them is cheap.
+            if len(truncated) <= 80:
+                truncated = self._inject_grep_hashes(cwd, truncated)
 
-            output = "\n".join(files[:limit])
-            if len(files) > limit:
-                output += f"\n\n[... {len(files) - limit} more files ...]"
+            output = "\n".join(truncated)
+            if len(raw_lines) > limit:
+                output += f"\n\n[... {len(raw_lines) - limit} more matches ...]"
 
             return ToolResult.ok(output)
 
@@ -708,6 +727,65 @@ class ToolRegistry:
             return ToolResult.fail("Search timed out")
         except Exception as e:
             return ToolResult.fail(f"Search failed: {e}")
+
+    @staticmethod
+    def _inject_grep_hashes(cwd: Path, lines: list[str]) -> list[str]:
+        """Post-process ripgrep output lines to inject hashline tags.
+
+        Transforms ``filepath:42:content`` into ``filepath:42:ab|content``
+        where ``ab`` is the 2-char content hash.  Context lines
+        (``filepath-42-content``) are similarly transformed.
+        Group separators (``--``) are passed through unchanged.
+        """
+        # Regex for ripgrep match/context lines:
+        #   match:   filepath:linenum:content
+        #   context: filepath-linenum-content
+        rg_line_re = re.compile(r"^(.+?)([:])(\d+)([:])(.*)$")
+        rg_ctx_re = re.compile(r"^(.+?)(-)(\d+)(-)(.*)$")
+
+        # Cache: file path -> list of lines (0-indexed)
+        file_cache: dict[str, list[str]] = {}
+
+        def _get_file_lines(fpath: str) -> list[str] | None:
+            if fpath in file_cache:
+                return file_cache[fpath]
+            p = Path(fpath)
+            if not p.is_absolute():
+                p = cwd / p
+            try:
+                file_cache[fpath] = p.read_text(encoding="utf-8", errors="replace").splitlines()
+            except Exception:
+                file_cache[fpath] = []  # type: ignore[assignment]
+                return None
+            return file_cache[fpath]
+
+        result: list[str] = []
+        for raw in lines:
+            if raw == "--":
+                result.append(raw)
+                continue
+
+            m = rg_line_re.match(raw)
+            sep = ":"
+            if not m:
+                m = rg_ctx_re.match(raw)
+                sep = "-"
+            if not m:
+                result.append(raw)
+                continue
+
+            fpath, _, linenum_s, _, content = m.groups()
+            linenum = int(linenum_s)
+
+            # Compute hash from the actual file content at that line
+            file_lines = _get_file_lines(fpath)
+            if file_lines and 1 <= linenum <= len(file_lines):
+                h = line_hash(file_lines[linenum - 1])
+            else:
+                h = line_hash(content)
+
+            result.append(f"{fpath}{sep}{linenum}:{h}{sep}{content}")
+        return result
 
     def _execute_apply_patch(
         self,
@@ -805,6 +883,10 @@ class ToolRegistry:
             )
 
         self._plan = normalized_steps
+        # Bump iteration marker — the loop stamps the current iteration via
+        # ``stamp_plan_iteration`` after each turn that contains an update_plan.
+        # We set a flag so the loop knows it needs to refresh the stamp.
+        self._plan_dirty = True
 
         # Emit plan update as a JSONL event for progress tracking
         from src.output.jsonl import emit_raw
@@ -839,6 +921,21 @@ class ToolRegistry:
             lines.append(f"{icon} {i}. {step.get('description', '')}")
         lines.append("Keep this plan updated with update_plan as work progresses.")
         return "\n".join(lines)
+
+    def stamp_plan_iteration(self, iteration: int) -> None:
+        """Record the loop iteration when the plan was last updated.
+
+        Called by the main loop after processing a turn that contained
+        an ``update_plan`` tool call so we can detect staleness later.
+        """
+        if getattr(self, "_plan_dirty", False):
+            self._plan_last_updated_iteration = iteration
+            self._plan_dirty = False
+
+    @property
+    def plan_last_updated_iteration(self) -> int:
+        """Return the loop iteration at which the plan was last updated."""
+        return self._plan_last_updated_iteration
 
     def _execute_web_search(self, args: dict[str, Any]) -> ToolResult:
         """Execute a web search."""
@@ -1010,6 +1107,140 @@ class ToolRegistry:
 
         return ToolResult.ok(
             f"Replaced {replaced} occurrence(s) in {file_path}"
+        )
+
+    # -------------------------------------------------------------------------
+    # hashline_edit execution
+    # -------------------------------------------------------------------------
+
+    def _execute_hashline_edit(
+        self,
+        cwd: Path,
+        args: dict[str, Any],
+        enforce_guards: bool,
+    ) -> ToolResult:
+        """Edit a file using hashline references (line_number:hash pairs)."""
+        from src.tools.hashline import compute_hashes, parse_ref, validate_ref
+
+        file_path = args.get("file_path", "")
+        operations = args.get("operations", [])
+
+        if not file_path:
+            return ToolResult.fail("No file_path provided")
+        if not operations or not isinstance(operations, list):
+            return ToolResult.fail("No operations provided (expected a non-empty array)")
+
+        path = Path(file_path)
+        if not path.is_absolute():
+            path = cwd / path
+        if enforce_guards:
+            self._guards.require_mutation_allowed("hashline_edit")
+            path = self._guards.require_write(path)
+
+        if not path.exists():
+            return ToolResult.fail(f"File not found: {path}")
+
+        try:
+            content = path.read_text(encoding="utf-8")
+        except Exception as e:
+            return ToolResult.fail(f"Failed to read file: {e}")
+
+        lines = content.splitlines()
+
+        # ------------------------------------------------------------------
+        # Validate all refs before applying anything
+        # ------------------------------------------------------------------
+        parsed_ops: list[dict[str, Any]] = []
+        for idx, op in enumerate(operations, 1):
+            op_type = op.get("op", "")
+            start_ref = op.get("start", "")
+            end_ref = op.get("end", "")
+            new_content = op.get("content", "")
+
+            if op_type not in ("replace", "insert", "delete"):
+                return ToolResult.fail(
+                    f"Operation {idx}: invalid op '{op_type}' (expected replace, insert, or delete)"
+                )
+            if not start_ref:
+                return ToolResult.fail(f"Operation {idx}: missing 'start' reference")
+
+            # Validate start ref
+            ok, err = validate_ref(start_ref, lines)
+            if not ok:
+                return ToolResult.fail(f"Operation {idx}: {err}")
+            start_line, start_hash = parse_ref(start_ref)
+
+            # Validate end ref if present
+            end_line = start_line
+            if end_ref:
+                ok, err = validate_ref(end_ref, lines)
+                if not ok:
+                    return ToolResult.fail(f"Operation {idx}: {err}")
+                end_line, _ = parse_ref(end_ref)
+                if end_line < start_line:
+                    return ToolResult.fail(
+                        f"Operation {idx}: end line {end_line} < start line {start_line}"
+                    )
+
+            # Content required for replace/insert
+            if op_type in ("replace", "insert") and new_content is None:
+                return ToolResult.fail(
+                    f"Operation {idx}: '{op_type}' requires 'content'"
+                )
+
+            parsed_ops.append({
+                "op": op_type,
+                "start": start_line,
+                "end": end_line,
+                "content": new_content or "",
+            })
+
+        # ------------------------------------------------------------------
+        # Sort operations bottom-up (highest line number first) so earlier
+        # line numbers remain valid as we modify the list.
+        # ------------------------------------------------------------------
+        parsed_ops.sort(key=lambda o: o["start"], reverse=True)
+
+        # ------------------------------------------------------------------
+        # Apply operations
+        # ------------------------------------------------------------------
+        changes_made = 0
+        for op in parsed_ops:
+            op_type = op["op"]
+            start = op["start"]  # 1-indexed
+            end = op["end"]      # 1-indexed, inclusive
+            new_content = op["content"]
+
+            if op_type == "replace":
+                new_lines = new_content.splitlines() if new_content else []
+                lines[start - 1 : end] = new_lines
+                changes_made += 1
+
+            elif op_type == "insert":
+                new_lines = new_content.splitlines() if new_content else []
+                # Insert after the referenced line
+                lines[start : start] = new_lines
+                changes_made += 1
+
+            elif op_type == "delete":
+                lines[start - 1 : end] = []
+                changes_made += 1
+
+        # ------------------------------------------------------------------
+        # Write result
+        # ------------------------------------------------------------------
+        new_file_content = "\n".join(lines)
+        # Preserve trailing newline if original had one
+        if content.endswith("\n"):
+            new_file_content += "\n"
+
+        try:
+            path.write_text(new_file_content, encoding="utf-8")
+        except Exception as e:
+            return ToolResult.fail(f"Failed to write file: {e}")
+
+        return ToolResult.ok(
+            f"Applied {changes_made} operation(s) to {file_path}"
         )
 
     # -------------------------------------------------------------------------

@@ -103,7 +103,7 @@ _valid_models_fetched_at: float = 0.0
 _VALID_MODELS_TTL = 300.0  # re-fetch every 5 minutes
 
 # Known-good fallback model if the requested one isn't available
-_FALLBACK_MODEL = "zai-org/GLM-4.7-TEE"
+_FALLBACK_MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 
 
 def _fetch_available_models(base_url: str, api_key: str) -> Set[str]:
@@ -222,7 +222,19 @@ class LLMResponse:
 
     def has_function_calls(self) -> bool:
         """Check if response contains function calls."""
-        return len(self.function_calls) > 0
+        return bool(self.function_calls) and len(self.function_calls) > 0
+
+    @property
+    def is_empty(self) -> bool:
+        """True when the model produced no usable output (no text, no tool calls).
+
+        An empty response typically means the model failed silently —
+        returning a well-formed HTTP 200 but with zero content.  This
+        should be treated as a retryable error, not a valid result.
+        """
+        has_text = bool(self.text and self.text.strip())
+        has_calls = bool(self.function_calls)
+        return not has_text and not has_calls
 
 
 @dataclass
@@ -516,19 +528,19 @@ class LLMClient:
         result.model = data.get("model", self.model)
 
         # Extract choices
-        choices = data.get("choices", [])
+        choices = data.get("choices") or []
         if choices:
             choice = choices[0]
-            message = choice.get("message", {})
+            message = choice.get("message") or {}
 
             result.finish_reason = choice.get("finish_reason", "") or ""
             result.text = message.get("content", "") or ""
 
             # Extract function calls
-            tool_calls = message.get("tool_calls", [])
+            tool_calls = message.get("tool_calls") or []
             if tool_calls:
                 for call in tool_calls:
-                    func = call.get("function", {})
+                    func = call.get("function") or {}
                     args_str = func.get("arguments", "{}")
 
                     try:
@@ -543,6 +555,20 @@ class LLMClient:
                             arguments=args if isinstance(args, dict) else {},
                         )
                     )
+
+        # Detect empty responses — model returned HTTP 200 but produced
+        # nothing.  Raise as a retryable error so the loop can retry or
+        # fall back to another model.
+        if result.is_empty:
+            _log_client(
+                f"Empty response from model {effective_model} "
+                f"(finish_reason={result.finish_reason!r})"
+            )
+            raise LLMError(
+                f"Empty response: model '{effective_model}' produced no text and no tool calls "
+                f"(finish_reason={result.finish_reason!r})",
+                code="empty_response",
+            )
 
         return result
 
@@ -672,10 +698,10 @@ class LLMClient:
                             if "usage" in chunk and chunk["usage"]:
                                 usage = chunk["usage"]
 
-                            choices = chunk.get("choices", [])
+                            choices = chunk.get("choices") or []
                             if not choices:
                                 continue
-                            delta = choices[0].get("delta", {})
+                            delta = choices[0].get("delta") or {}
                             fr = choices[0].get("finish_reason")
                             if fr:
                                 finish_reason = fr
@@ -686,7 +712,7 @@ class LLMClient:
                                 if on_text:
                                     on_text(content)
 
-                            tc_deltas = delta.get("tool_calls", [])
+                            tc_deltas = delta.get("tool_calls") or []
                             for tcd in tc_deltas:
                                 idx = tcd.get("index", 0)
                                 if idx not in tc_accum:
@@ -802,6 +828,20 @@ class LLMClient:
             self._total_cost += cost
 
         result.model = model or self.model
+
+        # Detect empty responses — model returned a valid stream but
+        # produced no text and no tool calls.  Treat as retryable.
+        if result.is_empty:
+            _log_client(
+                f"Empty streaming response from model {effective_model} "
+                f"(finish_reason={result.finish_reason!r})"
+            )
+            raise LLMError(
+                f"Empty response: model '{effective_model}' produced no text and no tool calls "
+                f"(finish_reason={result.finish_reason!r})",
+                code="empty_response",
+            )
+
         return result
 
     @property

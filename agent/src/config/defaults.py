@@ -15,7 +15,7 @@ CONFIG: Dict[str, Any] = {
     # Model Settings (simulates --model gpt-5.2 -c model_reasoning_effort=xhigh)
     # ==========================================================================
     # Model to use via Chutes API (OpenAI-compatible)
-    "model": os.environ.get("LLM_MODEL", "moonshotai/Kimi-K2.5-TEE"),
+    "model": os.environ.get("LLM_MODEL", "deepseek-ai/DeepSeek-V3.2-TEE"),
     # Provider
     "provider": "chutes",
     # Reasoning effort: none, minimal, low, medium, high, xhigh (not used for Claude)
