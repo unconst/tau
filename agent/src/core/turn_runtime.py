@@ -120,6 +120,7 @@ class TurnRuntimeResult:
     tool_failures_delta: int = 0
     plan_only_turn: bool = False  # True when only update_plan was called (no productive tools)
     made_edits: bool = False  # True when any file-modifying tool was called this turn
+    ran_successful_shell: bool = False  # True when a shell_command succeeded this turn
 
 
 class TurnRuntime:
@@ -291,6 +292,7 @@ class TurnRuntime:
             )
 
         _has_edit = any(c.tool_name in _EDIT_TOOLS for c in parsed_calls)
+        _has_successful_shell = False
 
         precomputed: list[tuple[str, Any, Any]] = []
         for call in parsed_calls:
@@ -463,6 +465,8 @@ class TurnRuntime:
             )
             if result.success:
                 tool_successes += 1
+                if call.tool_name == "shell_command":
+                    _has_successful_shell = True
             else:
                 tool_failures += 1
             emit_raw(
@@ -538,6 +542,7 @@ class TurnRuntime:
                     tool_successes_delta=tool_successes,
                     tool_failures_delta=tool_failures,
                     made_edits=_has_edit,
+                    ran_successful_shell=_has_successful_shell,
                 )
 
         return TurnRuntimeResult(
@@ -555,6 +560,7 @@ class TurnRuntime:
             tool_successes_delta=tool_successes,
             tool_failures_delta=tool_failures,
             made_edits=_has_edit,
+            ran_successful_shell=_has_successful_shell,
         )
 
     @staticmethod

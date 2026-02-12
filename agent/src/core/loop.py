@@ -1144,6 +1144,22 @@ Do NOT ask questions — make reasonable decisions and proceed.
         ):
             _consecutive_no_edit_turns += 1
 
+        # ================================================================
+        # Auto-arm completion after self-verification
+        # ================================================================
+        # When the agent has made file edits AND just ran a successful
+        # shell command, it has already verified its own work.  Pre-arm
+        # pending_completion so the next text-only response completes
+        # immediately — skipping the redundant verification prompt that
+        # would otherwise cost an extra LLM round-trip.
+        if (
+            _has_made_edits_ever
+            and runtime_result.ran_successful_shell
+            and not pending_completion
+        ):
+            pending_completion = True
+            _log("Auto-armed completion: edits made + successful shell verification")
+
         _investigation_loop_threshold = int(config.get("investigation_loop_threshold", 3) or 3)
         if (
             _consecutive_no_edit_turns > 0
