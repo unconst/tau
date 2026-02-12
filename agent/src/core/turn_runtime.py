@@ -577,12 +577,24 @@ class TurnRuntime:
             # Write-only turn: content is deterministic, auto-arm
             _result_pending = True
 
+        # Auto-complete: when completion was already armed (e.g. after a
+        # deterministic write_file) and this turn ran a successful
+        # shell_command with no new file edits and no failures, the
+        # agent has verified its work.  Complete immediately — saves
+        # 1 full LLM round-trip that would only produce a summary.
+        _verified_complete = (
+            pending_completion
+            and _has_successful_shell
+            and not _has_edit
+            and tool_failures == 0
+        )
+
         return TurnRuntimeResult(
             messages=updated_messages,
-            pending_completion=_result_pending,
+            pending_completion=_result_pending or _verified_complete,
             last_agent_message=last_agent_message,
             tool_call_count_delta=len(parsed_calls),
-            completed=False,
+            completed=_verified_complete,
             aborted=False,
             parallel_batch_count_delta=1 if can_batch else 0,
             approval_denials_delta=approval_denials,
