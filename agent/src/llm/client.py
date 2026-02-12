@@ -100,7 +100,44 @@ def _parse_rate_limit_headers(headers: httpx.Headers) -> RateLimitInfo:
 _valid_models_lock = threading.Lock()
 _valid_models: Set[str] = set()
 _valid_models_fetched_at: float = 0.0
-_VALID_MODELS_TTL = 300.0  # re-fetch every 5 minutes
+_VALID_MODELS_TTL = 3600.0  # re-fetch every 1 hour (was 5 min — hot-path overhead)
+
+# ---------------------------------------------------------------------------
+# Shared httpx.Client pool — avoids TCP/TLS handshake per LLMClient instance.
+# Keyed by (base_url, api_key_hash, timeout).  Thread-safe via lock.
+# ---------------------------------------------------------------------------
+_http_pool_lock = threading.Lock()
+_http_pool: Dict[tuple, httpx.Client] = {}
+
+
+def _get_shared_http_client(
+    base_url: str,
+    api_key: str,
+    timeout: Optional[float],
+) -> httpx.Client:
+    """Return a shared httpx.Client for the given (base_url, key, timeout) tuple.
+
+    Connection pooling means subsequent requests reuse existing TCP/TLS
+    connections, eliminating handshake latency for subagents and retries.
+    """
+    import hashlib
+    key_hash = hashlib.sha256(api_key.encode()).hexdigest()[:16]
+    pool_key = (base_url, key_hash, timeout)
+
+    with _http_pool_lock:
+        client = _http_pool.get(pool_key)
+        if client is not None:
+            return client
+        client = httpx.Client(
+            base_url=base_url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=httpx.Timeout(timeout=timeout, connect=30.0),
+        )
+        _http_pool[pool_key] = client
+        return client
 
 # Known-good fallback model if the requested one isn't available
 _FALLBACK_MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
@@ -418,10 +455,9 @@ class LLMClient:
                 limit=self.cost_limit,
             )
 
-        # Validate per-call model override against available models
+        # Per-call model override — skip re-validation to avoid lock +
+        # possible HTTP fetch on every LLM call in the hot path.
         effective_model = model or self.model
-        if model:
-            effective_model = validate_model(model, self.base_url, self._api_key)
 
         # Build request payload
         payload: Dict[str, Any] = {
@@ -615,10 +651,8 @@ class LLMClient:
                 limit=self.cost_limit,
             )
 
-        # Validate per-call model override against available models
+        # Per-call model override — skip re-validation (same rationale as chat()).
         effective_model = model or self.model
-        if model:
-            effective_model = validate_model(model, self.base_url, self._api_key)
 
         payload: Dict[str, Any] = {
             "model": effective_model,

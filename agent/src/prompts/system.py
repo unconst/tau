@@ -546,6 +546,14 @@ Keep going until the task is completely resolved. Only yield when you are sure t
 
 Before tool calls, send a 1-sentence preamble describing what you're about to do.
 
+## Parallel tool calls
+Maximize throughput by issuing multiple tool calls in a single response whenever possible:
+- When exploring: read several files, grep for multiple patterns, or list multiple directories at once
+- When verifying: run lint, tests, and re-read edited files together
+- Only read-only tools (`read_file`, `list_dir`, `grep_files`, `glob_files`, `web_search`, `view_image`, `lint`) can run in parallel
+- Mutating tools (`write_file`, `str_replace`, `hashline_edit`, `apply_patch`, `shell_command`) must be issued one at a time
+- Prefer batching 3-6 read-only calls per turn instead of one-at-a-time
+
 ## Planning discipline
 Use `update_plan` to decompose tasks and track progress.
 - One step `in_progress` at a time; keep descriptions short and actionable

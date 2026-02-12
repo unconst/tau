@@ -297,22 +297,27 @@ def _log(msg: str) -> None:
 
 def prune_old_tool_outputs(
     messages: List[Dict[str, Any]],
-    protect_last_turns: int = 2,
+    protect_last_turns: int = 4,
 ) -> List[Dict[str, Any]]:
     """
     Prune old tool outputs with relevance awareness.
 
     Strategy:
     1. Go backwards through messages
-    2. Skip first 2 user turns (most recent)
+    2. Skip the most recent N assistant turns (iterations)
     3. Accumulate tool output tokens weighted by relevance
     4. Protect outputs for files in the working set
     5. Compress outputs before pruning entirely
     6. Only fully prune if we can recover > PRUNE_MINIMUM tokens
 
+    Note: We count *assistant* messages (each representing one LLM iteration)
+    rather than user messages to determine recency.  In agentic loops the
+    initial user instruction is typically the only user message, so counting
+    user messages would protect everything and effectively disable pruning.
+
     Args:
         messages: List of messages
-        protect_last_turns: Number of recent user turns to skip
+        protect_last_turns: Number of recent assistant turns (iterations) to skip
 
     Returns:
         Messages with old tool outputs pruned/compressed
@@ -332,7 +337,11 @@ def prune_old_tool_outputs(
     for msg_index in range(len(messages) - 1, -1, -1):
         msg = messages[msg_index]
 
-        if msg.get("role") == "user":
+        # Count assistant messages (each = one LLM iteration) instead of
+        # user messages.  Agentic loops usually have a single user message
+        # at the start, so counting user turns would never reach the
+        # protect_last_turns threshold and pruning would be skipped entirely.
+        if msg.get("role") == "assistant":
             turns += 1
 
         if turns < protect_last_turns:
@@ -342,7 +351,7 @@ def prune_old_tool_outputs(
             content = msg.get("content", "")
 
             if content == PRUNE_MARKER:
-                break
+                continue
 
             estimate = estimate_tokens(content)
             total += estimate
@@ -527,11 +536,17 @@ def manage_context(
     _log(f"Context: {total_tokens} tokens ({usage_pct:.1f}% of {usable})")
 
     if not force_compaction and not _is_over(total_tokens):
-        # Even under token threshold, prune if message count is excessive
-        if len(messages) > 60:
-            _log(f"Message count high ({len(messages)}), pruning old tool outputs...")
+        # Proactive pruning: clean up stale tool outputs before they
+        # accumulate into a full compaction event.  Two triggers:
+        # 1. Message count > 30 — catches moderate-length sessions early
+        #    (previously 60, which meant most agentic sessions never pruned)
+        # 2. Token usage > 50% — catches sessions with large tool outputs
+        #    even if message count is still low
+        _should_prune = len(messages) > 30 or usage_pct > 50.0
+        if _should_prune:
+            _log(f"Proactive pruning ({len(messages)} msgs, {usage_pct:.1f}% usage)...")
             pruned = prune_old_tool_outputs(messages)
-            if len(pruned) < len(messages):
+            if pruned is not messages:
                 if _token_budget is not None:
                     _token_budget.reset(pruned)
                 return pruned
