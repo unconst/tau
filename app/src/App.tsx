@@ -437,12 +437,23 @@ console.log(data.choices[0].message.content);`;
         <ChatPlayground />
       </section>
 
-      {/* API Docs */}
-      <section id="api" className="relative z-10 max-w-4xl mx-auto px-6 pb-20">
-        <h2 className="text-2xl font-bold text-white mb-2">API</h2>
+      {/* Getting Started */}
+      <section id="api" className="relative z-10 max-w-4xl mx-auto px-6 pb-12">
+        <h2 className="text-2xl font-bold text-white mb-2">Getting Started</h2>
         <p className="text-slate-500 text-sm mb-6">
-          OpenAI-compatible. Use any existing client library&mdash;just change the base URL.
+          Drop-in replacement for OpenAI. Just change the base URL&mdash;no API key required.
         </p>
+
+        <GlassCard className="p-5 mb-6">
+          <div className="flex items-center gap-3 mb-1">
+            <span className="text-xs text-slate-500 uppercase tracking-wider font-medium">Base URL</span>
+          </div>
+          <div className="flex items-center gap-3">
+            <code className="text-lg font-mono text-indigo-400 break-all">{API_URL}/v1</code>
+            <CopyButton text={`${API_URL}/v1`} />
+          </div>
+          <p className="text-xs text-slate-600 mt-2">Works with the OpenAI Python/JS SDK, LangChain, LiteLLM, and any OpenAI-compatible client.</p>
+        </GlassCard>
 
         <GlassCard className="p-5">
           <div className="flex items-center gap-2 mb-4 text-xs">
@@ -464,19 +475,62 @@ console.log(data.choices[0].message.content);`;
           <CodeBlock code={codeExamples[activeTab]} lang={activeTab === 'curl' ? 'bash' : activeTab === 'python' ? 'python' : 'javascript'} />
 
           <div className="mt-5 space-y-3">
-            <h4 className="text-sm font-medium text-white/80">Parameters</h4>
+            <h4 className="text-sm font-medium text-white/80">Request Parameters</h4>
             <div className="grid gap-2 text-xs">
               {[
                 ['model', 'string', '"qwen-7b"', 'Model to use for inference'],
-                ['messages', 'array', '—', 'Array of {role, content} message objects'],
-                ['max_tokens', 'integer', '256', 'Maximum tokens to generate'],
+                ['messages', 'array', '(required)', 'Array of {role, content} message objects'],
+                ['max_tokens', 'integer', '256', 'Maximum tokens to generate (1-4096)'],
                 ['stream', 'boolean', 'false', 'Stream response as Server-Sent Events'],
                 ['temperature', 'float', '1.0', 'Sampling temperature (0.0 - 2.0)'],
+                ['top_p', 'float', '1.0', 'Nucleus sampling threshold'],
+                ['frequency_penalty', 'float', '0.0', 'Penalize repeated tokens (-2.0 to 2.0)'],
+                ['presence_penalty', 'float', '0.0', 'Penalize token presence (-2.0 to 2.0)'],
+                ['stop', 'string[]', 'null', 'Stop sequences to end generation'],
               ].map(([name, type, def, desc]) => (
                 <div key={name} className="flex items-start gap-3 py-2 border-b border-white/5 last:border-0">
                   <code className="text-indigo-400 font-medium min-w-[100px]">{name}</code>
                   <span className="text-slate-600 min-w-[60px]">{type}</span>
                   <span className="text-slate-600 min-w-[60px]">{def}</span>
+                  <span className="text-slate-400">{desc}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="mt-5 space-y-3">
+            <h4 className="text-sm font-medium text-white/80">Response Format</h4>
+            <CodeBlock code={`{
+  "id": "chatcmpl-...",
+  "object": "chat.completion",
+  "created": 1710000000,
+  "model": "qwen-7b",
+  "choices": [{
+    "index": 0,
+    "message": { "role": "assistant", "content": "..." },
+    "finish_reason": "stop"  // or "length"
+  }],
+  "usage": {
+    "prompt_tokens": 12,
+    "completion_tokens": 64,
+    "total_tokens": 76
+  }
+}`} lang="json" />
+          </div>
+
+          <div className="mt-5 space-y-3">
+            <h4 className="text-sm font-medium text-white/80">Additional Endpoints</h4>
+            <div className="grid gap-2 text-xs">
+              {[
+                ['GET', '/v1/health', 'Network health, miner fleet status, and throughput stats'],
+                ['GET', '/v1/models', 'List available models'],
+                ['POST', '/v1/inference', 'Legacy inference endpoint (non-OpenAI format)'],
+              ].map(([method, path, desc]) => (
+                <div key={path} className="flex items-start gap-3 py-2 border-b border-white/5 last:border-0">
+                  <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                    method === 'GET' ? 'bg-blue-500/20 text-blue-400' : 'bg-green-500/20 text-green-400'
+                  }`}>{method}</span>
+                  <code className="text-indigo-400 font-medium min-w-[180px]">{path}</code>
                   <span className="text-slate-400">{desc}</span>
                 </div>
               ))}
