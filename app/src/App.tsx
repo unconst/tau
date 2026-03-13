@@ -183,6 +183,10 @@ interface NetworkHealth {
   miners_total: number;
   total_organic: number;
   total_synthetic: number;
+  version?: string;
+  uptime_s?: number;
+  epoch?: number;
+  last_weight_set?: number;
   miners_detail: Array<{
     uid: number;
     alive: boolean;
@@ -193,9 +197,17 @@ interface NetworkHealth {
   }>;
 }
 
+function formatUptime(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+
 function NetworkStatus() {
   const [health, setHealth] = useState<NetworkHealth | null>(null);
   const [error, setError] = useState(false);
+  const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
 
   useEffect(() => {
     const fetchHealth = async () => {
@@ -204,13 +216,14 @@ function NetworkStatus() {
         if (res.ok) {
           setHealth(await res.json());
           setError(false);
+          setLastUpdate(new Date());
         }
       } catch {
         setError(true);
       }
     };
     fetchHealth();
-    const interval = setInterval(fetchHealth, 15000);
+    const interval = setInterval(fetchHealth, 10000);
     return () => clearInterval(interval);
   }, []);
 
@@ -221,8 +234,18 @@ function NetworkStatus() {
     : 0;
 
   return (
-    <section className="relative z-10 max-w-4xl mx-auto px-6 pb-20">
-      <h2 className="text-2xl font-bold text-white mb-2">Network Status</h2>
+    <section id="status" className="relative z-10 max-w-4xl mx-auto px-6 pb-20">
+      <div className="flex items-center justify-between mb-2">
+        <h2 className="text-2xl font-bold text-white">Network Status</h2>
+        <div className="flex items-center gap-2">
+          {health?.version && (
+            <span className="text-[10px] px-2 py-0.5 rounded-full bg-white/5 text-slate-600">v{health.version}</span>
+          )}
+          {lastUpdate && (
+            <span className="text-[10px] text-slate-600">Updated {lastUpdate.toLocaleTimeString()}</span>
+          )}
+        </div>
+      </div>
       <p className="text-slate-500 text-sm mb-6">Live stats from the Constantinople miner fleet on Bittensor Subnet 97.</p>
 
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
@@ -230,27 +253,32 @@ function NetworkStatus() {
           {
             label: 'Miners Online',
             value: health ? `${health.miners_alive}/${health.miners_total}` : '—',
+            sub: health?.uptime_s ? `Up ${formatUptime(health.uptime_s)}` : undefined,
             color: health && health.miners_alive > 0 ? 'text-green-400' : 'text-slate-400',
           },
           {
             label: 'Fleet Throughput',
             value: health ? `${Math.round(totalTPS)} tok/s` : '—',
+            sub: health?.epoch ? `Epoch ${health.epoch}` : undefined,
             color: 'text-indigo-400',
           },
           {
             label: 'Avg TTFT',
             value: health ? `${avgTTFT.toFixed(0)}ms` : '—',
+            sub: 'Time to first token',
             color: 'text-purple-400',
           },
           {
             label: 'Requests Served',
             value: health ? `${(health.total_organic + health.total_synthetic).toLocaleString()}` : '—',
+            sub: health ? `${health.total_organic.toLocaleString()} organic` : undefined,
             color: 'text-pink-400',
           },
-        ].map(({ label, value, color }) => (
+        ].map(({ label, value, sub, color }) => (
           <GlassCard key={label} className="p-4 text-center">
             <div className="text-xs text-slate-500 mb-1">{label}</div>
             <div className={`font-semibold text-lg ${color}`}>{value}</div>
+            {sub && <div className="text-[10px] text-slate-600 mt-0.5">{sub}</div>}
           </GlassCard>
         ))}
       </div>
@@ -259,7 +287,9 @@ function NetworkStatus() {
         <GlassCard className="p-5">
           <h3 className="text-sm font-medium text-white/80 mb-3">Active Miners</h3>
           <div className="space-y-2">
-            {aliveMiners.map(m => (
+            {aliveMiners
+              .sort((a, b) => b.avg_tps - a.avg_tps)
+              .map(m => (
               <div key={m.uid} className="flex items-center gap-3 text-xs py-2 border-b border-white/5 last:border-0">
                 <div className="w-2 h-2 rounded-full bg-green-400" />
                 <span className="text-slate-400 min-w-[60px]">UID {m.uid}</span>
@@ -267,6 +297,7 @@ function NetworkStatus() {
                 <span className="text-slate-500 min-w-[70px]">{m.avg_ttft_ms.toFixed(0)}ms TTFT</span>
                 <span className="text-slate-600">{m.served.toLocaleString()} served</span>
                 <div className="flex-1" />
+                <span className="text-slate-600 text-[10px]">{(m.reliability * 100).toFixed(0)}%</span>
                 <div className="w-16 h-1.5 rounded-full bg-white/5 overflow-hidden">
                   <div className="h-full rounded-full bg-green-400/60" style={{ width: `${m.reliability * 100}%` }} />
                 </div>
@@ -375,6 +406,7 @@ console.log(data.choices[0].message.content);`;
         <div className="flex items-center gap-6 text-sm text-slate-400">
           <a href="#playground" className="hover:text-white transition-colors">Playground</a>
           <a href="#api" className="hover:text-white transition-colors">API</a>
+          <a href="#status" className="hover:text-white transition-colors">Status</a>
           <a href="https://github.com/unconst/Constantinople" target="_blank" rel="noopener noreferrer" className="hover:text-white transition-colors">GitHub</a>
         </div>
       </nav>
