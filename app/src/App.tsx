@@ -178,6 +178,113 @@ function ChatPlayground() {
   );
 }
 
+interface NetworkHealth {
+  miners_alive: number;
+  miners_total: number;
+  total_organic: number;
+  total_synthetic: number;
+  miners_detail: Array<{
+    uid: number;
+    alive: boolean;
+    reliability: number;
+    avg_tps: number;
+    avg_ttft_ms: number;
+    served: number;
+  }>;
+}
+
+function NetworkStatus() {
+  const [health, setHealth] = useState<NetworkHealth | null>(null);
+  const [error, setError] = useState(false);
+
+  useEffect(() => {
+    const fetchHealth = async () => {
+      try {
+        const res = await fetch(`${API_URL}/v1/health`);
+        if (res.ok) {
+          setHealth(await res.json());
+          setError(false);
+        }
+      } catch {
+        setError(true);
+      }
+    };
+    fetchHealth();
+    const interval = setInterval(fetchHealth, 15000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const aliveMiners = health?.miners_detail?.filter(m => m.alive) ?? [];
+  const totalTPS = aliveMiners.reduce((sum, m) => sum + m.avg_tps, 0);
+  const avgTTFT = aliveMiners.length > 0
+    ? aliveMiners.reduce((sum, m) => sum + m.avg_ttft_ms, 0) / aliveMiners.length
+    : 0;
+
+  return (
+    <section className="relative z-10 max-w-4xl mx-auto px-6 pb-20">
+      <h2 className="text-2xl font-bold text-white mb-2">Network Status</h2>
+      <p className="text-slate-500 text-sm mb-6">Live stats from the Constantinople miner fleet on Bittensor Subnet 97.</p>
+
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
+        {[
+          {
+            label: 'Miners Online',
+            value: health ? `${health.miners_alive}/${health.miners_total}` : '—',
+            color: health && health.miners_alive > 0 ? 'text-green-400' : 'text-slate-400',
+          },
+          {
+            label: 'Fleet Throughput',
+            value: health ? `${Math.round(totalTPS)} tok/s` : '—',
+            color: 'text-indigo-400',
+          },
+          {
+            label: 'Avg TTFT',
+            value: health ? `${avgTTFT.toFixed(0)}ms` : '—',
+            color: 'text-purple-400',
+          },
+          {
+            label: 'Requests Served',
+            value: health ? `${(health.total_organic + health.total_synthetic).toLocaleString()}` : '—',
+            color: 'text-pink-400',
+          },
+        ].map(({ label, value, color }) => (
+          <GlassCard key={label} className="p-4 text-center">
+            <div className="text-xs text-slate-500 mb-1">{label}</div>
+            <div className={`font-semibold text-lg ${color}`}>{value}</div>
+          </GlassCard>
+        ))}
+      </div>
+
+      {health && aliveMiners.length > 0 && (
+        <GlassCard className="p-5">
+          <h3 className="text-sm font-medium text-white/80 mb-3">Active Miners</h3>
+          <div className="space-y-2">
+            {aliveMiners.map(m => (
+              <div key={m.uid} className="flex items-center gap-3 text-xs py-2 border-b border-white/5 last:border-0">
+                <div className="w-2 h-2 rounded-full bg-green-400" />
+                <span className="text-slate-400 min-w-[60px]">UID {m.uid}</span>
+                <span className="text-indigo-400 min-w-[80px]">{m.avg_tps.toFixed(0)} tok/s</span>
+                <span className="text-slate-500 min-w-[70px]">{m.avg_ttft_ms.toFixed(0)}ms TTFT</span>
+                <span className="text-slate-600">{m.served.toLocaleString()} served</span>
+                <div className="flex-1" />
+                <div className="w-16 h-1.5 rounded-full bg-white/5 overflow-hidden">
+                  <div className="h-full rounded-full bg-green-400/60" style={{ width: `${m.reliability * 100}%` }} />
+                </div>
+              </div>
+            ))}
+          </div>
+        </GlassCard>
+      )}
+
+      {error && (
+        <div className="text-center text-slate-500 text-sm mt-4">
+          Unable to fetch network status. The API may be temporarily unavailable.
+        </div>
+      )}
+    </section>
+  );
+}
+
 function App() {
   const [mousePos, setMousePos] = useState({ x: 0.5, y: 0.5 });
   const containerRef = useRef<HTMLDivElement>(null);
@@ -378,23 +485,8 @@ console.log(data.choices[0].message.content);`;
         </GlassCard>
       </section>
 
-      {/* Network Info */}
-      <section className="relative z-10 max-w-4xl mx-auto px-6 pb-20">
-        <h2 className="text-2xl font-bold text-white mb-6">Network</h2>
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-          {[
-            { label: 'Subnet', value: '97' },
-            { label: 'Model', value: 'Qwen 7B' },
-            { label: 'Miners', value: 'Active' },
-            { label: 'Verification', value: 'Hidden State' },
-          ].map(({ label, value }) => (
-            <GlassCard key={label} className="p-4 text-center">
-              <div className="text-xs text-slate-500 mb-1">{label}</div>
-              <div className="text-white font-semibold text-sm">{value}</div>
-            </GlassCard>
-          ))}
-        </div>
-      </section>
+      {/* Network Status */}
+      <NetworkStatus />
 
       {/* Footer */}
       <footer className="relative z-10 border-t border-white/5 px-6 py-8">
