@@ -186,7 +186,12 @@ interface NetworkHealth {
   version?: string;
   uptime_s?: number;
   epoch?: number;
+  epoch_elapsed_s?: number;
+  epoch_length_s?: number;
   last_weight_set?: number;
+  weights?: Record<string, number>;
+  challenges?: { total: number; passed: number; failed: number };
+  errors?: { timeouts: number; miner_errors: number; failovers: number };
   miners_detail: Array<{
     uid: number;
     alive: boolean;
@@ -194,6 +199,12 @@ interface NetworkHealth {
     avg_tps: number;
     avg_ttft_ms: number;
     served: number;
+    failed?: number;
+    score?: number;
+    weight?: number;
+    pass_rate?: number;
+    divergence?: number;
+    is_suspect?: boolean;
   }>;
 }
 
@@ -259,7 +270,7 @@ function NetworkStatus() {
           {
             label: 'Fleet Throughput',
             value: health ? `${Math.round(totalTPS)} tok/s` : '—',
-            sub: health?.epoch ? `Epoch ${health.epoch}` : undefined,
+            sub: health?.challenges ? `${health.challenges.passed}/${health.challenges.total} challenges` : undefined,
             color: 'text-indigo-400',
           },
           {
@@ -283,19 +294,57 @@ function NetworkStatus() {
         ))}
       </div>
 
+      {health && health.epoch_elapsed_s != null && health.epoch_length_s != null && (
+        <GlassCard className="p-4 mb-6">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-xs text-slate-400">Epoch {health.epoch}</span>
+            <span className="text-[10px] text-slate-600">
+              {formatUptime(health.epoch_elapsed_s)} / {formatUptime(health.epoch_length_s)}
+            </span>
+          </div>
+          <div className="w-full h-2 rounded-full bg-white/5 overflow-hidden">
+            <div
+              className="h-full rounded-full transition-all duration-1000"
+              style={{
+                width: `${Math.min((health.epoch_elapsed_s / health.epoch_length_s) * 100, 100)}%`,
+                background: 'linear-gradient(90deg, #6366f1, #a855f7)',
+              }}
+            />
+          </div>
+          {health.weights && Object.keys(health.weights).length > 0 && (
+            <div className="mt-3 flex items-center gap-2 flex-wrap">
+              <span className="text-[10px] text-slate-500">Weights:</span>
+              {Object.entries(health.weights)
+                .sort(([, a], [, b]) => b - a)
+                .map(([uid, w]) => (
+                  <span key={uid} className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-500/10 text-indigo-400">
+                    UID {uid}: {(w * 100).toFixed(1)}%
+                  </span>
+                ))}
+            </div>
+          )}
+        </GlassCard>
+      )}
+
       {health && aliveMiners.length > 0 && (
         <GlassCard className="p-5">
           <h3 className="text-sm font-medium text-white/80 mb-3">Active Miners</h3>
           <div className="space-y-2">
             {aliveMiners
-              .sort((a, b) => b.avg_tps - a.avg_tps)
+              .sort((a, b) => (b.weight ?? b.avg_tps) - (a.weight ?? a.avg_tps))
               .map(m => (
               <div key={m.uid} className="flex items-center gap-3 text-xs py-2 border-b border-white/5 last:border-0">
-                <div className="w-2 h-2 rounded-full bg-green-400" />
-                <span className="text-slate-400 min-w-[60px]">UID {m.uid}</span>
-                <span className="text-indigo-400 min-w-[80px]">{m.avg_tps.toFixed(0)} tok/s</span>
-                <span className="text-slate-500 min-w-[70px]">{m.avg_ttft_ms.toFixed(0)}ms TTFT</span>
-                <span className="text-slate-600">{m.served.toLocaleString()} served</span>
+                <div className={`w-2 h-2 rounded-full ${m.is_suspect ? 'bg-red-400' : 'bg-green-400'}`} />
+                <span className="text-slate-400 min-w-[50px]">UID {m.uid}</span>
+                <span className="text-indigo-400 min-w-[70px]">{m.avg_tps.toFixed(0)} tok/s</span>
+                <span className="text-slate-500 min-w-[60px]">{m.avg_ttft_ms.toFixed(0)}ms</span>
+                {m.weight != null && m.weight > 0 && (
+                  <span className="text-purple-400 min-w-[50px]">{(m.weight * 100).toFixed(1)}%</span>
+                )}
+                {m.score != null && (
+                  <span className="text-amber-400/70 min-w-[50px]">{m.score.toFixed(2)}pts</span>
+                )}
+                <span className="text-slate-600">{m.served.toLocaleString()} req</span>
                 <div className="flex-1" />
                 <span className="text-slate-600 text-[10px]">{(m.reliability * 100).toFixed(0)}%</span>
                 <div className="w-16 h-1.5 rounded-full bg-white/5 overflow-hidden">
@@ -304,6 +353,13 @@ function NetworkStatus() {
               </div>
             ))}
           </div>
+          {health.errors && (health.errors.timeouts > 0 || health.errors.failovers > 0) && (
+            <div className="mt-3 pt-3 border-t border-white/5 flex gap-4 text-[10px] text-slate-600">
+              {health.errors.timeouts > 0 && <span>Timeouts: {health.errors.timeouts}</span>}
+              {health.errors.miner_errors > 0 && <span>Errors: {health.errors.miner_errors}</span>}
+              {health.errors.failovers > 0 && <span>Failovers: {health.errors.failovers}</span>}
+            </div>
+          )}
         </GlassCard>
       )}
 
